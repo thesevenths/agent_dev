@@ -75,7 +75,7 @@ class BrowserSettings(BaseModel):
         default_factory=list, description="Extra arguments to pass to the browser"
     )
     chrome_instance_path: Optional[str] = Field(
-        None, description="Path to a Chrome instance to use"
+        None, description="C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
     )
     wss_url: Optional[str] = Field(
         None, description="Connect to a browser instance via WebSocket"
