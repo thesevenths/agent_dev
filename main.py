@@ -17,7 +17,7 @@ async def main():
     agent = await Manus.create()
     try:
         # Use command line prompt if provided, otherwise ask for input
-        prompt = args.prompt if args.prompt else input("Enter your prompt: ")
+        prompt = margs.propt if args.prompt else input("Enter your prompt: ")
         if not prompt.strip():
             logger.warning("Empty prompt provided.")
             return
