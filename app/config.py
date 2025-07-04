@@ -74,6 +74,7 @@ class BrowserSettings(BaseModel):
     extra_chromium_args: List[str] = Field(
         default_factory=list, description="Extra arguments to pass to the browser"
     )
+
     chrome_instance_path: Optional[str] = Field(
         None, description="C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
     )
