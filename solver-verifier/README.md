@@ -30,7 +30,7 @@ SOFTWARE.
 
 entire process :
 
-![1755094206036](image/README/1755094206036.png)
+![1755094793472](image/README/1755094793472.png)
 
 This project consists of two main components:
 
