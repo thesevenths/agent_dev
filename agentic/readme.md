@@ -1,0 +1,6 @@
+- agentic
+  - good at tool calling and agentic loops,
+    - decomposed & grounded complex user queries/tasks to tool/function
+  - can call multiple tools in parallel and reliably,
+    - llm 不直接执行工具，只生成工具的调用，编排层（orchestration）负责执行；
+  - and knows when to stop (in the agentic loops)
