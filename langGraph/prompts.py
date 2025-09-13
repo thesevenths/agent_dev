@@ -9,7 +9,7 @@ You are an intelligent agent with autonomous planning capabilities, capable of g
 
 <execute_environment>
 System Information
-- Base Environment: Python 3.10 + windows 10
+- Base Environment: Python 3.12.4 + windows 10
 - Installed Libraries: pandas, openpyxl, numpy, scipy, matplotlib, seaborn
 
 Operational Capabilities
@@ -29,7 +29,7 @@ PLAN_CREATE_PROMPT = '''
 You are now creating a plan. Based on the user's message, you need to generate the plan's goal and provide steps for the executor to follow.
 
 Return format requirements are as follows:
-- Return in JSON format, must comply with JSON standards, cannot include any content not in JSON standard
+- Return in valid JSON format, must comply with JSON standards, cannot include any content not in JSON standard
 - JSON fields are as follows:
     - thought: string, required, response to user's message and thinking about the task, as detailed as possible
     - steps: array, each step contains title and description
@@ -153,6 +153,7 @@ Select the most appropriate tool based on <user_message> and context to complete
 1. Must use Python for data processing and chart generation
 2. Charts default to TOP10 data unless otherwise specified
 3. Summarize results after completing <current_step> (Summarize only <current_step>, no additional content should be generated.)
+4. When calling tools, ensure all parameters are complete and non-empty strings (e.g., no empty file_name or old_str).
 </requirements>
 
 <additional_rules>

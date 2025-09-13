@@ -2,83 +2,76 @@ from langchain_core.tools import tool
 import os
 import traceback
 import subprocess
+
 @tool
-def create_file(file_name, file_contents):
+def create_file(file_name: str, file_contents: str):
     """
     Create a new file with the provided contents at a given path in the workspace.
     
-    args:
-        file_name (str): Name to the file to be created
-        file_contents (str): The content to write to the file
+    Args:
+        file_name (str): Name of the file to be created (required, non-empty)
+        file_contents (str): The content to write to the file (required)
     """
     try:
-
+        if not file_name or not file_contents:
+            return {"error": "file_name and file_contents must be non-empty strings"}
         file_path = os.path.join(os.getcwd(), file_name)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-        with open(file_path, 'w') as file:
+        with open(file_path, 'w', encoding='utf-8') as file:  # 加 encoding
             file.write(file_contents)
-
-        return {
-            "message": f"Successfully created file at {file_path}"
-        }
-
+        return {"message": f"Successfully created file at {file_path}"}
     except Exception as e:
-        return {
-            "error": str(e)
-        }
+        return {"error": str(e)}
 
 @tool
-def str_replace(file_name, old_str, new_str):
+def str_replace(file_name: str, old_str: str, new_str: str):
     """
     Replace specific text in a file.
     
-    args:
-        file_name (str): Name to the target file
-        old_str (str): Text to be replaced (must appear exactly once)
-        new_str (str): Replacement text
+    Args:
+        file_name (str): Name of the target file (required, non-empty)
+        old_str (str): Text to be replaced (must appear exactly once, required, non-empty)
+        new_str (str): Replacement text (required, non-empty)
     """
     try:
+        if not all([file_name, old_str, new_str]):
+            return {"error": "All parameters must be non-empty strings"}
         file_path = os.path.join(os.getcwd(), file_name)
-        with open(file_path, "r") as file:
+        with open(file_path, "r", encoding='utf-8') as file:
             content = file.read()
-
         new_content = content.replace(old_str, new_str, 1)
-        
-        with open(file_path, "w") as file:
+        with open(file_path, "w", encoding='utf-8') as file:
             file.write(new_content)
-
-        return {"message": "Successfully replaced '{old_str}' with '{new_str}' in {file_path}"}
+        return {"message": f"Successfully replaced '{old_str}' with '{new_str}' in {file_path}"}  # 修复：直接 f-string
     except Exception as e:
         return {"error": f"Error replacing '{old_str}' with '{new_str}' in {file_path}: {str(e)}"}
 
 @tool
 def send_message(message: str):
     """
-    send a message to the user
+    Send a message to the user.
     
-    args:
-        message: the message to send to the user
+    Args:
+        message (str): The message to send to the user (required, non-empty)
     """
-    
-    return message
+    if not message:
+        return {"error": "Message must be non-empty"}
+    return {"message": message}  # 统一返回 dict
 
 @tool
 def shell_exec(command: str) -> dict:
     """
-    在指定的 shell 会话中执行命令。
+    Execute a command in the specified shell session.
 
-    参数:
-        command (str): 要执行的 shell 命令
+    Args:
+        command (str): The shell command to execute (required, non-empty)
 
-    返回:
-        dict: 包含以下字段：
-            - stdout: 命令的标准输出
-            - stderr: 命令的标准错误
+    Returns:
+        dict: Contains 'stdout' and 'stderr'
     """
-  
     try:
-        # 执行命令
+        if not command:
+            return {"error": {"stderr": "Command must be non-empty"}}
         result = subprocess.run(
             command,
             shell=True,          
@@ -89,9 +82,6 @@ def shell_exec(command: str) -> dict:
             encoding='utf-8',
             errors='ignore'
         )
-
-        # 返回结果
-        return {"message":{"stdout": result.stdout,"stderr": result.stderr}}
-
+        return {"message": {"stdout": result.stdout, "stderr": result.stderr}}
     except Exception as e:
-        return {"error":{"stderr": str(e)}}
+        return {"error": {"stderr": str(e)}}
