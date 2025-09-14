@@ -154,6 +154,7 @@ Select the most appropriate tool based on <user_message> and context to complete
 2. Charts default to TOP10 data unless otherwise specified
 3. Summarize results after completing <current_step> (Summarize only <current_step>, no additional content should be generated.)
 4. When calling tools, ensure all parameters are complete and non-empty strings (e.g., no empty file_name or old_str).
+5. For web crawling, use crawl_web3_news with valid URLs and output file path.
 </requirements>
 
 <additional_rules>
@@ -165,6 +166,9 @@ Select the most appropriate tool based on <user_message> and context to complete
    - Must use the specified font for plotting. Font path: *SimSun.ttf* 
    - The chart file name must reflect its actual content.
    - Must use *print* statements to display intermediate processes and results.
+3. Web Crawling:
+   - Target Web3 cryptocurrency news sites (include but not limited as : cointelegraph.com, cryptoslate.com, techflowpost.com, podcasts.apple.com, www.coinglass.com/zh/news)
+   - Extract date and news title, save as JSON with the specified format.
 </additional_rules>
 
 <user_message>
@@ -179,13 +183,26 @@ Select the most appropriate tool based on <user_message> and context to complete
 
 REPORT_SYSTEM_PROMPT = """
 <goal>
-你是报告生成专家，你需要根据已有的上下文信息（数据信息、图表信息等），生成一份有价值的报告。
+你是报告生成专家，你需要根据已有的上下文信息（数据信息、图表信息或爬取的新闻），生成一份有价值的报告。
 </goal>
 
 <style_guide>
 - 使用表格和图表展示数据
 - 不要描述图表的全部数据，只描述具有显著意义的指标
 - 生成丰富有价值的内容，从多个维度扩散，避免过于单一
+- For crawled news, must be json object in the following format and save to the local directory:
+      news output format:
+      [
+         {
+            date:
+            news:
+         },
+         {
+            date:
+            news:
+         }
+         .......
+      ]
 </style_guide>
 
 <attention>
@@ -194,5 +211,6 @@ REPORT_SYSTEM_PROMPT = """
 - 报告中不得出现代码执行错误相关信息
 - 首先生成各个子报告，然后合并所有子报告文件得到完整报告
 - 以文件形式展示分析报告
+- If news is crawled, ensure the JSON file is referenced in the report,then save to the local directory
 </attention>
 """

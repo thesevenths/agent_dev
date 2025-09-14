@@ -10,7 +10,6 @@ from tools import *
 
 
 # llm = ChatOpenAI(model="", temperature=0.0, base_url='', api_key='')
-llm = ChatOpenAI(model=" ", temperature=0.0, base_url=' ', api_key=' ')
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -24,7 +23,8 @@ logger.addHandler(hander)
 tools_map = {
     "create_file": create_file,
     "str_replace": str_replace,
-    "shell_exec":  shell_exec
+    "shell_exec":  shell_exec,
+    "crawl_web3_news": crawl_web3_news
 }
 
 def extract_json(text):
@@ -57,34 +57,37 @@ def update_planner_node(state: State):
     plan = state['plan']
     goal = plan['goal']
     state['messages'].extend([SystemMessage(content=PLAN_SYSTEM_PROMPT), HumanMessage(content=UPDATE_PLAN_PROMPT.format(plan=plan, goal=goal))])
-    messages = state['messages']
-    
-    # 新增：补全未解决的 tool_calls（核心修复）
+    messages = state['messages'][:]  # 复制，避免原地改
+
+    # 新增：补全未解决的 tool_calls（增强匹配）
     unresolved_tool_calls = []
     for i, msg in enumerate(messages):
         if isinstance(msg, AIMessage) and msg.tool_calls:
             for tc in msg.tool_calls:
-                # 检查是否有对应的 ToolMessage（简单匹配 id）
+                # 检查后续是否有匹配 ToolMessage
                 has_response = any(
-                    isinstance(m, ToolMessage) and m.tool_call_id == tc['id']
+                    isinstance(m, ToolMessage) and m.tool_call_id == tc.get('id')
                     for m in messages[i+1:]
                 )
                 if not has_response:
-                    unresolved_tool_calls.append((tc['id'], tc))
-    
+                    unresolved_tool_calls.append((i, tc['id'], tc))  # 记录位置和 id
+
     if unresolved_tool_calls:
-        logger.warning(f"Found {len(unresolved_tool_calls)} unresolved tool_calls. Adding dummy ToolMessages.")
-        for tool_call_id, tc in unresolved_tool_calls:
-            # 创建 dummy ToolMessage（模拟工具失败/空结果，避免 API 拒绝）
+        logger.warning(f"Found {len(unresolved_tool_calls)} unresolved tool_calls. Inserting dummy ToolMessages at correct positions.")
+        offset = 0  # 插入偏移
+        for insert_idx, tool_call_id, tc in unresolved_tool_calls:
+            # 创建 dummy ToolMessage
             dummy_content = json.dumps({
-                "error": f"Dummy response for unresolved tool_call {tool_call_id} (original args: {tc['args']})",
-                "stdout": "", "stderr": "Unresolved in planner context"
+                "error": f"Dummy response for unresolved tool_call {tool_call_id} (original args: {tc.get('args', {})})",
+                "stdout": "", "stderr": "Unresolved in planner context - original error may be driver missing"
             }, ensure_ascii=False)
-            messages.append(ToolMessage(content=dummy_content, tool_call_id=tool_call_id))
-        # 更新 state['messages'] 以包含这些
-        state['messages'] = messages  # 重新赋值
-    
-    max_retries = 3  # 限重试，避免无限循环
+            dummy_msg = ToolMessage(content=dummy_content, tool_call_id=tool_call_id)
+            # 插入紧跟 AIMessage 后
+            messages.insert(insert_idx + 1 + offset, dummy_msg)
+            offset += 1  # 更新偏移
+        state['messages'] = messages  # 更新 state
+
+    max_retries = 3
     for retry in range(max_retries):
         try:
             response = llm.invoke(messages)
@@ -97,17 +100,16 @@ def update_planner_node(state: State):
             error_msg = f"json格式错误:{e}"
             logger.error(f"Retry {retry+1}/{max_retries}: {error_msg}")
             if "400" in str(e) or "invalid_request_error" in str(e):
-                # 进一步简化：移除最近的 AIMessage with tool_calls（如果重试还失败）
-                recent_ai_msgs = [m for m in messages[-5:] if isinstance(m, AIMessage) and m.tool_calls]
-                if recent_ai_msgs:
-                    messages = messages[:-len(recent_ai_msgs)]  # 截断
-                    messages.append(HumanMessage(content="Ignore previous tool calls; focus on plan update."))
-                else:
-                    raise  # 无法修复，抛出
+                # 截断最近 AIMessage + tool_calls
+                for j in range(len(messages)-1, -1, -1):
+                    if isinstance(messages[j], AIMessage) and messages[j].tool_calls:
+                        messages = messages[:j]  # 移除污染部分
+                        break
+                messages.append(HumanMessage(content="Ignore previous tool calls and errors; directly update the plan based on available info."))
             else:
-                messages += [HumanMessage(content=error_msg)]  # 其他错误，继续原逻辑
+                messages += [HumanMessage(content=error_msg)]
             if retry == max_retries - 1:
-                raise  # 最终失败
+                raise
             
 def execute_node(state: State) -> Command:
     logger.info("***正在运行 execute_node***")
@@ -115,7 +117,6 @@ def execute_node(state: State) -> Command:
     plan = state["plan"]
     steps = plan["steps"]
 
-    # 找到第一个 pending 的 step
     current_step = None
     current_step_index = 0
     for i, s in enumerate(steps):
@@ -128,18 +129,16 @@ def execute_node(state: State) -> Command:
 
     logger.info(f"当前执行 STEP: {current_step}")
 
-    # 1. 构造本轮对话历史（不含 ToolMessage） - 新增：过滤无效 ToolMessage
     cleaned_observations = []
     for obs in state["observations"]:
         if isinstance(obs, ToolMessage):
             try:
-                # 校验 content 是有效 JSON
                 json.loads(obs.content)
-                content = obs.content.replace('\n', '\\n').replace('\t', '\\t')  # 转义
+                content = obs.content.replace('\n', '\\n').replace('\t', '\\t')
                 cleaned_observations.append(ToolMessage(content=content, tool_call_id=obs.tool_call_id))
             except (json.JSONDecodeError, TypeError) as e:
                 logger.warning(f"Skipping invalid ToolMessage: {obs.content[:50]}... Error: {e}")
-                continue  # 跳过无效消息，避免污染
+                continue
         else:
             cleaned_observations.append(obs)
     
@@ -148,30 +147,27 @@ def execute_node(state: State) -> Command:
         + [SystemMessage(content=EXECUTE_SYSTEM_PROMPT)]
         + [HumanMessage(content=EXECUTION_PROMPT.format(
               user_message=state["user_message"],
-              step=current_step["description"]))]  # 注意：step 是 dict，format 用 .format(**step) 如果需要，但这里是字符串
+              step=current_step["description"]))]
     )
 
-    # 2. 第一次调用：让模型决定是否调用工具 - 新增：重试机制
     max_retries = 2
     ai_msg = None
     for retry in range(max_retries + 1):
         try:
-            bound_llm = llm.bind_tools([create_file, str_replace, shell_exec])
+            bound_llm = llm.bind_tools([create_file, str_replace, shell_exec, crawl_web3_news])
             ai_msg = bound_llm.invoke(messages)
-            break  # 成功，跳出
+            break
         except Exception as e:
             if "400" in str(e) or "Invalid parameter" in str(e):
                 logger.warning(f"Retry {retry+1}/{max_retries}: Invalid params error: {e}. Simplifying messages...")
-                # 简化 messages：只保留最后 3 条 + 当前 prompt，避免历史污染
-                messages = messages[-3:] + [SystemMessage(content=EXECUTE_SYSTEM_PROMPT)] + [HumanMessage(content=...)]  # 替换为当前 HumanMessage
+                messages = messages[-3:] + [SystemMessage(content=EXECUTE_SYSTEM_PROMPT)] + [HumanMessage(content=...)]
                 if retry == max_retries:
-                    raise  # 最终失败，抛出
+                    raise
             else:
-                raise  # 非 400 错误，直接抛
+                raise
 
-    messages.append(ai_msg)  # 把带有 tool_calls 的 AIMessage 追加到历史
+    messages.append(ai_msg)
 
-    # 3. 如果模型发起了工具调用，执行并追加 ToolMessage - 新增：预校验 args
     tool_results = []
     if ai_msg.tool_calls:
         logger.info(f"Tool calls detected: {[tc['name'] + ': ' + str(tc['args']) for tc in ai_msg.tool_calls]}")
@@ -180,11 +176,14 @@ def execute_node(state: State) -> Command:
             tool_args = tc["args"]
             tool_func = tools_map[tool_name]
             
-            # 新增：args 预校验（针对常见空/None）
-            if tool_name == "str_replace":
+            if tool_name == "crawl_web3_news":
+                if not tool_args.get("urls") or not tool_args.get("output_file"):
+                    tool_result = {"error": "urls and output_file must be non-empty"}
+                else:
+                    tool_result = tool_func.invoke(tool_args)
+            elif tool_name == "str_replace":
                 if not tool_args.get("old_str") or tool_args.get("old_str") == "" or tool_args.get("new_str") is None or tool_args.get("new_str") == "":
-                    logger.error(f"Invalid args for {tool_name}: old_str/new_str empty/None. Skipping call.")
-                    tool_result = {"error": f"Invalid parameters: {tool_args} - old_str/new_str must be non-empty strings"}
+                    tool_result = {"error": f"Invalid args for {tool_name}: old_str/new_str empty/None"}
                 elif not tool_args.get("file_name"):
                     tool_result = {"error": "Missing file_name"}
                 else:
@@ -210,7 +209,6 @@ def execute_node(state: State) -> Command:
                 tool_call_id=tc["id"]
             ))
 
-        # 4. 第二次调用：让模型对工具返回结果进行总结
         final_ai_msg = llm.invoke(messages)
         messages.append(final_ai_msg)
         summary = extract_answer(final_ai_msg.content)
@@ -219,18 +217,27 @@ def execute_node(state: State) -> Command:
 
     logger.info(f"当前 STEP 执行总结: {summary}")
 
-    # 5. 把本轮新产生的信息写回 state - 修复：只追加新 ToolMessage（用 tool_results）
+    # 生成新 ToolMessage
     new_tool_messages = [
         ToolMessage(content=json.dumps(tr, ensure_ascii=False), tool_call_id=tc["id"])
         for tc, tr in zip(ai_msg.tool_calls or [], tool_results)
     ]
-    # state["messages"] += [m for m in messages if isinstance(m, (AIMessage, HumanMessage, SystemMessage)) and m not in state["messages"]]  # 只加非 Tool
-    # state["observations"] += new_tool_messages
-    all_new_messages = [m for m in messages if m not in state["messages"]]  # 全加，包括 ToolMessage
-    state["messages"] += all_new_messages
+
+    # 新增：将所有新消息（包括 ToolMessage）添加到 state["messages"]，确保序列完整
+    # 先去重：避免重复添加旧消息
+    existing_ids = {id(m) for m in state["messages"]}  # 用 id() 去重（更可靠）
+    new_messages_to_add = []
+    for m in messages:
+        if id(m) not in existing_ids:
+            new_messages_to_add.append(m)
+            existing_ids.add(id(m))
+    state["messages"] += new_messages_to_add  # 全加：AIMessage + ToolMessage + 其他
+
+    # observations 只加 ToolMessage 和 summary（原样）
+    state["observations"] += new_tool_messages
     state["observations"] += [AIMessage(content=summary)]
 
-    # 更新当前 step 状态为 completed（可选，根据 summary 判断）
+    # 更新 step 状态（原样）
     plan["steps"][current_step_index]["status"] = "completed"
 
     return Command(goto="update_planner", update={"plan": plan})
@@ -245,10 +252,10 @@ def report_node(state: State):
     messages = observations + [SystemMessage(content=REPORT_SYSTEM_PROMPT)]
     
     while True:
-        response = llm.bind_tools([create_file, shell_exec]).invoke(messages)
+        response = llm.bind_tools([create_file, shell_exec, crawl_web3_news]).invoke(messages)
         response = response.model_dump_json(indent=4, exclude_none=True)
         response = json.loads(response)
-        tools = {"create_file": create_file, "shell_exec": shell_exec} 
+        tools = {"create_file": create_file, "shell_exec": shell_exec, "crawl_web3_news": crawl_web3_news}
         if response['tool_calls']:    
             for tool_call in response['tool_calls']:
                 tool_name = tool_call['name']

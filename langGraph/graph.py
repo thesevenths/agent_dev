@@ -38,9 +38,15 @@ def build_graph():
 graph = build_graph()
 
 
-inputs = {"user_message": "对所给文档进行分析，生成分析报告。文档使用utf-8格式读取，路径为当前目录的 F:\agent\langGraph\student_habits_performance.csv",
+# inputs = {"user_message": "对所给文档进行分析，生成分析报告。文档使用utf-8格式读取，路径为当前目录的 F:\agent\langGraph\student_habits_performance.csv",
+#           "plan": None,
+#           "observations": [], 
+#           "final_report": ""}
+
+inputs = {"user_message": "我是加密货币的交易员，帮我爬取历史上加密货币的新闻，并保存到本地",
           "plan": None,
           "observations": [], 
           "final_report": ""}
+
 
 graph.invoke(inputs, {"recursion_limit":100})
