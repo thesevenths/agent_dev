@@ -61,7 +61,7 @@ Create a plan according to the following requirements:
 - If multiple charts need to be drawn, draw them step by step, generating only one chart per step
 
 User message:
-{user_message}/no_think
+{user_message}  /no_think
 '''
 
 UPDATE_PLAN_PROMPT = """
@@ -77,13 +77,13 @@ Input:
 - goal: the goal of the plan
 
 Output:
-- the updated plan in json format
+- must have the updated plan in json format
 
 Plan:
 {plan}
 
 Goal:
-{goal}/no_think
+{goal}  /no_think
 """
 
 

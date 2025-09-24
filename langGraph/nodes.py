@@ -8,8 +8,8 @@ from state import State
 from prompts import *
 from tools import *
 
+llm = ChatOpenAI(model="", temperature=0.0, base_url='', api_key='sk-')
 
-# llm = ChatOpenAI(model="", temperature=0.0, base_url='', api_key='')
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -59,7 +59,7 @@ def update_planner_node(state: State):
     state['messages'].extend([SystemMessage(content=PLAN_SYSTEM_PROMPT), HumanMessage(content=UPDATE_PLAN_PROMPT.format(plan=plan, goal=goal))])
     messages = state['messages'][:]  # 复制，避免原地改
 
-    # 新增：补全未解决的 tool_calls（增强匹配）
+    # 识别message中哪些tool call请求没有对应的response。 补全未解决的 tool_calls（增强匹配）
     unresolved_tool_calls = []
     for i, msg in enumerate(messages):
         if isinstance(msg, AIMessage) and msg.tool_calls:
@@ -72,7 +72,7 @@ def update_planner_node(state: State):
                 if not has_response:
                     unresolved_tool_calls.append((i, tc['id'], tc))  # 记录位置和 id
 
-    if unresolved_tool_calls:
+    if unresolved_tool_calls: # 插入虚拟 ToolMessage，补全message，使其满足 API 要求（每个 tool_call_id 必须有响应），从而避免 400 错误。
         logger.warning(f"Found {len(unresolved_tool_calls)} unresolved tool_calls. Inserting dummy ToolMessages at correct positions.")
         offset = 0  # 插入偏移
         for insert_idx, tool_call_id, tc in unresolved_tool_calls:
@@ -110,12 +110,18 @@ def update_planner_node(state: State):
                 messages += [HumanMessage(content=error_msg)]
             if retry == max_retries - 1:
                 raise
-            
+
+
 def execute_node(state: State) -> Command:
     logger.info("***正在运行 execute_node***")
 
     plan = state["plan"]
-    steps = plan["steps"]
+    # 容错：确保 plan 包含 steps
+    if not isinstance(plan, dict) or "steps" not in plan or not isinstance(plan["steps"], list):
+        logger.error(f"Invalid plan structure: {plan}. Using default steps.")
+        steps = [{"title": "默认步骤", "description": "执行默认操作", "status": "pending"}]
+    else:
+        steps = plan["steps"]
 
     current_step = None
     current_step_index = 0
@@ -141,13 +147,13 @@ def execute_node(state: State) -> Command:
                 continue
         else:
             cleaned_observations.append(obs)
-    
+
     messages = (
-        cleaned_observations
-        + [SystemMessage(content=EXECUTE_SYSTEM_PROMPT)]
-        + [HumanMessage(content=EXECUTION_PROMPT.format(
-              user_message=state["user_message"],
-              step=current_step["description"]))]
+            cleaned_observations
+            + [SystemMessage(content=EXECUTE_SYSTEM_PROMPT)]
+            + [HumanMessage(content=EXECUTION_PROMPT.format(
+        user_message=state["user_message"],
+        step=current_step["description"]))]
     )
 
     max_retries = 2
@@ -159,8 +165,9 @@ def execute_node(state: State) -> Command:
             break
         except Exception as e:
             if "400" in str(e) or "Invalid parameter" in str(e):
-                logger.warning(f"Retry {retry+1}/{max_retries}: Invalid params error: {e}. Simplifying messages...")
-                messages = messages[-3:] + [SystemMessage(content=EXECUTE_SYSTEM_PROMPT)] + [HumanMessage(content=...)]
+                logger.warning(f"Retry {retry + 1}/{max_retries}: Invalid params error: {e}. Simplifying messages...")
+                retry_message = f"重试执行步骤：{current_step['description']}，忽略之前的工具调用错误。"
+                messages = messages[-3:] + [SystemMessage(content=EXECUTE_SYSTEM_PROMPT)] + [HumanMessage(content=retry_message)]
                 if retry == max_retries:
                     raise
             else:
@@ -175,7 +182,7 @@ def execute_node(state: State) -> Command:
             tool_name = tc["name"]
             tool_args = tc["args"]
             tool_func = tools_map[tool_name]
-            
+
             if tool_name == "crawl_web3_news":
                 if not tool_args.get("urls") or not tool_args.get("output_file"):
                     tool_result = {"error": "urls and output_file must be non-empty"}
@@ -197,10 +204,12 @@ def execute_node(state: State) -> Command:
                 if not tool_args.get("command") or tool_args.get("command") == "":
                     tool_result = {"error": "Invalid parameters: command must be non-empty"}
                 else:
-                    tool_result = tool_func.invoke(tool_args)
+                    # 确保命令为 Windows 兼容
+                    command = tool_args["command"].replace("ls", "dir", 1) if "ls" in tool_args["command"] else tool_args["command"]
+                    tool_result = tool_func.invoke({"command": command})
             else:
                 tool_result = tool_func.invoke(tool_args)
-            
+
             tool_results.append(tool_result)
             logger.info(f"tool_name:{tool_name}, tool_args:{tool_args}\ntool_result:{tool_result}")
 
