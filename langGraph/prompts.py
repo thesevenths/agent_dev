@@ -23,6 +23,9 @@ Operational Capabilities
 - Perform data analysis using Python libraries
 - Chinese font file path: SimSun.ttf 
 </execute_environment>
+3 web crawling 
+- crawl the date from suitable web site
+- store the crawled date into file
 """
 
 PLAN_CREATE_PROMPT = '''
