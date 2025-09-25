@@ -105,7 +105,12 @@ def update_planner_node(state: State):
                     if isinstance(messages[j], AIMessage) and messages[j].tool_calls:
                         messages = messages[:j]  # 移除污染部分
                         break
-                messages.append(HumanMessage(content="Ignore previous tool calls and errors; directly update the plan based on available info."))
+                # messages.append(HumanMessage(content="Ignore previous tool calls and errors; directly update the plan based on available info."))
+                text = (
+                    "Ignore previous tool calls and errors; directly update the plan based on available info.\n\n"
+                    f"{UPDATE_PLAN_PROMPT.format(plan=plan, goal=goal)}"
+                )
+                messages = [HumanMessage(content=text)]
             else:
                 messages += [HumanMessage(content=error_msg)]
             if retry == max_retries - 1:
