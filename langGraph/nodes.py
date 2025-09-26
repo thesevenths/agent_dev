@@ -232,7 +232,8 @@ def execute_node(state: State) -> Command:
         return Command(goto="report")
     current_step = steps[current_index]
     desc = current_step.get("description", "")
-    # 函数结尾 observations 只保留 ToolMessage和最后的summary AImessage, 节约token；所以进入LLM前要检查是否匹配，不匹配toolMessage要去掉！
+
+    # 函数结尾 observations 只保留 ToolMessage和最后的summary AImessage, 节约token；所以进入LLM前要检查是否匹配，不匹配的toolMessage要去掉！
     # 合并 observations + system + human prompt;
     messages = state.get("observations", [])[:]  # copy
     messages.append(SystemMessage(content=EXECUTE_SYSTEM_PROMPT))
@@ -249,7 +250,8 @@ def execute_node(state: State) -> Command:
 
     # 将新 messages 加入 state["messages"]
     state["messages"].extend(messages)
-    # 仅 observations 保留 ToolMessage + summary AIMessage
+    # 仅 observations 保留 ToolMessage + summary AIMessage；
+    # 每个步骤结束后要使用LLM总结，生成summary AIMessage，用来提示目前的执行进度，其实只保留summary AIMessage也行
     for m in messages:
         if isinstance(m, ToolMessage):
             state["observations"].append(m)
