@@ -38,7 +38,7 @@ def build_graph():
 graph = build_graph()
 
 
-inputs = {"user_message": "对所给文档进行分析，生成分析报告。文档使用utf-8格式读取，路径为当前目录的 E:\agent_dev\langGraph\student_habits_performance.csv",
+inputs = {"user_message": "对所给文档进行分析，生成分析报告。文档使用utf-8格式读取，路径为当前目录的 E:\\agent_dev\\langGraph\\student_habits_performance.csv",
           "plan": None,
           "observations": [],
           "final_report": ""}
