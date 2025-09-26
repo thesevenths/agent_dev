@@ -9,13 +9,16 @@ if not os.path.exists(file_path):
 else:
     print(f"文件存在：{file_path}")
 
-    # 尝试以UTF-8编码打开文件，检查是否可读
+    # 尝试以UTF-8编码打开文件，读取前几行进行验证
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read(1024)  # 读取前1024个字符进行验证
-            print("文件成功以UTF-8编码读取前1024字符。")
-            print("文件开头内容预览：\n", content[:200])
+            for i in range(5):  # 读取前5行
+                line = f.readline()
+                if not line:
+                    break
+                print(f"第{i+1}行: {line.strip()}")
+        print("\n文件成功以UTF-8编码读取，格式正常。")
     except UnicodeDecodeError as e:
-        print(f"UTF-8解码错误：{e}")
+        print(f"\n文件读取失败，编码错误：{e}")
     except Exception as e:
-        print(f"读取文件时发生其他错误：{e}")
+        print(f"\n发生未知错误：{e}")

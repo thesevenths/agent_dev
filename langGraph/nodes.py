@@ -11,6 +11,7 @@ from tools import *
 
 llm = ChatOpenAI(model="", temperature=0.0, base_url='', api_key='sk-')
 
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -74,7 +75,7 @@ def strict_pair_messages(messages: list) -> list:
 def compress_messages_keep_ai_and_recent_sys_human(msgs, keep_recent_h=1, keep_recent_s=1):
     """
     压缩消息，只保留：
-     - 所有不含 tool_calls 的 AIMessage（视为对话内容的核心历史）
+     - 所有不含 tool_calls 的 AIMessage（视为对话内容的核心历史），也就是每个step的总结
      - 最近 keep_recent_h 条 HumanMessage
      - 最近 keep_recent_s 条 SystemMessage
     丢弃所有 ToolMessage 和带 tool_calls 的 AIMessage，以及曾经的 Human/System。
@@ -175,8 +176,10 @@ def update_planner_node(state: State):
     # messages = state["messages"][:]
     # messages = state["messages"][:]
     # messages = state["observations"][:]  # 这里可以用state["observations"][:]替代，减少message
+
     # 压缩历史消息
-    messages = compress_messages_keep_ai_and_recent_sys_human(state["messages"], keep_recent_h=1, keep_recent_s=1)
+    # messages = compress_messages_keep_ai_and_recent_sys_human(state["messages"], keep_recent_h=1, keep_recent_s=1)
+    messages = compress_messages_keep_ai_and_recent_sys_human(state["observations"], keep_recent_h=1, keep_recent_s=1)
 
     # 再加上本次的 System + Human prompt
     messages.append(SystemMessage(content=PLAN_SYSTEM_PROMPT))
@@ -229,8 +232,8 @@ def execute_node(state: State) -> Command:
         return Command(goto="report")
     current_step = steps[current_index]
     desc = current_step.get("description", "")
-
-    # 合并 observations + system + human prompt
+    # 函数结尾 observations 只保留 ToolMessage和最后的summary AImessage, 节约token；所以进入LLM前要检查是否匹配，不匹配toolMessage要去掉！
+    # 合并 observations + system + human prompt;
     messages = state.get("observations", [])[:]  # copy
     messages.append(SystemMessage(content=EXECUTE_SYSTEM_PROMPT))
     messages.append(HumanMessage(content=EXECUTION_PROMPT.format(
