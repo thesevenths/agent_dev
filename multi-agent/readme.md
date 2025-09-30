@@ -7,3 +7,7 @@ multi agent开发！ 经典的supervised + other agent结构！
 数据库读写：
 
 ![1759239410997](image/readme/1759239410997.png)
+
+text2sql：根据用户的prompt自动生成sql查询并返回结果  
+
+![1759243044703](image/readme/1759243044703.png)
