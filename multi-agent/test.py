@@ -55,3 +55,34 @@
 
 import sys
 print(sys.version)
+
+from config import PG_CONN_STR, TAVILY_API_KEY
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
+from sqlalchemy.orm import sessionmaker, declarative_base
+Base = declarative_base()
+engine = create_engine(PG_CONN_STR)
+Base.metadata.create_all(engine)
+
+Session = sessionmaker(bind=engine)
+session = Session()
+print(session)
+
+from sqlalchemy import inspect
+
+# inspector = inspect(engine)
+# tables = inspector.get_table_names()
+# print("数据库中的表：", tables)
+# for table_name in tables:
+#     print(f"\n表：{table_name}")
+#     for column in inspector.get_columns(table_name):
+#         print(f"  {column['name']} ({column['type']})")
+
+# 用 session 绑定的引擎做 inspect
+inspector = inspect(session.bind)
+
+# 所有表名
+for table_name in inspector.get_table_names():
+    print(f"\n表：{table_name}")
+    # 该表的所有列
+    for col in inspector.get_columns(table_name):
+        print(f"  {col['name']}  {col['type']}")

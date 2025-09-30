@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from langchain_experimental.utilities import PythonREPL
 from pydantic import BaseModel
 from langchain_core.tools import tool
+from sqlalchemy import inspect
 
 from config import PG_CONN_STR, TAVILY_API_KEY
 
@@ -216,3 +217,18 @@ def query_sales(sales_id):
         return {"messages": [f"查询失败，错误原因：{e}"]}
     finally:
         session.close()
+
+@tool
+def query_table_schema():
+    """
+        query tables name and columns in database
+    """
+    session = Session()
+    inspector = inspect(session.bind)
+    # 所有表名
+    # for table_name in inspector.get_table_names():
+    #     print(f"\n表：{table_name}")
+    #     # 该表的所有列
+    #     for col in inspector.get_columns(table_name):
+    #         print(f"  {col['name']}  {col['type']}")
+    return inspector.get_table_names()
