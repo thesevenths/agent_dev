@@ -259,14 +259,24 @@ def execute_sql(
 @tool
 def query_table_schema():
     """
-        query tables name and columns in database
+    Query all table names and their column details (name and type) in the database.
+    Returns a dictionary mapping table names to list of column info.
     """
     session = Session()
-    inspector = inspect(session.bind)
-    # 所有表名
-    # for table_name in inspector.get_table_names():
-    #     print(f"\n表：{table_name}")
-    #     # 该表的所有列
-    #     for col in inspector.get_columns(table_name):
-    #         print(f"  {col['name']}  {col['type']}")
-    return inspector.get_table_names()
+    try:
+        inspector = inspect(session.bind)
+        schema = {}
+        for table_name in inspector.get_table_names():
+            columns = inspector.get_columns(table_name)
+            schema[table_name] = [
+                {
+                    "name": col["name"],
+                    "type": str(col["type"])  # Convert SQLAlchemy type to string for readability
+                }
+                for col in columns
+            ]
+        return schema
+    except Exception as e:
+        return {"error": f"Failed to retrieve schema: {str(e)}"}
+    finally:
+        session.close()
