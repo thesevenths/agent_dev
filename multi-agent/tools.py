@@ -196,7 +196,7 @@ def update_sale(sales_id, quantity, amount):
 # 4. 查询销售数据
 @tool(args_schema=QuerySalesSchema)
 def query_sales(sales_id):
-    """Query sale record from the database."""
+    """Query sales record from the database."""
     session = Session()
     try:
         sale_data = session.query(SalesData).filter(SalesData.sales_id == sales_id).first()
