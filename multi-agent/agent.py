@@ -31,7 +31,7 @@ from prompt import db_system_prompt,supervisor_system_prompt
 from config import DASHSCOPE_API_KEY
 
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-
+# print(DASHSCOPE_BASE_URL)
 # supervisor
 supervisor_llm = ChatOpenAI(model="qwen-plus",
                             api_key=DASHSCOPE_API_KEY,
@@ -132,6 +132,11 @@ def supervisor(state: AgentState):
     #     5. know exactly when to stop the conversation and response {{'next': 'FINISH'}}.
     #     """
     # )
+
+    # print("🔍 Supervisor called!")
+    # print("DASHSCOPE_API_KEY (from env):", os.getenv("DASHSCOPE_API_KEY"))
+    # print("DASHSCOPE_BASE_URL:", repr(DASHSCOPE_BASE_URL))  # 注意 repr 能看到空格！
+
     messages = [SystemMessage(content=supervisor_system_prompt.format(members=members))] + state["messages"]
     response = supervisor_llm.with_structured_output(Router).invoke(messages)
     next_ = response["next"]
@@ -169,3 +174,10 @@ workflow.add_conditional_edges(
 
 graph = workflow.compile()
 graph.name = "multi-Agent"
+
+if __name__ == "__main__":
+    from langchain_core.messages import HumanMessage
+    result = graph.invoke({
+        "messages": [HumanMessage(content="你好")]
+    })
+    print(result)
