@@ -25,8 +25,7 @@ from typing_extensions import TypedDict
 from typing import Literal
 from tools import tavily_search
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
-
+from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, MessagesPlaceholder
 from prompt import db_system_prompt,supervisor_system_prompt
 
 from config import DASHSCOPE_API_KEY
@@ -65,7 +64,7 @@ db_agent = create_react_agent(
     tools=[add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql],
     prompt=ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(db_system_prompt),
-        HumanMessagePromptTemplate.from_template("{input}"),
+        MessagesPlaceholder(variable_name="messages"),  # 处理 messages 键
     ])
 )
 code_agent = create_react_agent(coder_llm, tools=[python_repl])
