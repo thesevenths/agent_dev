@@ -1,10 +1,22 @@
+import sys
+import os
+from dotenv import load_dotenv
+
+# 调试工作目录和路径
+print("Current working directory:", os.getcwd())
+print("Python path:", sys.path)
+
+# 加载环境变量
+load_dotenv()
+print("DASHSCOPE_API_KEY:", os.getenv("DASHSCOPE_API_KEY"))
+print("TAVILY_API_KEY:", os.getenv("TAVILY_API_KEY"))
+
 """Define a data enrichment agent.
 
 Works with a chat model with tool calling support.
 """
 
 from langgraph.prebuilt import create_react_agent
-from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
 from langchain_openai import ChatOpenAI
 from tools import python_repl, add_sale, delete_sale, update_sale, query_sales
@@ -12,33 +24,30 @@ from state import AgentState
 from typing_extensions import TypedDict
 from typing import Literal
 from tools import tavily_search
-
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
-
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from config import DASHSCOPE_API_KEY
+DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
 # 用于普通问答对话
 chat_llm = ChatOpenAI(model="qwen-plus",
                     api_key=DASHSCOPE_API_KEY,
-                    base_url='https://dashscope.aliyuncs.com/compatible-mode/v')
+                    base_url=DASHSCOPE_BASE_URL)
 
 # 用于数据库检索
 db_llm = ChatOpenAI(model="qwen-plus",
                    api_key=DASHSCOPE_API_KEY,
-                   base_url='https://dashscope.aliyuncs.com/compatible-mode/v')
+                   base_url=DASHSCOPE_BASE_URL)
 
 # 用于代码生成和执行代码
 coder_llm = ChatOpenAI(model="qwen-plus",
                    api_key=DASHSCOPE_API_KEY,
-                   base_url='https://dashscope.aliyuncs.com/compatible-mode/v')
+                   base_url=DASHSCOPE_BASE_URL)
 
 # 爬取数据
 crawler_llm = ChatOpenAI(model="qwen-plus",
                    api_key=DASHSCOPE_API_KEY,
-                   base_url='https://dashscope.aliyuncs.com/compatible-mode/v')
+                   base_url=DASHSCOPE_BASE_URL)
 
 
 # --- 1. 创建原始 agent（不带 system prompt）---
@@ -50,7 +59,6 @@ crawler_agent = create_react_agent(crawler_llm, tools=[tavily_search])
 # --- 2. 定义带系统提示的节点函数 ---
 def chat_agent_node(state):
     messages = state["messages"]
-    # 插入系统消息（如果还没有）
     if not messages or not isinstance(messages[0], SystemMessage):
         messages = [
             SystemMessage(content="You are an intelligent chat bot.")
@@ -86,57 +94,56 @@ def crawler_agent_node(state):
     return {"messages": [response["messages"][-1]], "sender": "CrawlerAgent"}
 
 
-# 任何一个代理都可以决定结束
-
-members = ["chat", "coder", "sqler", "crawler"]
+# 定义成员列表，与节点名称一致
+members = ["chat_agent", "code_agent", "db_agent", "crawler_agent"]
 options = members + ["FINISH"]
-
 
 class Router(TypedDict):
     """Worker to route to next. If no workers needed, route to FINISH"""
     next: Literal[*options]
 
-
 def supervisor(state: AgentState):
     system_prompt = (
-        "You are a supervisor tasked with managing a conversation between the"
-        f" following workers: {members}.\n\n"
-        "Each worker has a specific role:\n"
-        "- chat: Responds directly to user inputs using natural language.\n"
-        "- coder: un python code to display diagrams or output execution results.\n"
-        "- sqler: perform database operations while should provide accurate data for the code_generator to use.\n"
-        " Given the following user request, respond with the worker to act next."
-        " Each worker will perform a task and respond with their results and status."
-        "When you think the result has answered the user's question, just reply FINISH."
+        "You are a supervisor managing a conversation between: "
+        f"{members}. Each has a role: chat_agent (chat), code_agent (run Python code), "
+        "db_agent (database ops), crawler_agent (web search). "
+        "Given the user request, choose the next worker to act. "
+        "Respond with a JSON object like {{'next': 'worker_name'}} or {{'next': 'FINISH'}}. "
+        "Use JSON format strictly."
     )
-
-    messages = [{"role": "system", "content": system_prompt},] + state["messages"]
-
-    response = db_llm.with_structured_output(Router).invoke(messages)
+    messages = [SystemMessage(content=system_prompt)] + state["messages"]
+    response = chat_llm.with_structured_output(Router).invoke(messages)
     next_ = response["next"]
-    if next_ == "FINISH":
-        next_ = END
-    return {"next": next_}
+    # return {"next": END if next_ == "FINISH" else next_}
+    return {"next": next_}   # 保持字符串，比如 "FINISH"
 
-
+# --- 修复后的 workflow ---
 workflow = StateGraph(AgentState)
-
 workflow.add_node("supervisor", supervisor)
 workflow.add_node("chat_agent", chat_agent_node)
 workflow.add_node("db_agent", db_agent_node)
 workflow.add_node("code_agent", code_agent_node)
 workflow.add_node("crawler_agent", crawler_agent_node)
 
+# 每个 agent 完成后回到 supervisor
 for member in members:
-    # 每个子代理在完成工作后总是向主管“汇报”
     workflow.add_edge(member, "supervisor")
 
+# 从 START 进入 supervisor
 workflow.add_edge(START, "supervisor")
-# 在图状态中填充`next`字段，路由到具体的某个节点或者结束图的运行，从来指定如何执行接下来的任务。
-workflow.add_conditional_edges("supervisor", lambda state: state["next"])
 
-# 编译图
+# supervisor 决定下一步（条件路由）
+workflow.add_conditional_edges(
+    "supervisor",
+    lambda state: state["next"],
+    {
+        "chat_agent": "chat_agent",
+        "db_agent": "db_agent",
+        "code_agent": "code_agent",
+        "crawler_agent": "crawler_agent",
+        "FINISH": END,
+    }
+)
+
 graph = workflow.compile()
-
 graph.name = "multi-Agent"
-

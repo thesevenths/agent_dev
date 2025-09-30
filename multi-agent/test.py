@@ -52,3 +52,6 @@
 #
 # Session = sessionmaker(bind=engine)
 # session = Session()
+
+import sys
+print(sys.version)
