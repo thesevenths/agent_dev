@@ -81,8 +81,17 @@ from sqlalchemy import inspect
 inspector = inspect(session.bind)
 
 # 所有表名
+session = Session()
+
+inspector = inspect(session.bind)
+schema = {}
 for table_name in inspector.get_table_names():
-    print(f"\n表：{table_name}")
-    # 该表的所有列
-    for col in inspector.get_columns(table_name):
-        print(f"  {col['name']}  {col['type']}")
+    columns = inspector.get_columns(table_name)
+    schema[table_name] = [
+        {
+            "name": col["name"],
+            "type": str(col["type"])  # Convert SQLAlchemy type to string for readability
+        }
+        for col in columns
+    ]
+print(schema)

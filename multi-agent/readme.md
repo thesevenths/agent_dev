@@ -1,5 +1,9 @@
-multi agent开发！  
-研究报告：
-![img.png](img.png)  
+multi agent开发！ 经典的supervised + other agent结构！
+
+生成研究报告：
+
+![1759239379759](image/readme/1759239379759.png)
+
 数据库读写：
-![img_1.png](img_1.png)
+
+![1759239410997](image/readme/1759239410997.png)
