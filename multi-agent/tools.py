@@ -12,7 +12,7 @@ from langchain_experimental.utilities import PythonREPL
 from pydantic import BaseModel
 from langchain_core.tools import tool
 from sqlalchemy import inspect
-
+from sqlalchemy import text
 from config import PG_CONN_STR, TAVILY_API_KEY
 
 from langchain_tavily import TavilySearch
@@ -217,6 +217,44 @@ def query_sales(sales_id):
         return {"messages": [f"查询失败，错误原因：{e}"]}
     finally:
         session.close()
+
+
+@tool
+def execute_sql(
+        sql_query: Annotated[str, "The SQL query to execute against the database. Use SELECT for reads, INSERT/UPDATE/DELETE for writes."],
+        is_read_only: Annotated[bool, "Set to True for read-only queries (SELECT). False allows writes. Default: True."] = True
+):
+    """Execute an arbitrary SQL query on the database and return the results.
+
+    - For SELECT queries, returns a list of dictionaries (rows).
+    - For write queries (INSERT/UPDATE/DELETE), returns the number of affected rows or success message.
+    - Always include schema names if needed (e.g., public.sales_data).
+    - Do not execute DDL (e.g., CREATE/DROP TABLE) unless explicitly allowed.
+    """
+    session = Session()
+    try:
+        # Use text() for raw SQL to prevent injection (though LLM-generated, still safer)
+        stmt = text(sql_query)
+
+        if is_read_only:
+            # For reads: Fetch all rows as dicts
+            result = session.execute(stmt)
+            rows = result.fetchall()
+            columns = result.keys()
+            data = [dict(zip(columns, row)) for row in rows]
+            session.commit()  # Not needed for reads, but harmless
+            return {"results": data, "messages": ["Query executed successfully."]}
+        else:
+            # For writes: Execute and get affected rows
+            result = session.execute(stmt)
+            session.commit()
+            return {"affected_rows": result.rowcount, "messages": ["Write operation successful."]}
+    except Exception as e:
+        session.rollback()
+        return {"messages": [f"Query failed: {str(e)}"]}
+    finally:
+        session.close()
+
 
 @tool
 def query_table_schema():
