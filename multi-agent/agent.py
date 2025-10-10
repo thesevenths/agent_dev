@@ -19,7 +19,7 @@ Works with a chat model with tool calling support.
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph, START, END
 from langchain_openai import ChatOpenAI
-from tools import python_repl, add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql
+from tools import python_repl, add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql, create_file, str_replace, shell_exec
 from state import AgentState
 from typing_extensions import TypedDict
 from typing import Literal
@@ -67,7 +67,7 @@ db_agent = create_react_agent(
         MessagesPlaceholder(variable_name="messages"),  # 处理 messages 键
     ])
 )
-code_agent = create_react_agent(coder_llm, tools=[python_repl])
+code_agent = create_react_agent(coder_llm, tools=[python_repl, create_file, str_replace, shell_exec])
 crawler_agent = create_react_agent(crawler_llm, tools=[tavily_search])
 
 
