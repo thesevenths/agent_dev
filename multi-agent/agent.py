@@ -19,14 +19,14 @@ Works with a chat model with tool calling support.
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph, START, END
 from langchain_openai import ChatOpenAI
-from tools import python_repl, add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql, create_file, str_replace, shell_exec
+from tools import python_repl, add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql, create_file, str_replace, shell_exec, list_files_metadata
 from state import AgentState
 from typing_extensions import TypedDict
 from typing import Literal
 from tools import tavily_search
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, MessagesPlaceholder
-from prompt import db_system_prompt,supervisor_system_prompt
+from prompt import db_system_prompt,supervisor_system_prompt,rag_system_prompt
 
 from config import DASHSCOPE_API_KEY
 
@@ -57,6 +57,12 @@ crawler_llm = ChatOpenAI(model="qwen-plus",
                          api_key=DASHSCOPE_API_KEY,
                          base_url=DASHSCOPE_BASE_URL)
 
+
+# RAG agent：读取知识库回答问题
+rag_llm = ChatOpenAI(model="qwen-plus",
+                     api_key=DASHSCOPE_API_KEY,
+                     base_url=DASHSCOPE_BASE_URL)
+
 # --- 1. 创建原始 agent（不带 system prompt）---
 chat_agent = create_react_agent(chat_llm, tools=[])
 db_agent = create_react_agent(
@@ -69,7 +75,14 @@ db_agent = create_react_agent(
 )
 code_agent = create_react_agent(coder_llm, tools=[python_repl, create_file, str_replace, shell_exec])
 crawler_agent = create_react_agent(crawler_llm, tools=[tavily_search])
-
+rag_agent = create_react_agent(
+    rag_llm,
+    tools=[list_files_metadata],
+    prompt=ChatPromptTemplate.from_messages([
+        SystemMessagePromptTemplate.from_template(rag_system_prompt.format(file_path=os.getcwd() + "\\documents")),
+        MessagesPlaceholder(variable_name="messages"),  # 处理 messages 键
+    ])
+)
 
 # --- 2. 定义带系统提示的节点函数 ---
 def chat_agent_node(state):
@@ -112,8 +125,19 @@ def crawler_agent_node(state):
     return {"messages": [response["messages"][-1]], "sender": "CrawlerAgent"}
 
 
+def rag_agent_node(state):
+    messages = state["messages"]
+    if not messages or not isinstance(messages[0], SystemMessage):
+        messages = [
+                       SystemMessage(content="You are an agentic retrieval-augmented generation (RAG) agent.")
+                   ] + messages
+    response = rag_agent.invoke({"messages": messages})
+    return {"messages": [response["messages"][-1]], "sender": "RAGAgent"}
+
+
+
 # 定义成员列表，与节点名称一致
-members = ["chat_agent", "code_agent", "db_agent", "crawler_agent"]
+members = ["chat_agent", "code_agent", "db_agent", "crawler_agent", "rag_agent"]
 options = members + ["FINISH"]
 
 
@@ -151,6 +175,7 @@ workflow.add_node("chat_agent", chat_agent_node)
 workflow.add_node("db_agent", db_agent_node)
 workflow.add_node("code_agent", code_agent_node)
 workflow.add_node("crawler_agent", crawler_agent_node)
+workflow.add_node("rag_agent", rag_agent_node)
 
 # 每个 agent 完成后回到 supervisor
 for member in members:
@@ -168,6 +193,7 @@ workflow.add_conditional_edges(
         "db_agent": "db_agent",
         "code_agent": "code_agent",
         "crawler_agent": "crawler_agent",
+        "rag_agent": "rag_agent",
         "FINISH": END,
     }
 )

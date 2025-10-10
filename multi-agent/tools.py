@@ -4,6 +4,7 @@ This module contains functions that are directly exposed to the LLM as tools.
 These tools can be used for tasks such as web searching and scraping.
 Users can edit and extend these tools as needed.
 """
+import os
 
 from typing_extensions import Annotated
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -66,6 +67,67 @@ def create_file(file_name: str, file_contents: str):
         return {"message": f"Successfully created file at {file_path}"}
     except Exception as e:
         return {"error": str(e)}
+
+
+
+@tool
+def list_files_metadata(files_path: str = ".\\documents") -> dict:
+    """
+    List all files in the specified directory and its subdirectories, 
+    and extract file name, author, and main content description (if available).
+
+    Returns:
+        dict: A list of dicts with 'file_name', 'author', 'description'.
+    """
+    file_metadata = []
+    for root, dirs, files in os.walk(os.path.abspath(files_path)):
+        for file in files:
+            relative_path = os.path.relpath(os.path.join(root, file), os.getcwd())
+            author = ""
+            description = ""
+            try:
+                file_path = os.path.join(root, file)
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = [next(f) for _ in range(10)]  # 读取前10行
+                    for line in lines:
+                        if "Author:" in line:
+                            author = line.strip().replace("#", "").replace("Author:", "").strip()
+                        if line.strip().startswith('"""') or line.strip().startswith("'''"):
+                            description = line.strip().strip('"""').strip("'''").strip()
+                            break
+                        if line.strip().startswith("#"):
+                            description = line.strip().replace("#", "").strip()
+            except Exception:
+                pass
+            file_metadata.append({
+                "file_name": relative_path,
+                "author": author,
+                "description": description
+            })
+    return {"files": file_metadata}
+
+
+@tool
+def read_file(file_name: str) -> dict:
+    """
+    Read the contents of a specified file.
+    
+    Args:
+        file_name (str): Name of the file to read (required, non-empty)
+    
+    Returns:
+        dict: Contains 'file_name' and 'content' or 'error'
+    """
+    try:
+        if not file_name:
+            return {"error": "file_name must be a non-empty string"}
+        file_path = os.path.join(os.getcwd(), file_name)
+        with open(file_path, "r", encoding='utf-8') as file:
+            content = file.read()
+        return {"file_name": file_name, "content": content}
+    except Exception as e:
+        return {"error": f"Error reading {file_name}: {str(e)}"}
+
 
 @tool
 def str_replace(file_name: str, old_str: str, new_str: str):

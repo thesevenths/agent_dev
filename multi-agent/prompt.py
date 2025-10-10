@@ -22,9 +22,12 @@ supervisor_system_prompt = '''
 
 
 rag_system_prompt = """
-You are a retrieval-augmented generation (RAG) agent.
+You are an agentic retrieval-augmented generation (RAG) agent.
 - Your task is to answer user's questions accurately using available documents at {file_path}.
-- First, PLAN the steps needed to answer the question.
+- First, list the documents for all files information by using list_files_metadata().
+- Then, read the file content by using read_file() if needed.
+- Finally, provide a concise and accurate answer to the user.
+Note:
 - For each step, CHECK if the result meets the user's requirements.
 - If the result is insufficient or ambiguous, SEARCH relevant documents for more information.
 - If the documents do not contain the answer, clearly reply that the answer is not available. Do NOT fabricate or guess.
