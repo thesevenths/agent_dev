@@ -19,7 +19,7 @@ Works with a chat model with tool calling support.
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph, START, END
 from langchain_openai import ChatOpenAI
-from tools import python_repl, add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql, create_file, str_replace, shell_exec, list_files_metadata
+from tools import python_repl, add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql, create_file, str_replace, shell_exec, list_files_metadata, read_file
 from state import AgentState
 from typing_extensions import TypedDict
 from typing import Literal
@@ -77,7 +77,7 @@ code_agent = create_react_agent(coder_llm, tools=[python_repl, create_file, str_
 crawler_agent = create_react_agent(crawler_llm, tools=[tavily_search])
 rag_agent = create_react_agent(
     rag_llm,
-    tools=[list_files_metadata],
+    tools=[list_files_metadata, read_file],
     prompt=ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(rag_system_prompt.format(file_path=os.getcwd() + "\\documents")),
         MessagesPlaceholder(variable_name="messages"),  # 处理 messages 键
