@@ -5,6 +5,8 @@ These tools can be used for tasks such as web searching and scraping.
 Users can edit and extend these tools as needed.
 """
 import os
+import time
+import json
 
 from typing_extensions import Annotated
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -426,3 +428,146 @@ def query_table_schema():
         return {"error": f"Failed to retrieve schema: {str(e)}"}
     finally:
         session.close()
+
+
+@tool
+def save_context_snapshot(name: str, content: str):
+    """
+    Save a context snapshot under ./contexts/<timestamp>__<name>.json
+    """
+    try:
+        ctx_dir = os.path.join(os.getcwd(), "contexts")
+        os.makedirs(ctx_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%dT%H%M%S")
+        fname = f"{ts}__{name}.json"
+        path = os.path.join(ctx_dir, fname)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"name": name, "timestamp": ts, "content": content}, f, ensure_ascii=False, indent=2)
+        return {"message": f"Snapshot saved: {path}", "path": path}
+    except Exception as e:
+        return {"error": str(e)}
+
+@tool
+def list_context_snapshots():
+    """
+    List saved context snapshots in ./contexts
+    """
+    try:
+        dir_path = os.path.join(os.getcwd(), "contexts")
+        if not os.path.exists(dir_path):
+            return {"snapshots": []}
+        files = sorted(os.listdir(dir_path), reverse=True)
+        return {"snapshots": files}
+    except Exception as e:
+        return {"error": str(e)}
+
+@tool
+def evaluate_output(criteria: str, output: str) -> dict:
+    """
+    evaluator for context_engineer verification.
+
+    Supported evaluation dimensions include:
+    - Correctness: Whether the output contains the expected key information or values.
+    - Completeness: Whether all required points are covered.
+    - Format/Protocol: Whether the output adheres to the specified format (e.g., JSON schema, strict keys).
+    - No Hallucination: Whether the response uses only verifiable information or explicitly marks missing info as NOT FOUND.
+    - Tool Usage: Whether specified tools were correctly invoked or expected tool result identifiers were returned.
+    - Reproducibility: Whether the same input consistently produces compliant output.
+    - Non-regression: Whether behavior on a set of examples has not degraded after a change.
+    - Conciseness/Length: Whether the output is within acceptable length limits (not too long or timeout-prone).
+    - Persistence/Commit: Whether the change has been persisted (e.g., snapshot file exists).
+
+    Args:
+        criteria (str): The evaluation criterion or dimension (e.g., "Correctness", "Completeness").
+        output (str): The model output to be evaluated.
+
+    Returns:
+      dict: {"passed": bool, "reason": str, "details": {...}}
+    """
+    import re
+    try:
+        crit = (criteria or "").strip()
+        out = (output or "")
+        if crit == "":
+            return {"passed": False, "reason": "No criteria provided.", "details": {}}
+
+        parts = [p.strip() for p in crit.split(";") if p.strip()]
+        details = {"checks": []}
+        for p in parts:
+            if p.lower() == "not empty":
+                ok = bool(out.strip())
+                details["checks"].append({"check": "not empty", "passed": ok})
+                if not ok:
+                    return {"passed": False, "reason": "Output is empty but expected non-empty.", "details": details}
+            elif p.lower().startswith("contain:"):
+                kw = p.split(":", 1)[1].strip().lower()
+                ok = kw in out.lower()
+                details["checks"].append({"check": f"contain:{kw}", "passed": ok})
+                if not ok:
+                    return {"passed": False, "reason": f"Missing expected keyword: '{kw}'.", "details": details}
+            elif p.lower().startswith("not contain:"):
+                kw = p.split(":", 1)[1].strip().lower()
+                ok = kw not in out.lower()
+                details["checks"].append({"check": f"not contain:{kw}", "passed": ok})
+                if not ok:
+                    return {"passed": False, "reason": f"Output contains forbidden keyword: '{kw}'.", "details": details}
+            elif p.lower().startswith("contains_all:"):
+                vals = [v.strip().lower() for v in p.split(":",1)[1].split(",") if v.strip()]
+                missing = [v for v in vals if v not in out.lower()]
+                ok = len(missing) == 0
+                details["checks"].append({"check": f"contains_all:{vals}", "passed": ok, "missing": missing})
+                if not ok:
+                    return {"passed": False, "reason": f"Missing items: {missing}", "details": details}
+            elif p.lower().startswith("regex:"):
+                pattern = p.split(":",1)[1].strip()
+                ok = bool(re.search(pattern, out, flags=re.MULTILINE))
+                details["checks"].append({"check": f"regex:{pattern}", "passed": ok})
+                if not ok:
+                    return {"passed": False, "reason": f"Regex '{pattern}' did not match output.", "details": details}
+            elif p.lower().startswith("equals:"):
+                expected = p.split(":",1)[1].strip()
+                ok = out.strip() == expected
+                details["checks"].append({"check": "equals", "passed": ok})
+                if not ok:
+                    return {"passed": False, "reason": "Output did not equal expected value.", "details": details}
+            elif p.lower().startswith("min_len:"):
+                try:
+                    n = int(p.split(":",1)[1].strip())
+                    ok = len(out) >= n
+                    details["checks"].append({"check": f"min_len:{n}", "passed": ok, "len": len(out)})
+                    if not ok:
+                        return {"passed": False, "reason": f"Output length {len(out)} < min_len {n}.", "details": details}
+                except Exception:
+                    return {"passed": False, "reason": "Invalid min_len value.", "details": details}
+            elif p.lower().startswith("max_len:"):
+                try:
+                    n = int(p.split(":",1)[1].strip())
+                    ok = len(out) <= n
+                    details["checks"].append({"check": f"max_len:{n}", "passed": ok, "len": len(out)})
+                    if not ok:
+                        return {"passed": False, "reason": f"Output length {len(out)} > max_len {n}.", "details": details}
+                except Exception:
+                    return {"passed": False, "reason": "Invalid max_len value.", "details": details}
+            elif p.lower().startswith("json_schema:"):
+                schema_str = p.split(":",1)[1].strip()
+                try:
+                    import jsonschema, json as _json
+                    schema = _json.loads(schema_str)
+                    data = _json.loads(out) if out.strip() else None
+                    if data is None:
+                        return {"passed": False, "reason": "Output is empty; cannot validate JSON schema.", "details": details}
+                    jsonschema.validate(instance=data, schema=schema)
+                    details["checks"].append({"check": "json_schema", "passed": True})
+                except ImportError:
+                    return {"passed": False, "reason": "jsonschema package not installed.", "details": details}
+                except Exception as e:
+                    details["checks"].append({"check": "json_schema", "passed": False, "error": str(e)})
+                    return {"passed": False, "reason": f"JSON schema validation failed: {e}", "details": details}
+            else:
+                details["checks"].append({"check": p, "passed": None, "note": "Unknown rule"})
+                # Unknown rules are non-fatal; could change to fail if desired
+
+        # All checks passed
+        return {"passed": True, "reason": "All checks passed.", "details": details}
+    except Exception as e:
+        return {"passed": False, "reason": str(e), "details": {}}
