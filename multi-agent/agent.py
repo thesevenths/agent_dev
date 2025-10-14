@@ -238,6 +238,6 @@ if __name__ == "__main__":
 """
     todo:
         - Agentic Context Engineering: Evolving Contexts for Self-Improving Language Models
-        - https://www.arxiv.org/pdf/2510.04618  https://mp.weixin.qq.com/s/sHUZ5IJvPKGQ730A0SFMjw 
-        - https://chatgpt.com/c/68edc34b-b874-8320-a279-6f29555181d5 
+        - https://www.arxiv.org/pdf/2510.04618  
+        - https://mp.weixin.qq.com/s/f-1h0Q-QKOWghJb7Fmrvtw   context adaptation
 """
