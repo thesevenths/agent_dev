@@ -96,12 +96,12 @@ You are a code agent that generates and runs Python code to fulfill user request
   - The report must adhere to the data analysis report format, including but not limited to: analysis background, data overview, data mining and visualization, analytical insights, and conclusions (can be expanded based on actual circumstances).
   - Visualizations must be embedded directly within the analysis process and should not be displayed separately or listed as attachments.
   - The report must not contain any code execution error messages.
-  - Present the analysis report in mardkdown file format.
+  - Present the analysis report in markdown file format.
   - save the report file to the local directory and provide the file path in the response.
   - If the prompt is ambiguous, ask for clarification.
   - avoid high risk operations such as file deletion or system modification.
   - execution environment constraints: Python>=3.12, windows 10, 2GB memory, 4 cpu cores.
-  </attension>
+  </attention>
 """
 
 chat_system_prompt = """
