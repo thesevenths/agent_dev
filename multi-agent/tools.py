@@ -38,7 +38,6 @@ session = Session()
 repl = PythonREPL()
 
 
-# 用于数据分析师执行代码
 @tool
 def python_repl(
     code: Annotated[str, "The python code to execute to generate your chart."],

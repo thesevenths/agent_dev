@@ -26,7 +26,7 @@ from typing import Literal
 from tools import tavily_search
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, MessagesPlaceholder
-from prompt import db_system_prompt, supervisor_system_prompt, rag_system_prompt, agentic_context_system_prompt, crawler_system_prompt, coder_system_prompt
+from prompt import db_system_prompt, supervisor_system_prompt, rag_system_prompt, agentic_context_system_prompt, crawler_system_prompt, coder_system_prompt, chat_system_prompt
 from tools import save_context_snapshot, list_context_snapshots, evaluate_output
 
 from config import DASHSCOPE_API_KEY
@@ -71,7 +71,14 @@ context_engineer_llm = ChatOpenAI(model="qwen-plus",
 
 
 # --- 1. 创建原始 agent（不带 system prompt）---
-chat_agent = create_react_agent(chat_llm, tools=[])
+chat_agent = create_react_agent(
+    chat_llm, 
+    tools=[read_file, create_file,  str_replace], 
+    prompt=ChatPromptTemplate.from_messages([
+        SystemMessagePromptTemplate.from_template(chat_system_prompt),
+        MessagesPlaceholder(variable_name="messages"), 
+    ])
+)
 
 db_agent = create_react_agent(
     model=db_llm,  
@@ -93,7 +100,7 @@ code_agent = create_react_agent(
 
 crawler_agent = create_react_agent(
     crawler_llm, 
-    tools=[get_nasdaq_top_gainers, tavily_search],
+    tools=[get_nasdaq_top_gainers, tavily_search, create_file],
      prompt=ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(crawler_system_prompt),
         MessagesPlaceholder(variable_name="messages"), 
