@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from langchain_core.tools import tool
 from sqlalchemy import inspect
 from sqlalchemy import text
-from config import PG_CONN_STR, TAVILY_API_KEY
+from config import PG_CONN_STR, TAVILY_API_KEY, TOP_N
 from typing import List, Dict, Optional
 
 from langchain_tavily import TavilySearch
@@ -240,6 +240,7 @@ def get_nasdaq_top_gainers(top_n: int = 5) -> List[Dict]:
     url = "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved"
     
     # fetch more to ensure enough NASDAQ stocks
+    top_n = TOP_N
     fetch_count = max(top_n * 3, 100)  
     
     params = {
