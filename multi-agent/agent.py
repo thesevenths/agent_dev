@@ -26,7 +26,7 @@ from typing import Literal
 from tools import tavily_search
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, MessagesPlaceholder
-from prompt import db_system_prompt, supervisor_system_prompt, rag_system_prompt, agentic_context_system_prompt, crawler_system_prompt
+from prompt import db_system_prompt, supervisor_system_prompt, rag_system_prompt, agentic_context_system_prompt, crawler_system_prompt, coder_system_prompt
 from tools import save_context_snapshot, list_context_snapshots, evaluate_output
 
 from config import DASHSCOPE_API_KEY
@@ -81,7 +81,15 @@ db_agent = create_react_agent(
         MessagesPlaceholder(variable_name="messages"), 
     ])
 )
-code_agent = create_react_agent(coder_llm, tools=[python_repl, create_file, str_replace, shell_exec])
+
+code_agent = create_react_agent(
+    coder_llm, 
+    tools=[python_repl, create_file, str_replace, shell_exec],
+     prompt=ChatPromptTemplate.from_messages([
+        SystemMessagePromptTemplate.from_template(coder_system_prompt),
+        MessagesPlaceholder(variable_name="messages"), 
+    ])
+)
 
 crawler_agent = create_react_agent(
     crawler_llm, 
