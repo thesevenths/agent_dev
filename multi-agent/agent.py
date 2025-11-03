@@ -19,14 +19,14 @@ Works with a chat model with tool calling support.
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import StateGraph, START, END
 from langchain_openai import ChatOpenAI
-from tools import python_repl, add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql, create_file, str_replace, shell_exec, list_files_metadata, read_file
+from tools import get_nasdaq_top_gainers, python_repl, add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql, create_file, str_replace, shell_exec, list_files_metadata, read_file
 from state import AgentState
 from typing_extensions import TypedDict
 from typing import Literal
 from tools import tavily_search
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, MessagesPlaceholder
-from prompt import db_system_prompt, supervisor_system_prompt, rag_system_prompt, agentic_context_system_prompt
+from prompt import db_system_prompt, supervisor_system_prompt, rag_system_prompt, agentic_context_system_prompt, crawler_system_prompt
 from tools import save_context_snapshot, list_context_snapshots, evaluate_output
 
 from config import DASHSCOPE_API_KEY
@@ -72,8 +72,9 @@ context_engineer_llm = ChatOpenAI(model="qwen-plus",
 
 # --- 1. 创建原始 agent（不带 system prompt）---
 chat_agent = create_react_agent(chat_llm, tools=[])
+
 db_agent = create_react_agent(
-    model=db_llm,  # 改为 model，而不是 llm
+    model=db_llm,  
     tools=[add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql],
     prompt=ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(db_system_prompt),
@@ -81,7 +82,16 @@ db_agent = create_react_agent(
     ])
 )
 code_agent = create_react_agent(coder_llm, tools=[python_repl, create_file, str_replace, shell_exec])
-crawler_agent = create_react_agent(crawler_llm, tools=[tavily_search])
+
+crawler_agent = create_react_agent(
+    crawler_llm, 
+    tools=[get_nasdaq_top_gainers, tavily_search],
+     prompt=ChatPromptTemplate.from_messages([
+        SystemMessagePromptTemplate.from_template(crawler_system_prompt),
+        MessagesPlaceholder(variable_name="messages"), 
+    ])
+)
+
 rag_agent = create_react_agent(
     rag_llm,
     tools=[list_files_metadata, read_file],

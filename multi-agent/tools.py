@@ -7,7 +7,9 @@ Users can edit and extend these tools as needed.
 import os
 import time
 import json
+import subprocess
 
+import requests
 from typing_extensions import Annotated
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
@@ -17,6 +19,7 @@ from langchain_core.tools import tool
 from sqlalchemy import inspect
 from sqlalchemy import text
 from config import PG_CONN_STR, TAVILY_API_KEY
+from typing import List, Dict, Optional
 
 from langchain_tavily import TavilySearch
 tavily_search = TavilySearch(
@@ -48,6 +51,35 @@ def python_repl(
         return f"Failed to execute. Error: {repr(e)}"
     result_str = f"Successfully executed:\n\`\`\`python\n{code}\n\`\`\`\nStdout: {result}"
     return result_str
+
+
+@tool
+def shell_exec(command: str) -> dict:
+    """
+    Execute a command in the specified shell session.
+
+    Args:
+        command (str): The shell command to execute (required, non-empty)
+
+    Returns:
+        dict: Contains 'stdout' and 'stderr'
+    """
+    try:
+        if not command:
+            return {"error": {"stderr": "Command must be non-empty"}}
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=os.getcwd(),
+            capture_output=True,
+            text=True,
+            check=False,
+            encoding='utf-8',
+            errors='ignore'
+        )
+        return {"message": {"stdout": result.stdout, "stderr": result.stderr}}
+    except Exception as e:
+        return {"error": {"stderr": str(e)}}
 
 
 @tool
@@ -193,6 +225,64 @@ def shell_exec(command: str) -> dict:
         return {"message": {"stdout": result.stdout, "stderr": result.stderr}}
     except Exception as e:
         return {"error": {"stderr": str(e)}}
+
+
+@tool
+def get_nasdaq_top_gainers(top_n: int = 5) -> List[Dict]:
+    """
+    fetch NASDAQ top gainers from Yahoo Finance, sorted by percentage gain descending.
+    
+    Args:
+        top_n (int): default 5 No. of top gainers to return.
+    
+    Returns:
+        List[Dict]: top n stock list，each include symbol, name, change_pct
+    """
+    url = "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved"
+    
+    # fetch more to ensure enough NASDAQ stocks
+    fetch_count = max(top_n * 3, 100)  
+    
+    params = {
+        "scrIds": "day_gainers",
+        "count": fetch_count
+    }
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://finance.yahoo.com/screener/predefined/day_gainers"
+    }
+    
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        quotes = data.get('finance', {}).get('result', [{}])[0].get('quotes', [])
+        if not quotes:
+            return []
+        
+        nasdaq_stocks = []
+        for q in quotes:
+            if q.get('exchange') == 'NMS' and q.get('regularMarketChangePercent') is not None:
+                nasdaq_stocks.append({
+                    'symbol': q.get('symbol', 'N/A'),
+                    'name': q.get('shortName', 'N/A'),
+                    'change_pct': float(q['regularMarketChangePercent'])
+                })
+        
+        # sort by percentage gain descending
+        nasdaq_stocks.sort(key=lambda x: x['change_pct'], reverse=True)
+        
+        # return top nq
+        return nasdaq_stocks[:top_n]
+        
+    except Exception as e:
+        print(f"⚠️ Warning: Failed to fetch data: {e}")
+        return []
+
 
 
 # 定义模型
