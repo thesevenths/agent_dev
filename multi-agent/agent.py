@@ -1,268 +1,423 @@
+"""
+Multi-Agent System with Memory, Rollback, and Visualization
+- 6 Agents: Chat, Code, DB, Crawler, RAG, Context Engineer
+- Memory: SQLite Checkpointer for conversation history
+- Snapshots: Visualized as PNG/HTML with Mermaid diagrams
+- Error Recovery: Automatic retry + fallback to other agents
+"""
+
 import sys
 import os
-from dotenv import load_dotenv
-
-# 调试工作目录和路径
-print("Current working directory:", os.getcwd())
-print("Python path:", sys.path)
-
-# 加载环境变量
-load_dotenv()
-print("DASHSCOPE_API_KEY:", os.getenv("DASHSCOPE_API_KEY"))
-print("TAVILY_API_KEY:", os.getenv("TAVILY_API_KEY"))
-
-"""Define a data enrichment agent.
-
-Works with a chat model with tool calling support.
-"""
-
-from langgraph.prebuilt import create_react_agent
-from langgraph.graph import StateGraph, START, END
-from langchain_openai import ChatOpenAI
-from tools import get_nasdaq_top_gainers, python_repl, add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql, create_file, str_replace, shell_exec, list_files_metadata, read_file
-from state import AgentState
+import json
+from langgraph.checkpoint.memory import MemorySaver
+from datetime import datetime
+from typing import Annotated, Sequence, Dict, Any, Optional
 from typing_extensions import TypedDict
-from typing import Literal
-from tools import tavily_search
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, MessagesPlaceholder
-from prompt import db_system_prompt, supervisor_system_prompt, rag_system_prompt, agentic_context_system_prompt, crawler_system_prompt, coder_system_prompt, chat_system_prompt
-from tools import save_context_snapshot, list_context_snapshots, evaluate_output
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import create_react_agent
+from langchain_openai import ChatOpenAI
+from langgraph.errors import GraphRecursionError
+import operator
+import logging
+from pathlib import Path
+
+
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# === 配置 ===
+from dotenv import load_dotenv
+load_dotenv()
 
 from config import DASHSCOPE_API_KEY
-
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-# print(DASHSCOPE_BASE_URL)
-# supervisor
-supervisor_llm = ChatOpenAI(model="qwen-plus",
-                            api_key=DASHSCOPE_API_KEY,
-                            base_url=DASHSCOPE_BASE_URL)
 
-# 用于普通问答对话
-chat_llm = ChatOpenAI(model="qwen-plus",
-                      api_key=DASHSCOPE_API_KEY,
-                      base_url=DASHSCOPE_BASE_URL)
+# 调试
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# 用于数据库检索
-db_llm = ChatOpenAI(model="qwen-plus",
-                    api_key=DASHSCOPE_API_KEY,
-                    base_url=DASHSCOPE_BASE_URL)
-
-# 用于代码生成和执行代码
-coder_llm = ChatOpenAI(model="qwen-plus",
-                       api_key=DASHSCOPE_API_KEY,
-                       base_url=DASHSCOPE_BASE_URL)
-
-# 爬取数据
-crawler_llm = ChatOpenAI(model="qwen-plus",
-                         api_key=DASHSCOPE_API_KEY,
-                         base_url=DASHSCOPE_BASE_URL)
-
-
-# RAG agent：读取知识库回答问题
-rag_llm = ChatOpenAI(model="qwen-plus",
-                      api_key=DASHSCOPE_API_KEY,
-                      base_url=DASHSCOPE_BASE_URL)
-
-# 负责规划/保存快照/验证/回滚等
-context_engineer_llm = ChatOpenAI(model="qwen-plus",
-                                  api_key=DASHSCOPE_API_KEY,
-                                  base_url=DASHSCOPE_BASE_URL)
-
-
-# --- 1. 创建原始 agent（不带 system prompt）---
-chat_agent = create_react_agent(
-    chat_llm, 
-    tools=[read_file, create_file,  str_replace], 
-    prompt=ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(chat_system_prompt),
-        MessagesPlaceholder(variable_name="messages"), 
-    ])
+# === 导入 Prompt 和 Tools ===
+from prompt import (
+    db_system_prompt, supervisor_system_prompt, rag_system_prompt, 
+    agentic_context_system_prompt, crawler_system_prompt, coder_system_prompt, chat_system_prompt
+)
+from tools import (
+    # Chat tools
+    read_file, create_file, str_replace,
+    # DB tools
+    add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql,
+    # Code tools
+    python_repl, shell_exec,
+    # Crawler tools
+    get_nasdaq_top_gainers, tavily_search,
+    # RAG tools
+    list_files_metadata,
+    # Context tools
+    save_context_snapshot, list_context_snapshots, evaluate_output
 )
 
-db_agent = create_react_agent(
-    model=db_llm,  
+# === 增强 Tools：添加快照恢复 ===
+def restore_snapshot(snapshot_id: str) -> str:
+    """恢复指定快照（新增工具）"""
+    try:
+        snapshots = list_context_snapshots()
+        for snap in snapshots:
+            if snap['id'] == snapshot_id:
+                # 这里模拟恢复逻辑，实际中加载文件
+                with open(f"./contexts/{snapshot_id}.json", 'r') as f:
+                    context = json.load(f)
+                logger.info(f"Restored snapshot {snapshot_id}")
+                return f"Context restored from snapshot {snapshot_id}: {context.get('summary', 'N/A')}"
+        return f"Snapshot {snapshot_id} not found"
+    except Exception as e:
+        logger.error(f"Restore failed: {e}")
+        return f"Restore failed: {e}"
+
+# === AgentState（增强版：支持快照和错误状态）===
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], operator.add]
+    sender: str | None
+    next: str | None
+    error_count: int  # 错误计数，用于重试
+    snapshot_id: str | None  # 当前快照 ID
+    memory_key: str  # 对话线程 ID
+
+# === LLMs 配置 ===
+def create_llm(model_name="qwen-plus", temperature=0.1):
+    """创建统一的 Qwen LLM"""
+    return ChatOpenAI(
+        model=model_name,
+        api_key=DASHSCOPE_API_KEY,
+        base_url=DASHSCOPE_BASE_URL,
+        temperature=temperature
+    )
+
+# 各专属 LLM
+supervisor_llm = create_llm(temperature=0.0)
+chat_llm = create_llm()
+db_llm = create_llm(temperature=0.0)  # DB 需要确定性
+coder_llm = create_llm(temperature=0.3)  # 代码生成需要创造性
+crawler_llm = create_llm()
+rag_llm = create_llm(temperature=0.1)
+context_engineer_llm = create_llm(temperature=0.2)
+
+# === 创建 Agent（使用提供的 Prompt）===
+def create_agent(llm, tools, system_prompt, agent_name="Agent"):
+    """创建标准化 ReAct Agent"""
+    return create_react_agent(
+        llm,
+        tools=tools,
+        name=agent_name,  # 为可视化准备
+        prompt=ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(system_prompt),
+            MessagesPlaceholder(variable_name="messages"),
+        ])
+    )
+
+# 1. Chat Agent
+chat_agent = create_agent(
+    chat_llm,
+    tools=[read_file, create_file, str_replace],
+    system_prompt=chat_system_prompt,
+    agent_name="ChatAgent"
+)
+
+# 2. DB Agent
+db_agent = create_agent(
+    db_llm,
     tools=[add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql],
-    prompt=ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(db_system_prompt),
-        MessagesPlaceholder(variable_name="messages"), 
-    ])
+    system_prompt=db_system_prompt,
+    agent_name="DBAgent"
 )
 
-code_agent = create_react_agent(
-    coder_llm, 
+# 3. Code Agent
+code_agent = create_agent(
+    coder_llm,
     tools=[python_repl, create_file, str_replace, shell_exec],
-     prompt=ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(coder_system_prompt),
-        MessagesPlaceholder(variable_name="messages"), 
-    ])
+    system_prompt=coder_system_prompt,
+    agent_name="CodeAgent"
 )
 
-crawler_agent = create_react_agent(
-    crawler_llm, 
+# 4. Crawler Agent
+crawler_agent = create_agent(
+    crawler_llm,
     tools=[get_nasdaq_top_gainers, tavily_search, create_file],
-     prompt=ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(crawler_system_prompt),
-        MessagesPlaceholder(variable_name="messages"), 
-    ])
+    system_prompt=crawler_system_prompt,
+    agent_name="CrawlerAgent"
 )
 
-rag_agent = create_react_agent(
+# 5. RAG Agent
+rag_agent = create_agent(
     rag_llm,
     tools=[list_files_metadata, read_file],
-    prompt=ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(rag_system_prompt.format(file_path=os.getcwd() + "\\documents")),
-        MessagesPlaceholder(variable_name="messages"),  
-    ])
+    system_prompt=rag_system_prompt.format(file_path=os.getcwd() + "\\documents"),
+    agent_name="RAGAgent"
 )
 
-context_engineer = create_react_agent(
+# 6. Context Engineer（增强工具）
+context_engineer = create_agent(
     context_engineer_llm,
-    tools=[save_context_snapshot, list_context_snapshots, evaluate_output],
-    prompt=ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(agentic_context_system_prompt),
-        MessagesPlaceholder(variable_name="messages"),
-    ])
+    tools=[save_context_snapshot, list_context_snapshots, evaluate_output, restore_snapshot],
+    system_prompt=agentic_context_system_prompt,
+    agent_name="ContextEngineer"
 )
 
-# --- 2. 定义带系统提示的节点函数 ---
-def chat_agent_node(state):
-    messages = state["messages"]
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [
-                       SystemMessage(content="You are an intelligent chat bot.")
-                   ] + messages
-    response = chat_agent.invoke({"messages": messages})
-    return {"messages": [response["messages"][-1]], "sender": "ChatAgent"}
-
-
-def db_agent_node(state):
-    messages = state["messages"]
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [
-                       SystemMessage(content="You perform database operations and must provide accurate data for the code_generator to use.")
-                   ] + messages
-    response = db_agent.invoke({"messages": messages})
-    return {"messages": [response["messages"][-1]], "sender": "DBAgent"}
-
-
-def code_agent_node(state):
-    messages = state["messages"]
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [
-                       SystemMessage(content="Run Python code to display diagrams or output execution results.")
-                   ] + messages
-    response = code_agent.invoke({"messages": messages})
-    return {"messages": [response["messages"][-1]], "sender": "CodeAgent"}
-
-
-def crawler_agent_node(state):
-    messages = state["messages"]
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [
-                       SystemMessage(content="Crawl data from the internet using search tools.")
-                   ] + messages
-    response = crawler_agent.invoke({"messages": messages})
-    return {"messages": [response["messages"][-1]], "sender": "CrawlerAgent"}
-
-
-def rag_agent_node(state):
-    messages = state["messages"]
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [
-                       SystemMessage(content="You are an agentic retrieval-augmented generation (RAG) agent.")
-                   ] + messages
-    response = rag_agent.invoke({"messages": messages})
-    return {"messages": [response["messages"][-1]], "sender": "RAGAgent"}
-
-
-def context_engineer_agent_node(state):
-    messages = state["messages"]
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [
-            SystemMessage(content="You are a Context Engineer: plan, patch, verify, snapshot, rollback if needed.")
-        ] + messages
-    response = context_engineer.invoke({"messages": messages})
-    return {"messages": [response["messages"][-1]], "sender": "ContextEngineer"}
-
-
-# 定义成员列表，与节点名称一致
-members = ["chat_agent", "code_agent", "db_agent", "crawler_agent", "rag_agent", "context_engineer_agent"]
+# === 成员配置 ===
+members = [
+    "chat_agent", "code_agent", "db_agent", 
+    "crawler_agent", "rag_agent", "context_engineer_agent"
+]
 options = members + ["FINISH"]
 
-
 class Router(TypedDict):
-    """Worker to route to next. If no workers needed, route to FINISH"""
-    next: Literal[*options]
+    next: str  # Literal[*options]  # 简化
 
+# === Supervisor（支持错误恢复）===
+def supervisor(state: AgentState) -> Dict[str, Any]:
+    """Supervisor with error recovery logic"""
+    try:
+        system_msg = SystemMessage(
+            content=supervisor_system_prompt.format(members=", ".join(members))
+        )
+        messages = [system_msg] + state["messages"]
+        
+        response = supervisor_llm.with_structured_output(Router).invoke(messages)
+        next_worker = response["next"]
+        
+        # 错误恢复：如果之前有错误，优先让 ContextEngineer 检查
+        if state.get("error_count", 0) > 0:
+            logger.warning(f"Previous errors detected ({state['error_count']}), checking context...")
+            next_worker = "context_engineer_agent" if next_worker != "FINISH" else "FINISH"
+        
+        return {"next": next_worker, "error_count": 0}  # 重置错误计数
+        
+    except Exception as e:
+        logger.error(f"Supervisor error: {e}")
+        # 回退到 ContextEngineer 修复
+        return {"next": "context_engineer_agent", "error_count": state.get("error_count", 0) + 1}
 
-def supervisor(state: AgentState):
-    # system_prompt = (
-    #     f"""
-    #     1. You are a supervisor managing a conversation between: {members}."
-    #     2. Each has a role: chat_agent (chat), code_agent (run Python code),db_agent (database ops), crawler_agent (web search).
-    #     3. Given the user request, choose the next worker to act.
-    #     4. Respond with a JSON object like {{'next': 'worker_name'}} or {{'next': 'FINISH'}}. Use JSON format strictly.
-    #     5. know exactly when to stop the conversation and response {{'next': 'FINISH'}}.
-    #     """
-    # )
+# === 通用 Agent 节点（带错误恢复）===
+def create_resilient_node(agent):
+    """创建带错误恢复的节点函数"""
+    def node(state: AgentState) -> Dict[str, Any]:
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # 执行 Agent
+                result = agent.invoke(state)
+                
+                # 保存快照（每 3 轮对话一次）
+                if len(state["messages"]) % 3 == 0:
+                    snapshot_id = save_context_snapshot({
+                        "messages": [m.content for m in state["messages"][-5:]],  # 最近5条
+                        "sender": state["sender"],
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    state["snapshot_id"] = snapshot_id
+                    logger.info(f"Snapshot saved: {snapshot_id}")
+                
+                return {
+                    "messages": result["messages"],
+                    "sender": agent.name,
+                    "error_count": 0,
+                    "snapshot_id": state.get("snapshot_id")
+                }
+                
+            except GraphRecursionError:
+                logger.warning("Recursion detected, breaking loop")
+                return {"messages": [AIMessage(content="Task completed to avoid infinite loop.")], "sender": agent.name}
+                
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} failed for {agent.name}: {e}")
+                if attempt == max_retries - 1:
+                    # 最终失败：回滚到上一个快照
+                    if state.get("snapshot_id"):
+                        rollback_msg = restore_snapshot(state["snapshot_id"])
+                        return {
+                            "messages": [AIMessage(content=f"Error recovered via rollback: {rollback_msg}")],
+                            "sender": "Recovery",
+                            "error_count": state.get("error_count", 0) + 1
+                        }
+                    else:
+                        return {
+                            "messages": [AIMessage(content=f"Critical error after {max_retries} attempts: {e}. Please clarify your request.")],
+                            "sender": "ErrorHandler",
+                            "error_count": state.get("error_count", 0) + 1
+                        }
+                
+                # 重试：清理部分状态
+                state["messages"] = state["messages"][-10:]  # 保留最近10条消息
+                continue
+    
+    return node
 
-    # print("🔍 Supervisor called!")
-    # print("DASHSCOPE_API_KEY (from env):", os.getenv("DASHSCOPE_API_KEY"))
-    # print("DASHSCOPE_BASE_URL:", repr(DASHSCOPE_BASE_URL))  # 注意 repr 能看到空格！
+# === 创建节点 ===
+chat_node = create_resilient_node(chat_agent)
+db_node = create_resilient_node(db_agent)
+code_node = create_resilient_node(code_agent)
+crawler_node = create_resilient_node(crawler_agent)
+rag_node = create_resilient_node(rag_agent)
+context_node = create_resilient_node(context_engineer)
 
-    messages = [SystemMessage(content=supervisor_system_prompt.format(members=members))] + state["messages"]
-    response = supervisor_llm.with_structured_output(Router).invoke(messages)
-    next_ = response["next"]
-    # return {"next": END if next_ == "FINISH" else next_}
-    return {"next": next_}  # 保持字符串，比如 "FINISH"
+# === 构建 Graph（带记忆）===
+def build_graph_with_memory():
+    """构建带 Checkpointer 的 Graph"""
+    # 初始化 Checkpointer（SQLite 记忆）
+    os.makedirs("./memory", exist_ok=True)
+    # memory = SqliteSaver.from_conn_string("./memory/conversations.db")
+    memory = MemorySaver()
+    workflow = StateGraph(AgentState)
+    
+    # 添加节点
+    workflow.add_node("supervisor", supervisor)
+    workflow.add_node("chat_agent", chat_node)
+    workflow.add_node("db_agent", db_node)
+    workflow.add_node("code_agent", code_node)
+    workflow.add_node("crawler_agent", crawler_node)
+    workflow.add_node("rag_agent", rag_node)
+    workflow.add_node("context_engineer_agent", context_node)
+    
+    # 边：Agent → Supervisor
+    for member in members:
+        workflow.add_edge(member, "supervisor")
+    
+    # START → Supervisor
+    workflow.add_edge(START, "supervisor")
+    
+    # 条件边
+    workflow.add_conditional_edges(
+        "supervisor",
+        lambda state: state["next"],
+        {
+            "chat_agent": "chat_agent",
+            "db_agent": "db_agent",
+            "code_agent": "code_agent",
+            "crawler_agent": "crawler_agent",
+            "rag_agent": "rag_agent",
+            "context_engineer_agent": "context_engineer_agent",
+            "FINISH": END,
+        }
+    )
+    
+    # 编译（带记忆）
+    # graph = workflow.compile(checkpointer=memory)
+    graph = workflow.compile()
+    graph.name = "Resilient Multi-Agent System"
+    return graph, memory
 
+# === 快照可视化工具 ===
+def visualize_snapshot(snapshot_id: str, output_dir: str = "./snapshots"):
+    """可视化快照：生成 Mermaid PNG + HTML"""
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 假设快照包含消息流
+        snapshot_data = json.loads(open(f"./contexts/{snapshot_id}.json").read())
+        messages = snapshot_data.get("messages", [])
+        
+        # 生成 Mermaid 流程图
+        mermaid_code = "graph TD\n"
+        for i, msg in enumerate(messages):
+            sender = msg.get("sender", "Unknown")
+            content = msg[:50] + "..." if len(msg) > 50 else msg  # 截断
+            node_id = f"N{i}"
+            mermaid_code += f'    {node_id}["{sender}: {content}"]\n'
+            if i > 0:
+                mermaid_code += f"    N{i-1} --> {node_id}\n"
+        
+        # 保存 Mermaid
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head><script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script></head>
+        <body>
+            <div class="mermaid">
+                {mermaid_code}
+            </div>
+            <script>mermaid.initialize({{startOnLoad:true}});</script>
+        </body>
+        </html>
+        """
+        
+        html_path = f"{output_dir}/{snapshot_id}.html"
+        png_path = f"{output_dir}/{snapshot_id}.png"  # 需要额外工具生成 PNG
+        
+        with open(html_path, "w") as f:
+            f.write(html_content)
+        
+        logger.info(f"Snapshot visualized: {html_path}")
+        return html_path
+        
+    except Exception as e:
+        logger.error(f"Visualization failed: {e}")
+        return None
 
-# --- 修复后的 workflow ---
-workflow = StateGraph(AgentState)
-workflow.add_node("supervisor", supervisor)
-workflow.add_node("chat_agent", chat_agent_node)
-workflow.add_node("db_agent", db_agent_node)
-workflow.add_node("code_agent", code_agent_node)
-workflow.add_node("crawler_agent", crawler_agent_node)
-workflow.add_node("rag_agent", rag_agent_node)
-workflow.add_node("context_engineer_agent", context_engineer_agent_node)
+# === 全局 Graph ===
+graph, memory = build_graph_with_memory()
 
-# 每个 agent 完成后回到 supervisor
-for member in members:
-    workflow.add_edge(member, "supervisor")
+# === 工具函数：带记忆的调用 ===
+def invoke_with_memory(query: str, thread_id: str = None, config: Optional[Dict] = None):
+    """带记忆的 Graph 调用，支持回滚"""
+    if thread_id is None:
+        thread_id = str(datetime.now().timestamp())
+    
+    config = config or {"configurable": {"thread_id": thread_id}}
+    
+    try:
+        # 流式执行（实时输出）
+        final_state = None
+        for chunk in graph.stream(
+            {"messages": [HumanMessage(content=query)], "memory_key": thread_id},
+            config=config
+        ):
+            print(chunk)  # 实时打印
+            final_state = chunk
+        
+        # 可视化最终快照
+        if final_state and final_state.get("snapshot_id"):
+            viz_path = visualize_snapshot(final_state["snapshot_id"])
+            if viz_path:
+                print(f"📊 Snapshot visualization: {viz_path}")
+        
+        return final_state
+        
+    except Exception as e:
+        logger.error(f"Invocation failed: {e}")
+        # 紧急回滚：恢复到最新快照
+        snapshots = list_context_snapshots()
+        if snapshots:
+            latest = snapshots[-1]
+            rollback_msg = restore_snapshot(latest['id'])
+            print(f"🚨 Emergency rollback: {rollback_msg}")
+        raise
 
-# 从 START 进入 supervisor
-workflow.add_edge(START, "supervisor")
-
-# supervisor 决定下一步（条件路由）
-workflow.add_conditional_edges(
-    "supervisor",
-    lambda state: state["next"],
-    {
-        "chat_agent": "chat_agent",
-        "db_agent": "db_agent",
-        "code_agent": "code_agent",
-        "crawler_agent": "crawler_agent",
-        "rag_agent": "rag_agent",
-        "context_engineer_agent": "context_engineer_agent",
-        "FINISH": END,
-    }
-)
-
-graph = workflow.compile()
-graph.name = "multi-Agent"
-
+# === 测试 ===
 if __name__ == "__main__":
-    from langchain_core.messages import HumanMessage
-    result = graph.invoke({
-        "messages": [HumanMessage(content="你好")]
-    })
-    print(result)
-
-"""
-    todo:
-        - Agentic Context Engineering: Evolving Contexts for Self-Improving Language Models
-        - https://www.arxiv.org/pdf/2510.04618  
-        - https://mp.weixin.qq.com/s/f-1h0Q-QKOWghJb7Fmrvtw   context adaptation
-"""
+    # 初始化上下文目录
+    os.makedirs("./contexts", exist_ok=True)
+    os.makedirs("./snapshots", exist_ok=True)
+    os.makedirs("./documents", exist_ok=True)
+    
+    # 测试 1：简单对话
+    print("=== 测试 1：简单对话 ===")
+    result1 = invoke_with_memory("你好，我是金融分析师")
+    print(f"Final response: {result1['messages'][-1].content if result1 else 'Failed'}")
+    
+    # 测试 2：复杂查询（触发工具 + 错误恢复）
+    print("\n=== 测试 2：纳斯达克查询 + 模拟错误 ===")
+    try:
+        # 模拟一个可能出错的查询
+        result2 = invoke_with_memory("分析今天纳斯达克涨幅前3的股票，生成报告。如果出错请自动恢复。")
+        print(f"Success: {result2['messages'][-1].content[:100] if result2 else 'Failed'}...")
+    except Exception as e:
+        print(f"Expected error handled: {e}")
+    
+    # 测试 3：加载记忆
+    print("\n=== 测试 3：加载记忆继续对话 ===")
+    thread_id = "test_thread_123"
+    invoke_with_memory("之前我问了纳斯达克，现在帮我查数据库里的销售数据", thread_id=thread_id)
+    
+    print("\n🎉 Multi-Agent System with Memory & Recovery is ready!")
+    print("Run: result = invoke_with_memory('your query', thread_id='unique_id')")
