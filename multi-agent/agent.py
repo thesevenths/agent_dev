@@ -45,7 +45,7 @@ from prompt import (
 )
 from tools import (
     # Chat tools
-    read_file, create_file, str_replace,
+    read_file, create_file, str_replace, send_qq_email,
     # DB tools
     add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql,
     # Code tools
@@ -119,7 +119,7 @@ def create_agent(llm, tools, system_prompt, agent_name="Agent"):
 # 1. Chat Agent
 chat_agent = create_agent(
     chat_llm,
-    tools=[read_file, create_file, str_replace],
+    tools=[read_file, create_file, str_replace, send_qq_email],
     system_prompt=chat_system_prompt,
     agent_name="ChatAgent"
 )
