@@ -51,7 +51,7 @@ from tools import (
     # Code tools
     python_repl, shell_exec,
     # Crawler tools
-    get_nasdaq_top_gainers, tavily_search,
+    get_nasdaq_top_gainers, resilient_tavily_search,
     # RAG tools
     list_files_metadata,
     # Context tools
@@ -143,7 +143,7 @@ code_agent = create_agent(
 # 4. Crawler Agent
 crawler_agent = create_agent(
     crawler_llm,
-    tools=[get_nasdaq_top_gainers, tavily_search, create_file],
+    tools=[get_nasdaq_top_gainers, resilient_tavily_search, create_file],
     system_prompt=crawler_system_prompt,
     agent_name="CrawlerAgent"
 )

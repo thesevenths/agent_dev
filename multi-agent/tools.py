@@ -4,7 +4,9 @@ This module contains functions that are directly exposed to the LLM as tools.
 These tools can be used for tasks such as web searching and scraping.
 Users can edit and extend these tools as needed.
 """
+import logging
 import os
+from random import random
 import time
 import json
 import subprocess
@@ -20,6 +22,11 @@ from sqlalchemy import inspect
 from sqlalchemy import text
 from config import PG_CONN_STR, TAVILY_API_KEY, TOP_N
 from typing import List, Dict, Optional
+from functools import wraps
+
+# 调试
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 from langchain_tavily import TavilySearch
 tavily_search = TavilySearch(
@@ -37,6 +44,26 @@ session = Session()
 
 repl = PythonREPL()
 
+
+@tool
+def resilient_tavily_search(query: str) -> str:
+    """
+        web search using TavilySearch tool with rate limit handling.
+        handle API rate limits by retrying with exponential backoff.
+    
+    Returns: search results as a string.
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            return tavily_search.run(query)
+        except Exception as e:
+            if "429" in str(e):
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(wait)
+                continue
+            raise
+    raise Exception("Tavily rate limit exceeded")
 
 @tool
 def python_repl(
