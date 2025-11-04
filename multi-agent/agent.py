@@ -65,7 +65,7 @@ def restore_snapshot(snapshot_id: str) -> str:
         snapshots = list_context_snapshots()
         for snap in snapshots:
             if snap['id'] == snapshot_id:
-                # 这里模拟恢复逻辑，实际中加载文件
+                # 恢复逻辑
                 with open(f"./contexts/{snapshot_id}.json", 'r') as f:
                     context = json.load(f)
                 logger.info(f"Restored snapshot {snapshot_id}")
@@ -94,7 +94,7 @@ def create_llm(model_name="qwen-plus", temperature=0.1):
         temperature=temperature
     )
 
-# 各专属 LLM
+
 supervisor_llm = create_llm(temperature=0.0)
 chat_llm = create_llm()
 db_llm = create_llm(temperature=0.0)  # DB 需要确定性
@@ -372,7 +372,7 @@ def invoke_with_memory(query: str, thread_id: str = None, config: Optional[Dict]
             {"messages": [HumanMessage(content=query)], "memory_key": thread_id},
             config=config
         ):
-            print(chunk)  # 实时打印
+            print(chunk) 
             final_state = chunk
         
         # 可视化最终快照
