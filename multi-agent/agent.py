@@ -135,7 +135,7 @@ db_agent = create_agent(
 # 3. Code Agent
 code_agent = create_agent(
     coder_llm,
-    tools=[python_repl, create_file, str_replace, shell_exec],
+    tools=[python_repl, create_file, read_file, str_replace, shell_exec, tavily_search],
     system_prompt=coder_system_prompt,
     agent_name="CodeAgent"
 )
