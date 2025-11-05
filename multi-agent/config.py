@@ -11,3 +11,8 @@ PG_CONN_STR = os.getenv("PG_CONN_STR")
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")   
 
 TOP_N = int(os.getenv("TOP_N", 5))  # Default to 5 if not set
+
+QQ_EMAIL = os.getenv("QQ_EMAIL")
+QQ_APP_PASSWORD = os.getenv("QQ_APP_PASSWORD")
+
+CRYPTO_SENTIMENT_KEY = os.getenv("CRYPTO_SENTIMENT_KEY")

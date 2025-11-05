@@ -4,6 +4,7 @@ This module contains functions that are directly exposed to the LLM as tools.
 These tools can be used for tasks such as web searching and scraping.
 Users can edit and extend these tools as needed.
 """
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 import logging
 import os
@@ -14,6 +15,8 @@ import ssl
 import time
 import json
 import subprocess
+
+from config import CRYPTO_SENTIMENT_KEY, QQ_APP_PASSWORD, QQ_EMAIL
 
 import requests
 from typing_extensions import Annotated
@@ -700,9 +703,6 @@ def evaluate_output(criteria: str, output: str) -> dict:
     
 
 # ============ 主 Tool 函数 ============
-QQ_EMAIL = os.getenv("QQ_EMAIL")
-QQ_APP_PASSWORD = os.getenv("QQ_APP_PASSWORD")
-
 def retry_smtp(max_retries=3):
     def decorator(func):
         @wraps(func)
@@ -832,3 +832,172 @@ def send_qq_email(
                 logger.info("SMTP 连接已关闭")
             except:
                 logger.warning("关闭连接时出错（忽略）")
+
+
+@tool
+def get_crypto_sentiment_indicators():
+    """
+    Agent Tool: Fetch cryptocurrency market sentiment indicators with fault tolerance and extensibility.
+
+    Functionality:
+    - Calls the CryptOracle API to retrieve BTC sentiment data from the last 4 hours.
+    - Supports core sentiment endpoints: 
+        - CO-A-02-01: positive sentiment ratio
+        - CO-A-02-02: negative sentiment ratio
+    - Computes derived metrics: net sentiment, sentiment strength, and data delay.
+    - Includes comprehensive error handling: network failures, empty responses, 
+      type conversion errors, and missing fields will NOT crash the program.
+
+    Returns (on success):
+    {
+        'positive_ratio': float,      # e.g., 65.2
+        'negative_ratio': float,      # e.g., 34.8
+        'net_sentiment': float,       # = positive_ratio - negative_ratio
+        'sentiment_strength': float,  # = positive_ratio + negative_ratio (indicates activity level)
+        'ar_ratio': float or None,    # Placeholder for future AR indicator (e.g., CO-A-03-01)
+        'br_ratio': float or None,    # Placeholder for future BR indicator (e.g., CO-A-03-02)
+        'data_time': str,             # Timestamp in "YYYY-MM-DD HH:MM:SS"
+        'data_delay_minutes': int,    # Delay from current time in minutes
+        'source': 'cryptoracle'
+    }
+
+    Returns (on failure):
+        None (no exception is raised)
+
+    Extensibility Notes:
+    - AR (Advance-Decline Ratio) and BR (Breadth Ratio) are classic sentiment indicators 
+      used in technical analysis [[1]][[5]]. If the API adds support (e.g., via new endpoints),
+      they can be integrated by extending the endpoint list and parsing logic.
+    """
+
+    try:
+        # === Configuration ===
+        API_URL = "https://service.cryptoracle.network/openapi/v2/endpoint"
+        API_KEY = CRYPTO_SENTIMENT_KEY
+
+        if not API_KEY:
+            logger.warning("API_KEY is not configured. Skipping sentiment fetch.")
+            return None
+
+        # === Define time window: last 4 hours with 15-minute granularity ===
+        end_time = datetime.now()
+        start_time = end_time - timedelta(hours=4)
+
+        # === Build request payload ===
+        request_body = {
+            "apiKey": API_KEY,
+            "endpoints": ["CO-A-02-01", "CO-A-02-02"],  # Core sentiment indicators
+            "startTime": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "endTime": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timeType": "15m",
+            "token": ["BTC"]
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-KEY": API_KEY
+        }
+
+        # === Make HTTP POST request ===
+        try:
+            response = requests.post(
+                API_URL,
+                json=request_body,
+                headers=headers,
+                timeout=10  # Prevent hanging on slow networks
+            )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network request failed: {e}")
+            return None
+
+        # === Check HTTP status code ===
+        if response.status_code != 200:
+            logger.error(f"HTTP request failed with status code: {response.status_code}")
+            return None
+
+        # === Parse JSON response safely ===
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.error(f"Failed to parse JSON response: {e}")
+            return None
+
+        # === Validate API business logic response ===
+        if not (data.get("code") == 200 and data.get("data")):
+            logger.warning(f"API returned non-success code or empty data: code={data.get('code')}")
+            return None
+
+        # === Process time periods to find the first valid data point ===
+        time_periods = data["data"][0].get("timePeriods", [])
+        if not time_periods:
+            logger.warning("No 'timePeriods' found in response data")
+            return None
+
+        # Iterate from newest to oldest for faster valid data retrieval
+        for period in reversed(time_periods):
+            period_data = period.get("data", [])
+
+            sentiment = {}
+            valid_data_found = False
+
+            for item in period_data:
+                endpoint = item.get("endpoint")
+                value_str = item.get("value", "").strip()
+
+                # Skip empty values
+                if not value_str:
+                    continue
+
+                # Safely convert value to float
+                try:
+                    value = float(value_str)
+                except (ValueError, TypeError):
+                    logger.debug(f"Skipping non-numeric value for endpoint {endpoint}: '{value_str}'")
+                    continue
+
+                # Only process known sentiment endpoints
+                if endpoint in ["CO-A-02-01", "CO-A-02-02"]:
+                    sentiment[endpoint] = value
+                    valid_data_found = True
+
+            # Check if both core indicators are present
+            if valid_data_found and "CO-A-02-01" in sentiment and "CO-A-02-02" in sentiment:
+                positive = sentiment['CO-A-02-01']
+                negative = sentiment['CO-A-02-02']
+                net_sentiment = positive - negative
+                sentiment_strength = positive + negative  # Reflects overall sentiment activity
+
+                # Calculate data delay in minutes
+                try:
+                    data_time = datetime.strptime(period['startTime'], '%Y-%m-%d %H:%M:%S')
+                    data_delay = int((datetime.now() - data_time).total_seconds() // 60)
+                    data_time_str = period['startTime']
+                except (ValueError, KeyError):
+                    # Fallback if timestamp parsing fails
+                    logger.warning("Failed to parse 'startTime'; using placeholder")
+                    data_delay = 0
+                    data_time_str = period.get('startTime', 'unknown')
+
+                logger.info(f"✅ Using sentiment data from: {data_time_str} (delay: {data_delay} minutes)")
+
+                # === Return standardized, agent-friendly result ===
+                return {
+                    'positive_ratio': positive,
+                    'negative_ratio': negative,
+                    'net_sentiment': net_sentiment,
+                    'sentiment_strength': sentiment_strength,
+                    'ar_ratio': None,  # Reserved for future AR indicator
+                    'br_ratio': None,  # Reserved for future BR indicator
+                    'data_time': data_time_str,
+                    'data_delay_minutes': data_delay,
+                    'source': 'cryptoracle'
+                }
+
+        logger.warning("❌ No valid sentiment data found in any time period")
+        return None
+
+    except Exception as e:
+        # Fallback: catch any unexpected errors to prevent crashes
+        logger.error(f"Unexpected error in get_sentiment_indicators: {e}")
+        return None
+

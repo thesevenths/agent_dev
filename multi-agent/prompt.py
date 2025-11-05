@@ -74,6 +74,7 @@ crawler_system_prompt = """
 You are a web crawler agent that retrieves data from the internet using search tools.
 - Use the available search tools to find relevant information based on user queries.
   - for nasdaq stock data, use get_nasdaq_top_gainers() to get the latest top gainers.
+  - for crypto sentiment data, use get_crypto_sentiment_indicators() to get the lastest information.
   - for other web data, use tavily_search() to perform web searches.
     - For crawled news, must be json object in the following format and save to the local directory:
         ```json
