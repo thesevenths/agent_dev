@@ -47,7 +47,7 @@ langgraph优势： https://mp.weixin.qq.com/s/LHIfNCovj9eknufCiEEcUA
 可以做到的场景
 
 * **动态上下文注入** ：在模型调用前，基于查询相关性添加/移除历史消息（e.g., RAG 检索）。
-* **上下文评估与压缩** ：**post-model hook 中评估输出质量，压缩冗余上下文（类似你的 evaluate_output 工具）**。
-* **快照管理** ：**pre-tool call 时保存/恢复快照（扩展你的 save_context_snapshot）**。
+* **上下文评估与压缩** ：**post-model hook 中评估输出质量，压缩冗余上下文（类似 evaluate_output 工具）**。
+* **快照管理** ：**pre-tool call 时保存/恢复快照（扩展 save_context_snapshot）**。
 * **Human-in-the-loop** ：暂停循环等待人工确认上下文。
 * **错误恢复** ：如果上下文导致 hallucination，自动回滚。
