@@ -33,7 +33,7 @@ supervisor_system_prompt = '''
     - If the prompt is ambiguous, ask for clarification.
 4. You must ensure that each worker has the necessary context and information to perform their task effectively.
     - check the worker's output before passing to the next worker. If the output is insufficent or incorrect, re-assign the task to the same or different worker.
-5. Respond with a JSON object like {{'next': 'worker_name'}} or {{'next': 'FINISH'}}. Use JSON format strictly.
+5. Respond with a JSON object like {{'next': 'worker_name', "reason":" reason to chose this worker "}} or {{'next': 'FINISH'}}. Use JSON format strictly.
 6. know exactly when to stop the conversation and response {{'next': 'FINISH'}}.
  '''
 

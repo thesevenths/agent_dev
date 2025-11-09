@@ -173,6 +173,7 @@ options = members + ["FINISH"]
 
 class Router(TypedDict):
     next: str  # Literal[*options]  # 简化
+    reason: str  # 选择该agent的理由
 
 # === Supervisor（支持错误恢复）===
 def supervisor(state: AgentState) -> Dict[str, Any]:
@@ -185,7 +186,9 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
         
         response = supervisor_llm.with_structured_output(Router).invoke(messages)
         next_worker = response["next"]
-        
+        reason = response.get("reason", "No reason provided")  # 默认值防空
+        logger.info(f"Supervisor decision: next={next_worker}, reason={reason}")  # 打印reason到日志
+
         # 错误恢复：如果之前有错误，优先让 ContextEngineer 检查
         if state.get("error_count", 0) > 0:
             logger.warning(f"Previous errors detected ({state['error_count']}), checking context...")
@@ -373,6 +376,8 @@ def invoke_with_memory(query: str, thread_id: str = None, config: Optional[Dict]
             config=config
         ):
             print(chunk) 
+            if "supervisor" in chunk and "reason" in chunk["supervisor"]:
+                print(f"Supervisor reason: {chunk['supervisor']['reason']}")
             final_state = chunk
         
         # 可视化最终快照

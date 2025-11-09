@@ -16,8 +16,6 @@ agentic RAG：plan + self evaluation
 
 ![1760107451075](image/readme/1760107451075.png)
 
-
-
 langgraph优势： https://mp.weixin.qq.com/s/LHIfNCovj9eknufCiEEcUA
 
 * 显式的流程建模能力: 有向图（Directed Graph）描述agent行为
