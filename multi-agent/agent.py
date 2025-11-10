@@ -4,6 +4,7 @@ Multi-Agent System with Memory, Rollback, and Visualization
 - Memory: SQLite Checkpointer for conversation history
 - Snapshots: Visualized as PNG/HTML with Mermaid diagrams
 - Error Recovery: Automatic retry + fallback to other agents
+- Upgraded to LangChain 1.0.5 and LangGraph 1.0.0 with Middleware
 """
 
 import sys
@@ -16,13 +17,10 @@ from typing_extensions import TypedDict
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, MessagesPlaceholder
 from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import create_react_agent
-from langchain_openai import ChatOpenAI
 from langgraph.errors import GraphRecursionError
 import operator
 import logging
 from pathlib import Path
-
 
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -55,31 +53,21 @@ from tools import (
     # RAG tools
     list_files_metadata,
     # Context tools
-    save_context_snapshot, list_context_snapshots, evaluate_output
+    save_context_snapshot, list_context_snapshots, evaluate_output, restore_snapshot
 )
 
-# === 增强 Tools：添加快照恢复 ===
-def restore_snapshot(snapshot_id: str) -> str:
-    """恢复指定快照（新增工具）"""
-    try:
-        snapshots = list_context_snapshots()
-        for snap in snapshots:
-            if snap['id'] == snapshot_id:
-                # 恢复逻辑
-                with open(f"./contexts/{snapshot_id}.json", 'r') as f:
-                    context = json.load(f)
-                logger.info(f"Restored snapshot {snapshot_id}")
-                return f"Context restored from snapshot {snapshot_id}: {context.get('summary', 'N/A')}"
-        return f"Snapshot {snapshot_id} not found"
-    except Exception as e:
-        logger.error(f"Restore failed: {e}")
-        return f"Restore failed: {e}"
+# LangChain 1.0 Imports for Agents and Middleware
+from langchain.agents import create_agent, AgentMiddleware
+from langchain.agents.middleware import SummarizationMiddleware, HumanInTheLoopMiddleware
+from langchain_openai import ChatOpenAI
+from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest, ToolCallResponse
 
-# === AgentState（增强版：支持快照和错误状态）===
+# === AgentState（增强版：支持快照、错误状态和reason）===
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     sender: str | None
     next: str | None
+    reason: str | None  # Added for supervisor reason
     error_count: int  # 错误计数，用于重试
     snapshot_id: str | None  # 当前快照 ID
     memory_key: str  # 对话线程 ID
@@ -94,7 +82,6 @@ def create_llm(model_name="qwen-plus", temperature=0.1):
         temperature=temperature
     )
 
-
 supervisor_llm = create_llm(temperature=0.0)
 chat_llm = create_llm()
 db_llm = create_llm(temperature=0.0)  # DB 需要确定性
@@ -103,21 +90,89 @@ crawler_llm = create_llm()
 rag_llm = create_llm(temperature=0.1)
 context_engineer_llm = create_llm(temperature=0.2)
 
-# === 创建 Agent（使用提供的 Prompt）===
-def create_agent(llm, tools, system_prompt, agent_name="Agent"):
-    """创建标准化 ReAct Agent"""
-    return create_react_agent(
-        llm,
+# === 自定义 Middleware for Context Engineer ===
+class CustomContextMiddleware(AgentMiddleware):
+    def before_model(self, request: ModelRequest) -> ModelRequest:
+        # Dynamic Context Injection: Add/remove history based on query relevance
+        query = request.messages[-1].content if request.messages else ""
+        relevant_messages = [msg for msg in request.messages[:-1] if any(word in msg.content.lower() for word in query.lower().split())]  # Simple keyword relevance
+        request.messages = relevant_messages + [request.messages[-1]]
+        logger.info("Dynamic context injected based on query relevance.")
+        return request
+
+    def after_model(self, response: ModelResponse) -> ModelResponse:
+        # Context Evaluation & Compression: Evaluate output and compress redundant context
+        eval_result = evaluate_output("Correctness;Completeness;No Hallucination", response.content)
+        if not eval_result.get("passed", False):
+            logger.warning(f"Output evaluation failed: {eval_result['reason']}")
+            # Compress: Summarize last 5 messages (using prebuilt if available)
+            summarizer = SummarizationMiddleware(model=context_engineer_llm, max_tokens_before_summary=500)
+            response.runtime.messages = summarizer.after_model(response).runtime.messages  # Compress
+        logger.info("Context evaluated and compressed if needed.")
+        return response
+
+    def wrap_tool_call(self, request: ToolCallRequest, handler: Callable[[ToolCallRequest], ToolCallResponse]) -> ToolCallResponse:
+        # Snapshot Management: Save/restore pre-tool call
+        snapshot_id = save_context_snapshot({
+            "messages": [m.content for m in request.runtime.messages[-5:]],
+            "sender": request.runtime.sender,
+            "timestamp": datetime.now().isoformat()
+        })
+        request.runtime.snapshot_id = snapshot_id
+        logger.info(f"Pre-tool snapshot saved: {snapshot_id}")
+
+        # Human-in-the-Loop: Pause for confirmation
+        human_mw = HumanInTheLoopMiddleware(interrupt_on={"all_tools": {"allowed_decisions": ["approve", "edit", "reject"]}})
+        if human_mw.wrap_tool_call(request, lambda r: r).decision != "approve":  # Simulate pause
+            user_input = input("Human approval needed. Approve? (y/n/edit): ")
+            if user_input.lower() == "n":
+                restore_snapshot(snapshot_id)  # Rollback on reject
+                raise ValueError("Human rejected tool call.")
+            elif user_input.lower() == "edit":
+                # Edit logic (simplified)
+                request.tool_calls[0].args["query"] = input("Edit query: ")
+
+        try:
+            result = handler(request)
+        except Exception as e:
+            # Error Recovery: Rollback on error/hallucination
+            logger.error(f"Tool call error: {e}. Rolling back.")
+            restore_snapshot(snapshot_id)
+            result = ToolCallResponse(error=str(e))
+        return result
+
+    def wrap_model_call(self, request: ModelRequest, handler: Callable[[ModelRequest], ModelResponse]) -> ModelResponse:
+        try:
+            result = handler(request)
+        except Exception as e:
+            # Error Recovery: Detect hallucination/error and rollback
+            logger.error(f"Model call error: {e}. Attempting recovery.")
+            if request.runtime.snapshot_id:
+                restore_snapshot(request.runtime.snapshot_id)
+            result = ModelResponse(content=f"Recovered from error: {e}")
+        return result
+
+    def after_agent(self, response: Any) -> Any:
+        # Trigger visualization after agent
+        if response.get("snapshot_id"):
+            visualize_snapshot(response["snapshot_id"])
+        return response
+
+# === 创建 Agent（使用 LangChain 1.0 create_agent + Middleware for Context Engineer）===
+def create_resilient_agent(llm, tools, system_prompt, agent_name="Agent", middleware=None):
+    """创建标准化 Agent with resilience"""
+    system_msg = SystemMessagePromptTemplate.from_template(system_prompt)
+    prompt = ChatPromptTemplate.from_messages([system_msg, MessagesPlaceholder(variable_name="messages")])
+    return create_agent(
+        model=llm,
         tools=tools,
-        name=agent_name,  # 为可视化准备
-        prompt=ChatPromptTemplate.from_messages([
-            SystemMessagePromptTemplate.from_template(system_prompt),
-            MessagesPlaceholder(variable_name="messages"),
-        ])
+        system_prompt=system_prompt,  # Passed directly in 1.0
+        middleware=middleware or [],
+        name=agent_name
     )
 
 # 1. Chat Agent
-chat_agent = create_agent(
+chat_agent = create_resilient_agent(
     chat_llm,
     tools=[read_file, create_file, str_replace, send_qq_email],
     system_prompt=chat_system_prompt,
@@ -125,7 +180,7 @@ chat_agent = create_agent(
 )
 
 # 2. DB Agent
-db_agent = create_agent(
+db_agent = create_resilient_agent(
     db_llm,
     tools=[add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql],
     system_prompt=db_system_prompt,
@@ -133,7 +188,7 @@ db_agent = create_agent(
 )
 
 # 3. Code Agent
-code_agent = create_agent(
+code_agent = create_resilient_agent(
     coder_llm,
     tools=[python_repl, create_file, read_file, str_replace, shell_exec, resilient_tavily_search],
     system_prompt=coder_system_prompt,
@@ -141,7 +196,7 @@ code_agent = create_agent(
 )
 
 # 4. Crawler Agent
-crawler_agent = create_agent(
+crawler_agent = create_resilient_agent(
     crawler_llm,
     tools=[get_nasdaq_top_gainers, get_crypto_sentiment_indicators, resilient_tavily_search, create_file],
     system_prompt=crawler_system_prompt,
@@ -149,19 +204,20 @@ crawler_agent = create_agent(
 )
 
 # 5. RAG Agent
-rag_agent = create_agent(
+rag_agent = create_resilient_agent(
     rag_llm,
     tools=[list_files_metadata, read_file],
     system_prompt=rag_system_prompt.format(file_path=os.getcwd() + "\\documents"),
     agent_name="RAGAgent"
 )
 
-# 6. Context Engineer（增强工具）
-context_engineer = create_agent(
+# 6. Context Engineer (with Custom Middleware)
+context_engineer = create_resilient_agent(
     context_engineer_llm,
     tools=[save_context_snapshot, list_context_snapshots, evaluate_output, restore_snapshot],
     system_prompt=agentic_context_system_prompt,
-    agent_name="ContextEngineer"
+    agent_name="ContextEngineer",
+    middleware=[CustomContextMiddleware(), SummarizationMiddleware(model=context_engineer_llm)]
 )
 
 # === 成员配置 ===
@@ -172,11 +228,12 @@ members = [
 options = members + ["FINISH"]
 
 class Router(TypedDict):
-    next: str  # Literal[*options]  # 简化
+    next: str
+    reason: str  # Added for reason
 
-# === Supervisor（支持错误恢复）===
+# === Supervisor（支持错误恢复 + Reason Output）===
 def supervisor(state: AgentState) -> Dict[str, Any]:
-    """Supervisor with error recovery logic"""
+    """Supervisor with error recovery logic and reason output"""
     try:
         system_msg = SystemMessage(
             content=supervisor_system_prompt.format(members=", ".join(members))
@@ -185,30 +242,33 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
         
         response = supervisor_llm.with_structured_output(Router).invoke(messages)
         next_worker = response["next"]
+        reason = response["reason"]
+        logger.info(f"Supervisor reason: {reason}")
         
         # 错误恢复：如果之前有错误，优先让 ContextEngineer 检查
         if state.get("error_count", 0) > 0:
             logger.warning(f"Previous errors detected ({state['error_count']}), checking context...")
             next_worker = "context_engineer_agent" if next_worker != "FINISH" else "FINISH"
+            reason += " (rerouted due to errors)"
         
-        return {"next": next_worker, "error_count": 0}  # 重置错误计数
+        return {"next": next_worker, "reason": reason, "error_count": 0}  # 重置错误计数
         
     except Exception as e:
         logger.error(f"Supervisor error: {e}")
         # 回退到 ContextEngineer 修复
-        return {"next": "context_engineer_agent", "error_count": state.get("error_count", 0) + 1}
+        return {"next": "context_engineer_agent", "reason": "Fallback due to supervisor error", "error_count": state.get("error_count", 0) + 1}
 
-# === 通用 Agent 节点（带错误恢复）===
+# === 通用 Agent 节点（带错误恢复，集成 Middleware行为）===
 def create_resilient_node(agent):
     """创建带错误恢复的节点函数"""
     def node(state: AgentState) -> Dict[str, Any]:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # 执行 Agent
+                # 执行 Agent (LangChain 1.0 invoke)
                 result = agent.invoke(state)
                 
-                # 保存快照（每 3 轮对话一次）
+                # 保存快照（每 3 轮对话一次，middleware handles visualization）
                 if len(state["messages"]) % 3 == 0:
                     snapshot_id = save_context_snapshot({
                         "messages": [m.content for m in state["messages"][-5:]],  # 最近5条
@@ -259,14 +319,13 @@ db_node = create_resilient_node(db_agent)
 code_node = create_resilient_node(code_agent)
 crawler_node = create_resilient_node(crawler_agent)
 rag_node = create_resilient_node(rag_agent)
-context_node = create_resilient_node(context_engineer)
+context_node = create_resilient_node(context_engineer)  # Middleware applied here
 
 # === 构建 Graph（带记忆）===
 def build_graph_with_memory():
     """构建带 Checkpointer 的 Graph"""
     # 初始化 Checkpointer（SQLite 记忆）
     os.makedirs("./memory", exist_ok=True)
-    # memory = SqliteSaver.from_conn_string("./memory/conversations.db")
     memory = MemorySaver()
     workflow = StateGraph(AgentState)
     
@@ -302,8 +361,7 @@ def build_graph_with_memory():
     )
     
     # 编译（带记忆）
-    # graph = workflow.compile(checkpointer=memory)
-    graph = workflow.compile()
+    graph = workflow.compile(checkpointer=memory)
     graph.name = "Resilient Multi-Agent System"
     return graph, memory
 
@@ -375,7 +433,7 @@ def invoke_with_memory(query: str, thread_id: str = None, config: Optional[Dict]
             print(chunk) 
             final_state = chunk
         
-        # 可视化最终快照
+        # 可视化最终快照 (middleware already handles, but fallback)
         if final_state and final_state.get("snapshot_id"):
             viz_path = visualize_snapshot(final_state["snapshot_id"])
             if viz_path:
