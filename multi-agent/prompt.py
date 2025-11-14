@@ -51,7 +51,7 @@ Your Core Responsibilities:
   "reason": "Brief explanation of why this agent starts",
   "execution_plan": ["1. ...", "2. ...", ...]   // Include this field ONLY when creating a new plan
 }
-
+ 
 4. In subsequent turns (when execution_plan already exists in state):
    - You will see the current progress
    - Strictly follow the original plan order
