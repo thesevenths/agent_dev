@@ -21,6 +21,7 @@ from langgraph.errors import GraphRecursionError
 import operator
 import logging
 from pathlib import Path
+from typing import Annotated, Sequence, Dict, Any, Optional, List
 
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -71,6 +72,9 @@ class AgentState(TypedDict):
     error_count: int  # 错误计数，用于重试
     snapshot_id: str | None  # 当前快照 ID
     memory_key: str  # 对话线程 ID
+    hallucination_check: bool | None  # 幻觉检查标志
+    execution_plan: Optional[List[str]]     
+    current_step: int
 
 # === LLMs 配置 ===
 def create_llm(model_name="qwen-plus", temperature=0.1):
@@ -95,6 +99,7 @@ class CustomContextMiddleware(AgentMiddleware):
     def before_model(self, request: ModelRequest) -> ModelRequest:
         # Dynamic Context Injection: Add/remove history based on query relevance
         query = request.messages[-1].content if request.messages else ""
+        # todo list： sematic relevance instead of keyword, embedding based search, not only keyword search
         relevant_messages = [msg for msg in request.messages[:-1] if any(word in msg.content.lower() for word in query.lower().split())]  # Simple keyword relevance
         request.messages = relevant_messages + [request.messages[-1]]
         logger.info("Dynamic context injected based on query relevance.")
@@ -106,11 +111,11 @@ class CustomContextMiddleware(AgentMiddleware):
         if not eval_result.get("passed", False):
             logger.warning(f"Output evaluation failed: {eval_result['reason']}")
             # Compress: Summarize last 5 messages (using prebuilt if available)
-            summarizer = SummarizationMiddleware(model=context_engineer_llm, max_tokens_before_summary=500)
+            summarizer = SummarizationMiddleware(model=context_engineer_llm, max_tokens_before_summary=1000)
             response.runtime.messages = summarizer.after_model(response).runtime.messages  # Compress
         logger.info("Context evaluated and compressed if needed.")
         return response
-
+    #  save/restore snapshot before too calls;  restore snapshot on error/hallucination
     def wrap_tool_call(self, request: ToolCallRequest, handler: Callable[[ToolCallRequest], ToolCallResponse]) -> ToolCallResponse:
         # Snapshot Management: Save/restore pre-tool call
         snapshot_id = save_context_snapshot({
@@ -122,15 +127,17 @@ class CustomContextMiddleware(AgentMiddleware):
         logger.info(f"Pre-tool snapshot saved: {snapshot_id}")
 
         # Human-in-the-Loop: Pause for confirmation
-        human_mw = HumanInTheLoopMiddleware(interrupt_on={"all_tools": {"allowed_decisions": ["approve", "edit", "reject"]}})
-        if human_mw.wrap_tool_call(request, lambda r: r).decision != "approve":  # Simulate pause
-            user_input = input("Human approval needed. Approve? (y/n/edit): ")
-            if user_input.lower() == "n":
-                restore_snapshot(snapshot_id)  # Rollback on reject
-                raise ValueError("Human rejected tool call.")
-            elif user_input.lower() == "edit":
-                # Edit logic (simplified)
-                request.tool_calls[0].args["query"] = input("Edit query: ")
+        # todo list: not every tool call needs human approval, only critical ones; or not provide high risk tools to agents
+        # Human-in-the-Loop is DISABLED: no high-risk tools exposed to agent
+        # human_mw = HumanInTheLoopMiddleware(interrupt_on={"all_tools": {"allowed_decisions": ["approve", "edit", "reject"]}})
+        # if human_mw.wrap_tool_call(request, lambda r: r).decision != "approve":  # Simulate pause
+        #     user_input = input("Human approval needed. Approve? (y/n/edit): ")
+        #     if user_input.lower() == "n":
+        #         restore_snapshot(snapshot_id)  # Rollback on reject
+        #         raise ValueError("Human rejected tool call.")
+        #     elif user_input.lower() == "edit":
+        #         # Edit logic (simplified)
+        #         request.tool_calls[0].args["query"] = input("Edit query: ")
 
         try:
             result = handler(request)
@@ -141,6 +148,7 @@ class CustomContextMiddleware(AgentMiddleware):
             result = ToolCallResponse(error=str(e))
         return result
 
+    # during model generating phase, try to rollback on error/hallucination using existing snapshot
     def wrap_model_call(self, request: ModelRequest, handler: Callable[[ModelRequest], ModelResponse]) -> ModelResponse:
         try:
             result = handler(request)
@@ -230,38 +238,86 @@ options = members + ["FINISH"]
 class Router(TypedDict):
     next: str
     reason: str  # Added for reason
+    execution_plan: Optional[List[str]]   # 只有第一次规划时才输出
 
 # === Supervisor（支持错误恢复 + Reason Output）===
 def supervisor(state: AgentState) -> Dict[str, Any]:
-    """Supervisor with error recovery logic and reason output"""
+    """Supervisor：支持一次性规划 + 多轮顺序执行"""
     try:
-        system_msg = SystemMessage(
-            content=supervisor_system_prompt.format(members=", ".join(members))
-        )
-        messages = [system_msg] + state["messages"]
-        
-        response = supervisor_llm.with_structured_output(Router).invoke(messages)
-        next_worker = response["next"]
-        reason = response["reason"]
-        logger.info(f"Supervisor reason: {reason}")
-        
-        # 错误恢复：如果之前有错误，优先让 ContextEngineer 检查
-        if state.get("error_count", 0) > 0:
-            logger.warning(f"Previous errors detected ({state['error_count']}), checking context...")
-            next_worker = "context_engineer_agent" if next_worker != "FINISH" else "FINISH"
-            reason += " (rerouted due to errors)"
-        
-        return {"next": next_worker, "reason": reason, "error_count": 0}  # 重置错误计数
-        
+        # 情况1：已经有执行计划 → 严格按计划走（第2~N轮）
+        if state.get("execution_plan") and len(state["execution_plan"]) > 0:
+            current = state.get("current_step", 0)
+            if current >= len(state["execution_plan"]):
+                # 所有步骤都完成了
+                return {
+                    "next": "FINISH",
+                    "reason": "All tasks in execution plan completed.",
+                    "current_step": current
+                }
+            
+            # 解析当前步骤应该交给哪个 agent
+            step_text = state["execution_plan"][current]
+            # 简单解析 "数字. 任务 → agent" 格式
+            target_agent = None
+            for member in members:
+                if member.replace("_agent", "") in step_text.lower():
+                    target_agent = member
+                    break
+            if not target_agent:
+                target_agent = "context_engineer_agent"  # 兜底
+
+            return {
+                "next": target_agent,
+                "reason": f"Following execution plan step {current+1}/{len(state['execution_plan'])}: {step_text}",
+                "current_step": current + 1   # 关键：推进进度
+            }
+
+        # 情况2：第一次遇到用户请求 → 做战略规划（只做一次）
+        else:
+            system_msg = SystemMessage(content=supervisor_system_prompt.format(
+                members=", ".join(members)
+            ))
+            messages = [system_msg] + state["messages"]
+
+            response = supervisor_llm.with_structured_output(Router).invoke(messages)
+            
+            # 如果模型给出了计划，就采纳
+            plan = response.get("execution_plan")
+            if plan and len(plan) > 0:
+                logger.info(f"Supervisor created execution plan:\n" + "\n".join(plan))
+                # 第一步立刻执行
+                first_agent = "context_engineer_agent"  # 兜底
+                for member in members:
+                    if member.replace("_agent", "") in plan[0].lower():
+                        first_agent = member
+                        break
+                return {
+                    "next": first_agent,
+                    "reason": f"Starting execution plan step 1/{len(plan)}: {plan[0]}",
+                    "execution_plan": plan,
+                    "current_step": 1
+                }
+            else:
+                # 降级为传统单轮路由（兼容旧逻辑）
+                return {
+                    "next": response["next"],
+                    "reason": response["reason"] + " (no multi-step plan generated)"
+                }
+
     except Exception as e:
         logger.error(f"Supervisor error: {e}")
-        # 回退到 ContextEngineer 修复
-        return {"next": "context_engineer_agent", "reason": "Fallback due to supervisor error", "error_count": state.get("error_count", 0) + 1}
+        return {
+            "next": "context_engineer_agent",
+            "reason": f"Supervisor fallback due to error: {e}",
+            "error_count": state.get("error_count", 0) + 1
+        }
 
 # === 通用 Agent 节点（带错误恢复，集成 Middleware行为）===
 def create_resilient_node(agent):
     """创建带错误恢复的节点函数"""
     def node(state: AgentState) -> Dict[str, Any]:
+        # 所有节点都能看到当前计划，增强可观测性
+        logger.info(f"Executing plan step {state.get('current_step', 0)}/{len(state.get('execution_plan', []))}: {state.get('execution_plan', [None])[state.get('current_step', 0)-1] if state.get('execution_plan') else 'No plan'}")
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -282,7 +338,10 @@ def create_resilient_node(agent):
                     "messages": result["messages"],
                     "sender": agent.name,
                     "error_count": 0,
-                    "snapshot_id": state.get("snapshot_id")
+                    "snapshot_id": state.get("snapshot_id"),
+                    # 把计划状态原样带回，让 supervisor 能继续追踪进度
+                    "execution_plan": state.get("execution_plan"),
+                    "current_step": state.get("current_step", 0),
                 }
                 
             except GraphRecursionError:
