@@ -1,18 +1,12 @@
-from llama_index.core.node_parser import SemanticSplitterNodeParser
-from llama_index.core.embeddings import resolve_embed_model
-from config import EMBEDDING_MODEL, DASHSCOPE_API_KEY
-from llama_index.embeddings.dashscope import DashScopeEmbedding
+from llama_index.core.node_parser import SimpleNodeParser
 
 def get_semantic_splitter():
-    # 使用 DashScope 的 embedding 模型进行语义分块
-    embed_model = DashScopeEmbedding(
-        model_name=EMBEDDING_MODEL,
-        api_key=DASHSCOPE_API_KEY
+    """
+    LlamaParse 输出已接近语义块（每表/每段为一块），
+    这里仅做轻量分块，避免切碎表格。
+    """
+    return SimpleNodeParser.from_defaults(
+        chunk_size=512,
+        chunk_overlap=20,
+        include_metadata=True
     )
-    # SemanticSplitter 会基于句子嵌入的相似度动态切分
-    splitter = SemanticSplitterNodeParser(
-        embed_model=embed_model,
-        buffer_size=1,  # 相邻句子数量用于判断语义边界
-        breakpoint_percentile_threshold=95  # 相似度低于95%分位数处切分
-    )
-    return splitter

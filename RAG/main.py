@@ -6,33 +6,38 @@ from query_engine import build_query_engine
 PDF_DIR = r"E:\\model\\report"
 
 def main():
-    print("1. Loading PDFs...")
+    print("1. Loading PDFs with LlamaParse...")
     documents = load_pdf_with_tables(PDF_DIR)
-    print(f"Loaded {len(documents)} document pages.")
+    print(f"Loaded {len(documents)} chunks (with table-aware parsing).")
 
-    print("2. Semantic chunking...")
+    print("2. Chunking...")
     splitter = get_semantic_splitter()
     nodes = splitter.get_nodes_from_documents(documents)
-    print(f"Generated {len(nodes)} semantic chunks.")
 
     print("3. Building retrievers...")
-    bm25_retriever = get_bm25_retriever(nodes, top_k=15)
-    vector_retriever = get_vector_retriever(nodes, top_k=15)
+    bm25_retriever = get_bm25_retriever(nodes, top_k=5)
+    vector_retriever = get_vector_retriever(nodes, top_k=5)
 
-    print("4. Building query engine...")
-    query_engine = build_query_engine(bm25_retriever, vector_retriever)
-
-    print("✅ RAG system ready!")
+    print("✅ RAG system ready! Ask questions like:")
+    print('  - "2023年哪些公司毛利率超过50%？"')
+    print('  - "对比宁德时代和比亚迪的净利润"')
+    
     while True:
-        query = input("\nEnter your question (or 'quit'): ")
-        if query.strip().lower() == 'quit':
+        query = input("\nYour question (or 'quit'): ").strip()
+        if query.lower() == 'quit':
             break
+        
+        # 关键：将原始 query 传入，用于动态元数据过滤
+        query_engine = build_query_engine(bm25_retriever, vector_retriever, query)
+        
         response = query_engine.query(query)
         print("\nAnswer:", response.response)
         print("\nSources:")
         for i, node in enumerate(response.source_nodes, 1):
-            print(f"{i}. {node.node.metadata.get('file_name', 'Unknown')} (score: {node.score:.3f})")
-            print(f"   Preview: {node.node.text[:200]}...")
+            meta = node.node.metadata
+            print(f"{i}. {meta.get('company', 'Unknown')} ({meta.get('fiscal_year', 'Unknown')}) - {meta.get('file_name', '')}")
+            preview = node.node.text.replace("\n", " ")[:150]
+            print(f"   Preview: {preview}...")
 
 if __name__ == "__main__":
     main()

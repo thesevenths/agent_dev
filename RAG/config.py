@@ -1,3 +1,4 @@
+from dotenv import load_dotenv
 import os
 
 
@@ -6,8 +7,7 @@ EMBEDDING_MODEL = "text-embedding-v3"  # DashScope embedding 模型
 RERANK_MODEL = "rerank-v1"              # DashScope rerank 模型
 LLM_MODEL = "qwen-max"                 # DashScope LLM 模型
 
-from dotenv import load_dotenv
-import os
+
 # Load environment variables from .env file
 load_dotenv()
 
