@@ -16,8 +16,8 @@ def main():
     print(f"Generated {len(nodes)} semantic chunks.")
 
     print("3. Building retrievers...")
-    bm25_retriever = get_bm25_retriever(nodes, top_k=5)
-    vector_retriever = get_vector_retriever(nodes, top_k=5)
+    bm25_retriever = get_bm25_retriever(nodes, top_k=15)
+    vector_retriever = get_vector_retriever(nodes, top_k=15)
 
     print("4. Building query engine...")
     query_engine = build_query_engine(bm25_retriever, vector_retriever)
