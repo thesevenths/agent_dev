@@ -1,8 +1,11 @@
 from llama_index.core import SimpleDirectoryReader
 from llama_index.readers.llama_parse import LlamaParse
-from config import LLAMA_CLOUD_API_KEY
+
 import re
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+from config import LLAMA_CLOUD_API_KEY
+print(f"out LLAMA_CLOUD_API_KEY: {LLAMA_CLOUD_API_KEY}")
 
 def extract_metadata_from_text(text: str):
     """从文档前500字符中自动提取公司名和年份"""
@@ -49,10 +52,12 @@ def chinese_to_arabic_year(chinese: str) -> str:
     return "Unknown"
 
 def load_pdf_with_tables(pdf_dir: str):
+    from config import LLAMA_CLOUD_API_KEY
+    print(f"in LLAMA_CLOUD_API_KEY: {LLAMA_CLOUD_API_KEY}")
     parser = LlamaParse(
         api_key=LLAMA_CLOUD_API_KEY,
         result_type="markdown",
-        language="zh",
+        language="ch_sim",
         ignore_errors=True,
     )
 

@@ -14,7 +14,7 @@ def get_bm25_retriever(nodes, top_k=5, filters=None):
         nodes=nodes,
         tokenizer=tokenize,
         similarity_top_k=top_k,
-        filters=filters  # 注意：BM25Retriever 0.14.10 可能不支持 filters，我们将在 HybridRetriever 中后过滤
+        filters=filters  # 注意：BM25Retriever 0.14.10 可能不支持 filters，将在 HybridRetriever 中后过滤
     )
 
 def get_vector_retriever(nodes, top_k=5, filters=None):
