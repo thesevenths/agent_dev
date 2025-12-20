@@ -7,7 +7,7 @@ load_dotenv(dotenv_path=env_path)
 
 # 模型配置
 EMBEDDING_MODEL = "text-embedding-v3"  # DashScope embedding 模型
-RERANK_MODEL = "rerank-v1"              # DashScope rerank 模型
+RERANK_MODEL = "gte-rerank"              # DashScope rerank 模型
 LLM_MODEL = "qwen-max"                 # DashScope LLM 模型
 
 # Load from environment variables to avoid committing to GitHub

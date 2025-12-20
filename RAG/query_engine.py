@@ -52,7 +52,7 @@ def build_query_engine(bm25_retriever, vector_retriever, raw_query: str):
         vector_retriever, 
         metadata_filters=metadata_filters
     )
-
+    # print(f"DASHSCOPE_API_KEY:{DASHSCOPE_API_KEY}")
     # Rerank
     reranker = DashScopeRerank(
         api_key=DASHSCOPE_API_KEY,
