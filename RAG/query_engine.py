@@ -1,6 +1,6 @@
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core import get_response_synthesizer
-from llama_index.core.retrievers import BaseRetriever  # ← 关键：补上这行！
+from llama_index.core.retrievers import BaseRetriever  
 from llama_index.core.schema import NodeWithScore
 from llama_index.postprocessor.dashscope_rerank import DashScopeRerank
 from llama_index.llms.dashscope import DashScope

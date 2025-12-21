@@ -1,11 +1,10 @@
-from loaders import load_pdf_with_tables
-from chunkers import get_semantic_splitter
+import os
+from process_report import process_pdfs_to_json, load_items_from_json
 from retrievers import get_bm25_retriever, get_vector_retriever
 from query_engine import build_query_engine
 from pathlib import Path
 import pickle
 
-import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 from dotenv import load_dotenv
@@ -14,44 +13,66 @@ load_dotenv(dotenv_path=env_path)
 
 from config import LLAMA_CLOUD_API_KEY
 from config import DASHSCOPE_API_KEY
-# print(f"main LLAMA_CLOUD_API_KEY: {LLAMA_CLOUD_API_KEY}")
+
+# 尝试导入官方 Document；若失败则用 process_report 的回退版本
+try:
+    from llama_index.core import Document as OfficalDocument
+except Exception:
+    OfficalDocument = None
 
 PDF_DIR = r"E:\\model\\RAG\\report"
 CHROMA_PATH = "E:\\model\\RAG\\chroma_db"
 NODES_CACHE = "E:\\model\\RAG\\nodes.pkl"
+JSON_DIR = r"E:\model\RAG\json_reports"
+
+def _convert_documents(docs):
+    """
+    将 process_report.Document 或其它 Document 转换为官方 llama-index Document（若可用）。
+    若官方 Document 不可用则保持原样。
+    """
+    if OfficalDocument is None:
+        return docs
+    
+    converted = []
+    for d in docs:
+        # 若已是官方 Document，跳过
+        if isinstance(d, OfficalDocument):
+            converted.append(d)
+        else:
+            # 转换：从回退 Document 提取 text 和 metadata
+            txt = getattr(d, "text", "") or ""
+            meta = getattr(d, "metadata", {}) or {}
+            converted.append(OfficalDocument(text=txt, metadata=meta))
+    return converted
 
 def main():
-    # 检查是否已有持久化向量库和 nodes 缓存
-    has_chroma = os.path.exists(CHROMA_PATH) and os.listdir(CHROMA_PATH)
+    # 1) 先把 PDF 转为 json（有缓存则跳过）
+    print("1. Converting PDFs to JSON (cached)...")
+    json_paths = process_pdfs_to_json(PDF_DIR, json_dir=JSON_DIR, force=False)
+    print(f" -> {len(json_paths)} json files ready in {JSON_DIR}")
+
+    # 2) 从 json 加载 items（每个 text item 与每个 table 都变成一个 Document）
     has_nodes = os.path.exists(NODES_CACHE)
-
-    if has_chroma and has_nodes:
-        print("🔍 Loading from persistent storage (Chroma + nodes.pkl)...")
-        documents = None
-        nodes = None
-        # 先加载 nodes（用于 BM25）
+    if has_nodes:
+        print("🔍 Loading documents cache from nodes.pkl...")
         with open(NODES_CACHE, "rb") as f:
-            nodes = pickle.load(f)
+            documents = pickle.load(f)
     else:
-        print("1. Loading PDFs with LlamaParse...")
-        documents = load_pdf_with_tables(PDF_DIR)
-        print(f"Loaded {len(documents)} chunks (with table-aware parsing).")
-
-        print("2. Chunking...")
-        splitter = get_semantic_splitter()
-        nodes = splitter.get_nodes_from_documents(documents)
-
-        # 保存 nodes.pkl（用于后续跳过 PDF 解析）
+        print("2. Loading items from JSON into Documents...")
+        documents = load_items_from_json(JSON_DIR)
         with open(NODES_CACHE, "wb") as f:
-            pickle.dump(nodes, f)
-        print(f"✅ Cached nodes to {NODES_CACHE}")
+            pickle.dump(documents, f)
+        print(f"✅ Cached documents to {NODES_CACHE} (total {len(documents)})")
+
+    # 转换为官方 Document（如果可用）
+    documents = _convert_documents(documents)
 
     print("3. Building retrievers...")
     # 向量检索器：自动处理 Chroma 持久化（在 retrievers.py 中实现）
-    vector_retriever = get_vector_retriever(nodes, top_k=15)
+    vector_retriever = get_vector_retriever(documents=documents, top_k=15)
 
-    # BM25 检索器：使用已加载或刚生成的 nodes
-    bm25_retriever = get_bm25_retriever(nodes, top_k=15)
+    # BM25 检索器：用 documents（每个 item 一个 Document）
+    bm25_retriever = get_bm25_retriever(documents=documents, top_k=15)
 
     print("✅ RAG system ready!")
     while True:
@@ -63,9 +84,9 @@ def main():
         print("\nAnswer:", response.response)
         print("\nSources:")
         for i, node in enumerate(response.source_nodes, 1):
-            meta = node.node.metadata
-            print(f"{i}. {meta.get('company', 'Unknown')} ({meta.get('fiscal_year', 'Unknown')})")
-            preview = node.node.text.replace("\n", " ")[:150]
+            meta = getattr(node.node, "metadata", {}) if hasattr(node, "node") else getattr(node, "metadata", {})
+            print(f"{i}. {meta.get('source', 'Unknown')} (table={meta.get('is_table', False)})")
+            preview = (getattr(node.node, "text", "") if hasattr(node, "node") else getattr(node, "text", ""))[:150].replace("\n", " ")
             print(f"   Preview: {preview}...")
 
 if __name__ == "__main__":
