@@ -6,6 +6,12 @@ from llama_index.core import VectorStoreIndex
 from llama_index.core.schema import BaseNode
 import uuid
 
+
+companies = ["高伟达", "京北方", "宇信科技", "财务指标", "营业收入", "净利润"] # 整体检索，不要分开
+for word in companies:
+    jieba.add_word(word)
+
+
 # 尝试兼容不同版本的 llama-index 导入
 try:
     from llama_index.retrievers.bm25 import BM25Retriever

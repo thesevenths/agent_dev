@@ -69,10 +69,10 @@ def main():
 
     print("3. Building retrievers...")
     # 向量检索器：自动处理 Chroma 持久化（在 retrievers.py 中实现）
-    vector_retriever = get_vector_retriever(documents=documents, top_k=15)
+    vector_retriever = get_vector_retriever(documents=documents, top_k=25)
 
     # BM25 检索器：用 documents（每个 item 一个 Document）
-    bm25_retriever = get_bm25_retriever(documents=documents, top_k=15)
+    bm25_retriever = get_bm25_retriever(documents=documents, top_k=30)
 
     print("✅ RAG system ready!")
     while True:
