@@ -57,7 +57,7 @@ def build_query_engine(bm25_retriever, vector_retriever, raw_query: str):
     reranker = DashScopeRerank(
         api_key=DASHSCOPE_API_KEY,
         model=RERANK_MODEL,
-        top_n=10
+        top_n=20
     )
 
     # LLM

@@ -1,5 +1,5 @@
 import os
-from process_report import process_pdfs_to_json, load_items_from_json
+from process_report import process_mds_to_json, load_items_from_json  # 修改为mds
 from retrievers import get_bm25_retriever, get_vector_retriever
 from query_engine import build_query_engine
 from pathlib import Path
@@ -13,6 +13,7 @@ load_dotenv(dotenv_path=env_path)
 
 from config import LLAMA_CLOUD_API_KEY
 from config import DASHSCOPE_API_KEY
+from config import MD_DIR, JSON_DIR  # 新增从config导入
 
 # 尝试导入官方 Document；若失败则用 process_report 的回退版本
 try:
@@ -20,10 +21,8 @@ try:
 except Exception:
     OfficalDocument = None
 
-PDF_DIR = r"E:\\model\\RAG\\report"
 CHROMA_PATH = "E:\\model\\RAG\\chroma_db"
 NODES_CACHE = "E:\\model\\RAG\\nodes.pkl"
-JSON_DIR = r"E:\model\RAG\json_reports"
 
 def _convert_documents(docs):
     """
@@ -46,12 +45,12 @@ def _convert_documents(docs):
     return converted
 
 def main():
-    # 1) 先把 PDF 转为 json（有缓存则跳过）
-    print("1. Converting PDFs to JSON (cached)...")
-    json_paths = process_pdfs_to_json(PDF_DIR, json_dir=JSON_DIR, force=False)
+    # 1) 先把 MD 转为 json（有缓存则跳过）
+    print("1. Converting MDs to JSON (cached)...")
+    json_paths = process_mds_to_json(MD_DIR, json_dir=JSON_DIR, force=False)
     print(f" -> {len(json_paths)} json files ready in {JSON_DIR}")
 
-    # 2) 从 json 加载 items（每个 text item 与每个 table 都变成一个 Document）
+    # 2) 从 json 加载 items（每个 text chunk 与每个 table 都变成一个 Document）
     has_nodes = os.path.exists(NODES_CACHE)
     if has_nodes:
         print("🔍 Loading documents cache from nodes.pkl...")

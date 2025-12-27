@@ -24,3 +24,7 @@ QQ_EMAIL = os.getenv("QQ_EMAIL")
 QQ_APP_PASSWORD = os.getenv("QQ_APP_PASSWORD")
 
 CRYPTO_SENTIMENT_KEY = os.getenv("CRYPTO_SENTIMENT_KEY")
+
+# 新增：MD目录
+MD_DIR = r"E:\model\RAG\report_md"
+JSON_DIR = r"E:\model\RAG\json_reports"
