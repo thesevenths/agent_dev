@@ -88,5 +88,27 @@ def main():
             preview = (getattr(node.node, "text", "") if hasattr(node, "node") else getattr(node, "text", ""))[:150].replace("\n", " ")
             print(f"   Preview: {preview}...")
 
+        # 输出MD格式的研究报告并保存到指定目录
+        output_dir = "E:\\model\\RAG\\output"
+        os.makedirs(output_dir, exist_ok=True)
+        report_filename = f"research_report_{query.replace(' ', '_')[:50]}.md"  # 使用查询作为文件名的一部分，避免特殊字符
+        report_path = os.path.join(output_dir, report_filename)
+        
+        # 构建MD内容：包括查询、响应和来源
+        md_content = f"# Research Report: {query}\n\n"
+        md_content += "## Answer\n\n" + response.response + "\n\n"
+        md_content += "## Sources\n\n"
+        for i, node in enumerate(response.source_nodes, 1):
+            meta = getattr(node.node, "metadata", {}) if hasattr(node, "node") else getattr(node, "metadata", {})
+            source = meta.get('source', 'Unknown')
+            is_table = meta.get('is_table', False)
+            preview = (getattr(node.node, "text", "") if hasattr(node, "node") else getattr(node, "text", ""))[:150].replace("\n", " ")
+            md_content += f"{i}. **Source:** {source} (Table: {is_table})\n   **Preview:** {preview}...\n\n"
+        
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+        
+        print(f"\n✅ Research report saved to: {report_path}")
+
 if __name__ == "__main__":
     main()

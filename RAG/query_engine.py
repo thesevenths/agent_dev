@@ -7,6 +7,7 @@ from llama_index.llms.dashscope import DashScope
 from config import LLM_MODEL, RERANK_MODEL, DASHSCOPE_API_KEY
 from retrievers import filter_nodes_by_metadata
 from typing import List, Optional
+from llama_index.core.prompts import PromptTemplate
 
 class HybridRetriever(BaseRetriever):
     def __init__(self, bm25_retriever, vector_retriever, metadata_filters: Optional[dict] = None):
@@ -61,8 +62,29 @@ def build_query_engine(bm25_retriever, vector_retriever, raw_query: str):
     )
 
     # LLM
-    llm = DashScope(model_name=LLM_MODEL, api_key=DASHSCOPE_API_KEY)
-    response_synthesizer = get_response_synthesizer(llm=llm)
+    llm = DashScope(
+        model_name=LLM_MODEL, 
+        api_key=DASHSCOPE_API_KEY,
+        max_tokens=8192,
+        temperature=0.2,
+        top_p=0.9,
+        context_window=32768
+    )
+
+    system_prompt = PromptTemplate(
+        "你是一位专业分析师，请基于以下检索到的上下文信息，撰写一份详尽、结构清晰、内容丰富的深度报告。\n"
+        "报告应包括：背景介绍、核心发现、详细分析、案例支持、数据引用、潜在影响与建议。\n"
+        "请确保内容不少于3000字（约4000+ tokens），语言专业、逻辑严密，避免重复。\n"
+        "上下文信息如下：\n{context_str}\n"
+        "用户问题：{query_str}\n"
+        "markdown格式的深度报告："
+    )
+
+    response_synthesizer = get_response_synthesizer(
+        llm=llm,
+        text_qa_template=system_prompt,
+        response_mode="tree_summarize"
+    )
 
     return RetrieverQueryEngine(
         retriever=hybrid_retriever,
