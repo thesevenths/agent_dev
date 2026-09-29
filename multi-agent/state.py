@@ -20,7 +20,7 @@ from typing import Annotated, Sequence
 class PlanStep(TypedDict):
     title: str
     description: str
-    status: str  # "pending" | "completed"
+    status: str  # "pending" | "completed" | "failed"（failed = 重试耗尽/异常，终态，不会被索引推进洗成 completed）
 
 
 class AgentState(MessagesState):

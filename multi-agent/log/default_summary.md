@@ -1,29 +1,41 @@
-*   **Step 1: Market Data Acquisition (2026-09-28)**
-    *   **Accomplished:** Captured closing data for A-share indices, market breadth, and capital flows.
+*   **Step 1: 09-28 Market Data & News**
+    *   **Accomplished:** Retrieved closing data and major news for 2026-09-28.
     *   **Key Data:**
-        *   **Indices:** SSE 3,823.62 (-1.67%), SZSE 12,858.75 (-3.44%), ChiNext 3,139.82 (-4.53%).
-        *   **Volume:** Total turnover ~1.70 trillion CNY (up ~49.4B CNY, indicating heavy selling pressure).
-        *   **Breadth:** <900 gainers (~16%), >4,500 losers.
-        *   **Capital:** Northbound net sell 4.753B CNY; Main capital net outflow 79.3B CNY.
-        *   **Futures:** IF -2.44%, IH -1.66%, IC -3.26%, IM -3.82% (Institutional hedging/short bias).
-        *   **Sectors:** Telecom -7.36%, Electronics -4.93% (Leaders in decline). Gainers: Oil/Petrochem, Utilities, Agriculture.
-        *   **Technical:** SSE broke 5/10/60-day MAs; MACD/KDJ dead cross; 3,844 pts identified as key resistance.
-    *   **Files:**
-        *   `E:\agent_dev\multi-agent\tmp\2026-09-28_A股行情与指数.json` (Primary data source for Step 3/4).
-        *   `E:\agent_dev\multi-agent\tmp\20260929T182545__step1__CrawlerAgent.md` (Summary).
+        *   **Indices:** SSE Composite 3823.62 (-1.67%), SZSE Component 12858.75 (-3.44%), ChiNext 3139.82 (-4.53%).
+        *   **Volume:** ~1.65 Trillion CNY (near yearly low, shrinking volume).
+        *   **Sentiment:** >4800 stocks declined.
+        *   **Drivers:** Tech sector profit-taking (AI/PCB/Semiconductors), pre-holiday risk aversion, external macro pressure (US stocks, oil, bonds).
+    *   **Files:** `F:\agent\multi-agent\tmp\20260929T225450__step1__CrawlerAgent.md`
 
-*   **Step 2: Cause Analysis & News Attribution**
-    *   **Accomplished:** Identified three resonating factors for the crash: Macro/External, Policy/Event, and Internal Capital Flight.
+*   **Step 2: 09-29 Real-time Market Data**
+    *   **Accomplished:** Retrieved intraday data for 2026-09-29 (as of 10:04 AM).
+    *   **Key Data:**
+        *   **SSE Composite:** 3813.02 (-0.28%). Open 3816.15, High 3828.57, Low 3812.43.
+        *   **Breadth:** 1293 stocks up vs 845 down (improvement from previous day).
+        *   **Context:** Data is intraday, not closing.
+    *   **Files:** `F:\agent\multi-agent\tmp\20260929T225532__step2__CrawlerAgent.md`
+
+*   **Step 3: Quantitative Analysis & Trend Judgment**
+    *   **Accomplished:** Analyzed crash drivers and assessed 09-29 rebound probability.
     *   **Key Conclusions:**
-        *   **Macro:** US 30Y Treasury yield broke **5.5%**, pressuring growth/tech valuations. Oil >$100/bbl reinforced inflation/rate expectations.
-        *   **Policy Trigger:** US Senator proposal to restrict federal procurement of Chinese **optical modules** directly triggered the telecom/electronics crash.
-        *   **Seasonal:** Pre-National Day risk aversion + quarter-end rebalancing amplified outflows.
-        *   **Verdict:** Crash driven by external rate/policy shock + internal hedging, not just technical correction.
+        *   **Crash Nature:** Technical/Liquidity adjustment (High-beta tech correction + Pre-holiday deleveraging), **NOT** fundamental deterioration or trend reversal.
+        *   **Rebound Probability:** ~55% (Neutral to Bullish). Expect "Structural Rebound" (Low-position sectors like Real Estate/Finance lead; Tech continues to digest).
+        *   **Key Levels (SSE):**
+            *   **Resistance:** 3823.62 (Prev Close), 3850, 3880.
+            *   **Support:** 3812.43 (Intraday Low), 3800, 3780 (Strong Support).
     *   **Files:**
-        *   `E:\agent_dev\multi-agent\tmp\2026-09-28_A股大跌原因与新闻.json` (Primary attribution source for Step 4).
-        *   `E:\agent_dev\multi-agent\tmp\20260929T182629__step2__CodeAgent.md` (Summary).
+        *   Report: `F:\agent\multi-agent\tmp\2026-09-29_大跌原因与走势研判.md`
+        *   Charts: `chart1_指数对比.png`, `chart2_驱动因素.png`, `chart3_支撑压力.png`, `chart4_反弹概率.png` (in `F:\agent\multi-agent\tmp\`)
 
-*   **Instructions for Downstream Agents:**
-    *   **Step 3 (Visualization):** Read `2026-09-28_A股行情与指数.json`. Generate charts highlighting: Index drop comparison, Sector heatmap (focus on Telecom/Electronics), Capital flow (Northbound -4.75B, Main -79.3B).
-    *   **Step 4 (Report):** Read both JSON files. Structure report around: 1) Attribution (US 30Y >5.5%, Optical Module Policy, Seasonal), 2) Technicals (3,844 resistance, MA breakdown), 3) Outlook, 4) Compliant advice for trapped investors (include risk disclaimers).
-    *   **Do NOT re-crawl:** All necessary data is in the persisted JSON files.
+*   **Step 4: Final Report & Position Management**
+    *   **Accomplished:** Generated final Markdown report with position advice.
+    *   **Key Advice (Position Management):**
+        *   **Core Decision:** Do **NOT** panic sell (割肉). Technical adjustment ≠ Trend reversal.
+        *   **Strategy:** "Optimize Structure, Not Panic."
+            *   **Hold:** Core low-valuation/policy-beneficiary stocks (Banks, Real Estate, High Dividend).
+            *   **Reduce:** High-beta Tech (AI/Semiconductors) on rebounds.
+            *   **Discipline:** Maintain 50-70% position. Add if volume breaks 3823.62; Reduce if breaks 3812.43/3800; Significant cut if breaks 3780.
+    *   **Files:** `F:\agent\multi-agent\tmp\2026-09-29_A股大跌分析与仓位管理建议_最终报告.md`
+
+**Action for Downstream Agents:**
+*   **Step 5 (Chat Agent):** Use the final report file above. Summarize the "55% Rebound Probability," "Structural Rebound" logic, and the specific "Hold Core / Reduce Tech" position advice. Do not re-analyze data.
