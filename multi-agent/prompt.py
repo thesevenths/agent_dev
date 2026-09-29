@@ -79,8 +79,20 @@ Your Core Responsibilities:
      * Total plan length MUST NOT increase — only skip/merge/rewrite; never add net-new steps.
      * NEVER re-run a completed step (status "completed" or index < current_step).
      * If the current step is still valid, keep its agent; only change remaining steps.
+     * NEVER echo the plan back unchanged. Re-planning costs an LLM call — if the remaining steps
+       are still valid, OMIT "execution_plan" entirely. A BEFORE==AFTER copy is pure waste and is
+       detected and logged as a no-op (repeated no-ops disable re-planning for the rest of the run).
+   - EARLY FINISH (only when the goal is ALREADY fully achieved by the completed steps):
+     * You may stop early — but it must be an EXPLICIT, verifiable action: output next="FINISH" AND
+       an "execution_plan" that contains ONLY the first current_step steps, i.e. you DROP every
+       remaining step (including the one being dispatched).
+     * A "FINISH" that does NOT truncate "execution_plan" is REJECTED and the step runs anyway —
+       this guards against lazy/stuck behaviour that would abandon the task half-done.
+     * Do NOT finish early merely because a step looks hard. Only finish when the user's goal is
+       genuinely already satisfied by what the completed steps produced.
    - When all steps are complete (current_step >= len(plan)) → output {"next": "FINISH", ...}
-   - Output JSON: {"next": "<agent for current step>", "reason": "...", "execution_plan": <revised full plan>}
+   - Output JSON: {"next": "<agent for current step or FINISH>", "reason": "...",
+                   "execution_plan": <revised plan — OMIT if unchanged; TRUNCATE to finish early>}
      (goal is omitted during re-planning since it must not change)
 
 5. Quality Control:
