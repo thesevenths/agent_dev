@@ -37,6 +37,10 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 
+# 运行日志：把关键事件（含本工具的联网检索 query）持久化到 multi-agent/log/ 的时间戳文件。
+# runlog 仅依赖标准库，无循环依赖（agent.py / tools.py 都可安全导入）。
+from runlog import log_event
+
 # 调试
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -99,6 +103,7 @@ def resilient_tavily_search(query: str) -> str:
     """
     norm = _norm_query(query)
     logger.info(f"[tavily] query = {query!r}")  # 便于在 langgraph dev 终端观察模型生成的 query
+    log_event(f"[tavily] query = {query!r}")     # 持久化到本次运行的 log/ 时间戳文件
     # 同 query 重复调用防呆：agent 在 ReAct 循环里常把相同 query 反复丢给本工具
     for prev_norm, prev_res in reversed(_tavily_recent):
         if prev_norm == norm:

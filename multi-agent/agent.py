@@ -89,6 +89,10 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 # 供 tools.py 的 create_file/read_file/str_replace 解析相对路径（延迟读取，晚于本模块导入也没关系）
 os.environ.setdefault("AGENT_TMP_DIR", str(TMP_DIR))
 
+# 每轮运行的关键日志（supervisor 规划 / 再规划 / 子 agent 任务下发 / 联网检索）持久化到
+# multi-agent/log/，文件名带时间戳，便于事后排查（不依赖 langgraph dev 终端）。
+from runlog import start_run, ensure_run, set_current, log_event, LOG_DIR, write_summary
+
 # === 当前日期上下文（根治：模型无实时时钟，必须显式注入"今天/昨天"）===
 # 否则模型会把"昨天"映射到训练记忆里的某次事件（如把 A 股大跌猜成 2025年6月）。
 _WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -127,6 +131,7 @@ class AgentState(TypedDict):
     observations: List  # 每步 ToolMessage + 总结 AIMessage 累积，作为再规划上下文（对应 demo 的 state["observations"]）
     current_step: int
     artifacts: List[str]  # 每步落盘的产物文件路径（tmp/ 下），作为 agent 间 handoff 的可靠通道
+    plan_summary: Optional[str]  # 已完成步的"要点清单"语义摘要（_summarize_observations 生成），作为下游 agent 的跨步上下文
 
 # === LLMs 配置 ===
 def create_llm(temperature=0.1, model_name=None):
@@ -452,6 +457,106 @@ def _build_replan_context(state: dict) -> str:
     return _latest_result_text(state)
 
 
+# === 跨步语义摘要（要点提取）===
+# 背景：之前"下游 agent 拿不到上游结果"的根因是历史只靠 _compress_messages 粗暴截断 + observations
+# 原样塞 40 条原始消息。截断会丢信息（用户担忧），原始 40 条又占 token 且不含"已检索到 X / 已存文件 Y /
+# 结论 Z"这种提炼信息。故在 supervisor 每轮再规划时，把 observations 过一次 LLM 提炼成"要点清单"
+# （key-points checklist），同时作为：①再规划上下文（比原始 observations 更准更省 token）；②下游 agent
+# 的跨步语义上下文（与文件 handoff 共同承载信息，使原始历史可安全截断）；③落盘 log/<thread>_summary.md
+# 供事后回看（对应 WorkBuddy/Qoder 把关键信息提取写入 md 的行为）。
+_SUMMARY_PROMPT = (
+    "You are condensing the COMPLETED steps of a multi-agent execution plan into a concise "
+    "KEY-POINTS checklist for the downstream agents that will run next.\n\n"
+    "For each completed step extract ONLY the decision-relevant essentials:\n"
+    "- What the step accomplished (one line).\n"
+    "- Key data / numbers / dates / facts it found — keep the ACTUAL values, not vague phrasing.\n"
+    "- Files it persisted (absolute paths) — downstream agents MUST read these for full data; "
+    "do NOT re-fetch or re-crawl.\n"
+    "- Any conclusion or decision it reached.\n\n"
+    "Rules:\n"
+    "- Be concrete and faithful to the source; never invent data.\n"
+    "- Total under ~400 words. Use a markdown bullet list.\n"
+    "- Do NOT paste raw tool JSON or long excerpts; keep only what a later agent needs to act.\n"
+)
+
+_summary_cache: dict = {}
+
+
+def _fallback_summary(state: dict) -> str:
+    """LLM 不可用时的兜底：从 plan 状态 + artifacts + 最近一条 AI 答复提取极简要点，避免下游完全失明。"""
+    plan = _normalize_plan(state.get("execution_plan") or [])
+    arts = state.get("artifacts") or []
+    lines = ["[auto summary — LLM unavailable, extractive fallback]"]
+    for i, s in enumerate(plan):
+        if s.get("status") == "completed":
+            lines.append(f"- Step {i + 1} ({s.get('title', '')}): completed. {s.get('description', '')}")
+    if arts:
+        lines.append("- Persisted files (read with read_file for full data):")
+        for p in arts[-5:]:
+            lines.append(f"  - {p}")
+    return "\n".join(lines)
+
+
+def _summarize_observations(state: dict) -> str:
+    """把已完成步的 observations 提炼成"要点清单"，作为下游 agent 的跨步语义上下文。
+
+    返回空串表示尚无已完成步（首步前）。LLM 失败时回落 _fallback_summary（不抛异常），调用方可自行
+    决定是否需要原始 observations 兜底。结果按 (memory_key, 最近一条 observation 内容指纹) 缓存，
+    避免 supervisor 再规划与子 agent 节点在同一 completed-state 下重复调用 LLM。同时落盘
+    log/<thread>_summary.md。
+    """
+    obs = state.get("observations", []) or []
+    if not obs:
+        return ""
+    mk = state.get("memory_key") or "default"
+    last = obs[-1]
+    fp = (mk, len(obs), type(last).__name__, _msg_text(last)[:120])
+    if fp in _summary_cache:
+        return _summary_cache[fp]
+    # 构造摘要输入：plan 状态 + artifacts + observations（各取合理上限，避免喂入爆炸）
+    plan = _normalize_plan(state.get("execution_plan") or [])
+    arts = state.get("artifacts") or []
+    plan_lines = "\n".join(
+        f"{i + 1}. [{'completed' if s.get('status') == 'completed' else 'pending'}] "
+        f"{s.get('title', '')}: {s.get('description', '')}"
+        for i, s in enumerate(plan)
+    )
+    art_lines = "\n".join(f"- {p}" for p in arts[-8:]) or "(none)"
+    obs_parts = []
+    for m in obs[-14:]:
+        if isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
+            c = m.content if isinstance(m.content, str) else str(m.content)
+            who = getattr(m, "name", None) or "agent"
+            obs_parts.append(f"[output from {who}] " + c[:1000])
+        elif isinstance(m, ToolMessage):
+            c = m.content if isinstance(m.content, str) else str(m.content)
+            obs_parts.append(f"[tool {getattr(m, 'name', None)}] " + c[:700])
+    obs_text = "\n".join(obs_parts)
+    sys_msg = SystemMessage(content=_SUMMARY_PROMPT)
+    user_msg = HumanMessage(content=(
+        f"Overall goal: {state.get('plan_goal') or _goal_text(state)}\n\n"
+        f"Plan status:\n{plan_lines}\n\n"
+        f"Persisted files from completed steps (full data lives here):\n{art_lines}\n\n"
+        f"Raw outputs of completed steps (extract key points from these; files hold full data):\n{obs_text}\n\n"
+        "Produce the key-points checklist now."
+    ))
+    text = ""
+    try:
+        ai = supervisor_llm.invoke([sys_msg, user_msg])
+        text = ai.content if isinstance(ai, AIMessage) else str(ai)
+        text = text.strip()
+    except Exception as se:
+        logger.warning(f"observations summary failed ({se}); using extractive fallback")
+        text = _fallback_summary(state)
+    # 落盘 + 缓存
+    try:
+        write_summary(mk, text)
+    except Exception:
+        pass
+    _summary_cache[fp] = text
+    return text
+
+
 def _mark_progress(plan: list, current: int) -> list:
     """把已完成步（index < current）标记为 completed；其余保持 pending。
 
@@ -475,14 +580,15 @@ def _plan_view(plan: list, current: int = -1) -> str:
     )
 
 
-def _replan_tail(state: dict, plan: list, current: int):
+def _replan_tail(state: dict, plan: list, current: int, summary_ctx: str | None = None):
     """调用 LLM 审视并改写剩余步骤。返回 (current_agent, new_plan)。
 
     借鉴 single-agent demo 的 update_planner：
     - plan 为结构化步骤（含 status），只重写"未完成"的尾部（index > current），
       已完成步（index < current）保留并标记为 completed；
     - plan_goal 永不改变（对应 demo "don't change the goal"）；
-    - 再规划上下文用 observations（每步 ToolMessage + 总结），比单条结果文本更完整。
+    - 再规划上下文优先用跨步语义摘要 summary_ctx（_summarize_observations 提炼的要点清单，
+      比原始 observations 更准更省 token）；摘要缺失时回落 _build_replan_context（原始 observations）。
 
     安全约束（防死循环）：
     - 已完成步 plan[:current] 永不改写，只标 completed；
@@ -492,7 +598,11 @@ def _replan_tail(state: dict, plan: list, current: int):
     任何解析/调用异常都向上抛，由调用方回落"按原计划下一步"。
     """
     goal = state.get("plan_goal") or _goal_text(state)
-    latest = _build_replan_context(state)
+    if summary_ctx is None and not _AGENT_SUMMARY_DISABLE:
+        summary_ctx = _summarize_observations(state)
+    elif summary_ctx is None:
+        summary_ctx = ""
+    ctx = summary_ctx or _build_replan_context(state)
     sys_prompt = supervisor_system_prompt.replace("{members}", ", ".join(members)) + "\n\n" + _date_context_str()
     sys_msg = SystemMessage(content=sys_prompt)
     before_view = _plan_view(_mark_progress(plan, current), current)
@@ -500,7 +610,7 @@ def _replan_tail(state: dict, plan: list, current: int):
     user_msg = HumanMessage(content=(
         f"User goal (NEVER change this):\n{goal}\n\n"
         f"Current execution_plan ('>>' marks the step being dispatched NOW, index {current}):\n{before_view}\n\n"
-        f"Observations from completed steps (ToolMessages + summaries):\n{latest}\n\n"
+        f"Summary of completed steps (key points — full data is in the listed files):\n{ctx}\n\n"
         "Decide the agent for the CURRENT step, then revise ONLY the REMAINING steps (index > current) "
         "based on what actually happened. You may skip/merge/rewrite remaining steps, but you MUST: "
         "1) keep the goal unchanged; 2) NOT increase total plan length; 3) NOT re-run completed steps; "
@@ -548,12 +658,17 @@ def _replan_tail(state: dict, plan: list, current: int):
 def supervisor(state: AgentState) -> Dict[str, Any]:
     """Supervisor：支持一次性规划 + 多轮顺序执行"""
     try:
+        # 让本轮运行的关键日志（含子 agent 内触发的 tavily 检索）落到正确的运行日志文件。
+        set_current(state.get("memory_key"))
         # 情况1：已有执行计划 → 自适应再规划（每步根据上一步结果审视/改写剩余步骤）
         plan = state.get("execution_plan") or []
         if plan and len(plan) > 0:
+            memory_key = state.get("memory_key")
+            ensure_run(memory_key)
             current = state.get("current_step", 0)
             if current >= len(plan):
                 # 所有步骤都完成了
+                log_event("[supervisor] FINISH: all steps in execution plan completed.", memory_key)
                 return {
                     "next": "FINISH",
                     "reason": "All tasks in execution plan completed.",
@@ -562,18 +677,38 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
 
             step_text = plan[current]
             target_agent = _parse_target_agent(step_text)
+            plan_before = _mark_progress(plan, current)
+            # 跨步语义摘要：把已完成步的 observations 提炼成要点清单（落盘 log/<thread>_summary.md），
+            # 作为再规划与下游 agent 的语义上下文；LLM 不可达时 _summarize_observations 内部回落提取式摘要。
+            summary_ctx = ""
+            if not _AGENT_SUMMARY_DISABLE:
+                summary_ctx = _summarize_observations(state)
+                if summary_ctx:
+                    log_event(f"[supervisor] completed-steps summary (fed to re-plan + downstream):\n{summary_ctx}", memory_key)
             try:
                 # 调用 LLM 审视剩余步骤（可跳过/改写已失效步骤），带防死循环硬约束
-                target_agent, plan = _replan_tail(state, plan, current)
+                target_agent, plan = _replan_tail(state, plan, current, summary_ctx=summary_ctx)
+                log_event(
+                    f"[supervisor] re-planning step {current + 1}/{len(plan_before)}:\n"
+                    f"BEFORE:\n{_plan_view(plan_before, current)}\n"
+                    f"AFTER:\n{_plan_view(plan)}\n=> next={target_agent}",
+                    memory_key,
+                )
             except Exception as re:
                 logger.warning(f"supervisor re-plan failed ({re}); follow original plan step {current + 1}")
                 # 回落：保持原计划仅推进当前步，但 status 必须照样反映进度（不依赖 LLM）
                 target_agent, plan = target_agent, _mark_progress(plan, current)
+                log_event(
+                    f"[supervisor] re-plan FAILED ({re}); following original step {current + 1}/{len(plan)}:\n"
+                    f"{_plan_view(plan, current)}",
+                    memory_key,
+                )
             return {
                 "next": target_agent,
                 "reason": f"Following execution plan step {current + 1}/{len(plan)}: {step_text}",
                 "execution_plan": plan,
                 "plan_goal": state.get("plan_goal"),  # 原样带回，再规划不改 goal
+                "plan_summary": summary_ctx,          # 跨步语义摘要，随 state 下发给子 agent
                 "current_step": current + 1   # 关键：推进进度
             }
 
@@ -603,9 +738,16 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
             plan = _normalize_plan(response.get("execution_plan"))
             if plan:
                 goal = response.get("goal") or _goal_text(state)
+                memory_key = state.get("memory_key")
+                run_path = start_run(memory_key)  # 新运行：开一个带时间戳的日志文件
                 logger.info(f"Supervisor created execution plan (goal={goal!r}):\n" + "\n".join(
                     f"{i+1}. {s.get('title','')}: {s.get('description','')}" for i, s in enumerate(plan)
                 ))
+                log_event(
+                    f"[supervisor] created execution plan (goal={goal!r}):\n{_plan_view(plan)}\n"
+                    f"[supervisor] run log file: {run_path}",
+                    memory_key,
+                )
                 # 第一步立刻执行
                 first_agent = _parse_target_agent(plan[0])
                 return {
@@ -654,10 +796,17 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
 #   b) 每步把最终输出落盘到 tmp/，用"文件路径"作为跨 agent handoff 的可靠通道——文件不受
 #      context 窗口限制，下游 read_file 即可拿到全量数据；
 #   c) 送入子 agent 前对历史消息做 pair-safe 压缩（工具输出截断 + 旧消息按窗口裁剪）。
-_CTX_TOOL_CHARS = int(os.environ.get("AGENT_CTX_TOOL_CHARS", 700))       # 单条 ToolMessage 保留上限
-_CTX_AI_CHARS = int(os.environ.get("AGENT_CTX_AI_CHARS", 1200))          # 历史 AI 消息保留上限
-_CTX_RECENT_AI_CHARS = int(os.environ.get("AGENT_CTX_RECENT_AI_CHARS", 6000))  # 最近一条上游结果上限
+# === 上下文压缩相关开关（可用 .env 覆盖，无需改代码）===
+# 说明：自"跨步语义摘要（_summarize_observations）"上线后，删旧步的原始消息已不再是信息载体——
+# 已完成步的"要点 + 落盘文件"由摘要承载，因此这里的截断只是最后一道防 context 溢出的安全网，
+# 而非信息来源。若你担心截断漏掉重要信息，可设 AGENT_CTX_NO_TRUNCATE=1 完全关闭截断做对照验证。
+_CTX_TOOL_CHARS = int(os.environ.get("AGENT_CTX_TOOL_CHARS", 1000))      # 单条 ToolMessage 保留上限
+_CTX_AI_CHARS = int(os.environ.get("AGENT_CTX_AI_CHARS", 1500))          # 历史 AI 消息保留上限
+_CTX_RECENT_AI_CHARS = int(os.environ.get("AGENT_CTX_RECENT_AI_CHARS", 8000))  # 最近一条上游结果上限
 _CTX_KEEP_LAST = int(os.environ.get("AGENT_CTX_KEEP_LAST_MSGS", 24))     # 送入子 agent 的消息条数上限
+_CTX_NO_TRUNCATE = os.environ.get("AGENT_CTX_NO_TRUNCATE", "").lower() in ("1", "true", "yes")
+# 跨步语义摘要总开关（默认开启）。设 AGENT_SUMMARY_DISABLE=1 可关闭，回落"原始 observations"喂再规划。
+_AGENT_SUMMARY_DISABLE = os.environ.get("AGENT_SUMMARY_DISABLE", "").lower() in ("1", "true", "yes")
 
 
 def _msg_text(m) -> str:
@@ -666,22 +815,30 @@ def _msg_text(m) -> str:
 
 
 def _truncate(text: str, limit: int) -> str:
+    if _CTX_NO_TRUNCATE:
+        return text
     if limit > 0 and len(text) > limit:
-        return text[:limit] + f"\n...[truncated {len(text) - limit} chars; full content kept in state.observations / tmp artifact]"
+        return text[:limit] + f"\n...[truncated {len(text) - limit} chars; full content kept in state.observations / tmp artifact / log/<thread>_summary.md]"
     return text
 
 
 def _compress_messages(msgs, keep_last: int = _CTX_KEEP_LAST):
     """pair-safe 压缩消息历史：保 首条用户 query + 最近 keep_last 条，其余按完整工具组裁剪。
 
+    角色说明：自"跨步语义摘要"上线后，本函数只是**最后一道防 context 溢出的安全网**，不再是
+    跨步信息的载体——已完成步的要点由 plan_summary 承载、全量数据由 tmp 文件承载。故：
     - 工具输出（体积最大）一律截断到 _CTX_TOOL_CHARS；
     - 历史 AI 消息截断到 _CTX_AI_CHARS 并加来源标签；最近一条（上一步的正式产出）保留更大预算；
     - 裁剪窗口时绝不切断 AIMessage(tool_calls) → ToolMessage 配对（否则部分推理服务会报
       "tool_call_id 无对应 assistant 消息"），遇到 ToolMessage 边界就后移到安全位置。
+    - 设 AGENT_CTX_NO_TRUNCATE=1 可完全跳过本函数（内容截断 + 窗口裁剪都关闭），用于对照验证
+      "截断是否漏掉重要信息"。
     """
     msgs = list(msgs or [])
     if not msgs:
         return msgs
+    if _CTX_NO_TRUNCATE:
+        return msgs  # 调试/上下文预算充足时：完全不压缩
     last_ai_idx = -1
     for i, m in enumerate(msgs):
         if isinstance(m, AIMessage):
@@ -777,6 +934,10 @@ def create_resilient_node(agent):
             _step_txt = f"{_step.get('title', '')} | {_step.get('description', '')}"
         else:
             _step_txt = str(_step) if _step is not None else "No plan"
+        # 让本步内子 agent 触发的工具（如 tavily 检索）把日志落到正确的运行日志文件。
+        _mk = state.get("memory_key")
+        set_current(_mk)
+        ensure_run(_mk)
         logger.info(f"Executing plan step {_cur}/{len(_plan)}: {_step_txt}")
         max_retries = 3
         for attempt in range(max_retries):
@@ -811,9 +972,23 @@ def create_resilient_node(agent):
                 if not prefixed:
                     msgs = [HumanMessage(content=date_ctx)] + msgs
                 compressed = _compress_messages(msgs)
+                # 跨步语义摘要：让子 agent 拿到"上游已完成步的要点"，而不是只看被截断的原始历史
+                # （或完全看不到上游做了什么）。摘要与文件 handoff 共同承载跨步信息，故原始历史可安全截断。
+                summary_ctx = state.get("plan_summary") or ""
+                if not summary_ctx and not _AGENT_SUMMARY_DISABLE:
+                    summary_ctx = _summarize_observations(state)
+                extra = []
+                if summary_ctx:
+                    extra.append(HumanMessage(content=(
+                        "[Summary of completed upstream steps — treat as context; DO NOT redo this work, "
+                        "full data is in the files listed]\n" + summary_ctx
+                    )))
                 assignment = _step_assignment_text(state, agent.name)
-                run_state["messages"] = compressed + [HumanMessage(content=assignment)]
+                run_state["messages"] = compressed + extra + [HumanMessage(content=assignment)]
                 logger.info(f"{agent.name} step assignment:\n{assignment[:400]}")
+                # 持久化本步任务下发（含第 N/M 步、title/description、上游产物路径、禁重跑规则），
+                # 便于事后在 log/ 下核对 supervisor 到底给子 agent 派了什么活。
+                log_event(f"{agent.name} step assignment (step {_cur}/{len(_plan)}):\n{assignment}", _mk)
                 result = agent.invoke(run_state)
                 
                 # 保存快照（每 3 轮对话一次，middleware handles visualization）
