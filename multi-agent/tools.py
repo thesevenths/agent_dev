@@ -164,10 +164,40 @@ def shell_exec(command: str) -> dict:
         return {"error": {"stderr": str(e)}}
 
 
+# === 统一产物目录 ===
+# 所有写入类工具（create_file / str_replace）的相对路径统一落到 <project>/tmp，避免污染仓库根目录；
+# 绝对路径原样尊重。读取类工具按「原样 → tmp → 仓库根」依次尝试，保证读写 round-trip 一致，
+# 同时不破坏历史产出（散落在根目录的旧文件仍可读）。
+def _output_dir() -> Path:
+    d = os.environ.get("AGENT_TMP_DIR") or os.path.join(Path(__file__).resolve().parent, "tmp")
+    p = Path(d)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return p
+
+
+def _resolve_write_path(file_name: str) -> Path:
+    p = Path(file_name)
+    return p if p.is_absolute() else _output_dir() / p
+
+
+def _resolve_read_path(file_name: str) -> Path:
+    p = Path(file_name)
+    if p.is_absolute():
+        return p
+    for candidate in (p, _output_dir() / p, Path(os.getcwd()) / p):
+        if candidate.exists():
+            return candidate
+    return p
+
+
 @tool
 def create_file(file_name: str, file_contents: str):
     """
     Create a new file with the provided contents at a given path in the workspace.
+    Relative paths are stored under the project's tmp/ directory; absolute paths are used as given.
     
     Args:
         file_name (str): Name of the file to be created (required, non-empty)
@@ -176,8 +206,8 @@ def create_file(file_name: str, file_contents: str):
     try:
         if not file_name or not file_contents:
             return {"error": "file_name and file_contents must be non-empty strings"}
-        file_path = os.path.join(os.getcwd(), file_name)
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        file_path = _resolve_write_path(file_name)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(file_path, 'w', encoding='utf-8') as file:
             file.write(file_contents)
         return {"message": f"Successfully created file at {file_path}"}
@@ -237,10 +267,10 @@ def read_file(file_name: str) -> dict:
     try:
         if not file_name:
             return {"error": "file_name must be a non-empty string"}
-        file_path = os.path.join(os.getcwd(), file_name)
+        file_path = _resolve_read_path(file_name)
         with open(file_path, "r", encoding='utf-8') as file:
             content = file.read()
-        return {"file_name": file_name, "content": content}
+        return {"file_name": str(file_path), "content": content}
     except Exception as e:
         return {"error": f"Error reading {file_name}: {str(e)}"}
 
@@ -258,7 +288,7 @@ def str_replace(file_name: str, old_str: str, new_str: str):
     try:
         if not all([file_name, old_str, new_str]):
             return {"error": "All parameters must be non-empty strings"}
-        file_path = os.path.join(os.getcwd(), file_name)
+        file_path = _resolve_read_path(file_name)
         with open(file_path, "r", encoding='utf-8') as file:
             content = file.read()
         new_content = content.replace(old_str, new_str, 1)
