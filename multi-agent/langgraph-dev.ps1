@@ -1,4 +1,4 @@
-# langgraph-dev.ps1 —— 一键启动 langgraph dev（带 PYTHONUTF8=1 根治 Windows GBK 编码崩溃）
+﻿# langgraph-dev.ps1 —— 一键启动 langgraph dev（带 PYTHONUTF8=1 根治 Windows GBK 编码崩溃）
 #
 # 用法（在 PowerShell 里，项目根目录）：
 #   .\langgraph-dev.ps1              # 默认：热重载已关闭（--no-reload），跑 agent 最稳

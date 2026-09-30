@@ -116,6 +116,16 @@ def _compress_messages(msgs, keep_last: int = _CTX_KEEP_LAST):
         return msgs
     if _CTX_NO_TRUNCATE:
         return msgs  # 调试/上下文预算充足时：完全不压缩
+    # 先做窗口裁剪（pair-safe），再只 condense 存活下来的消息。
+    # 原实现先对"全部"历史消息逐条调 LLM 提炼、之后才裁剪窗口，导致大量 LLM 调用花在
+    # 随即被丢弃的消息上（实测每个节点入口因此多出数分钟串行 LLM 开销）。裁剪前置后，
+    # condense 调用数从"全历史超预算条数"降到"窗口内超预算条数"，保留集合与 pair-safe 不变。
+    if len(msgs) > keep_last:
+        cut = len(msgs) - keep_last
+        while cut < len(msgs) and isinstance(msgs[cut], ToolMessage):
+            cut += 1  # 不要落在工具组的中间
+        head = [msgs[0]] if (isinstance(msgs[0], HumanMessage) and cut > 0) else []
+        msgs = head + msgs[cut:]
     last_ai_idx = -1
     for i, m in enumerate(msgs):
         if isinstance(m, AIMessage):
@@ -149,12 +159,4 @@ def _compress_messages(msgs, keep_last: int = _CTX_KEEP_LAST):
                     out.append(m)
         else:
             out.append(m)
-
-    # 窗口裁剪（pair-safe）
-    if len(out) > keep_last:
-        cut = len(out) - keep_last
-        while cut < len(out) and isinstance(out[cut], ToolMessage):
-            cut += 1  # 不要落在工具组的中间
-        head = [out[0]] if (isinstance(out[0], HumanMessage) and cut > 0) else []
-        out = head + out[cut:]
     return out
