@@ -26,6 +26,15 @@ from llm import supervisor_llm
 logger = logging.getLogger(__name__)
 
 
+def _extract_longterm(state, memory_key):
+    """FINISH 收尾时把本轮蒸馏成跨会话长期记忆（“养龙虾”闭环写入端）。异常吞掉，绝不影响收尾。"""
+    try:
+        from longterm import extract_and_remember_from_run
+        extract_and_remember_from_run(state, memory_key)
+    except Exception as e:
+        logger.warning(f"[longterm] FINISH extract skipped ({e})")
+
+
 def supervisor(state: AgentState) -> Dict[str, Any]:
     """Supervisor：支持一次性规划 + 多轮顺序执行"""
     try:
@@ -51,6 +60,8 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                     + f"\n{_plan_view(final_plan)}",
                     memory_key,
                 )
+                # 长期记忆抽取（写入端）：本轮真正结束，用 1 次 LLM 蒸馏跨会话记忆入库。
+                _extract_longterm(state, memory_key)
                 return {
                     "next": "FINISH",
                     "reason": "All tasks in execution plan completed.",
@@ -115,6 +126,8 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                         f"{_plan_view(final_plan)}",
                         memory_key,
                     )
+                    # 长期记忆抽取（写入端）：早停同样是一次 run 结束，蒸馏跨会话记忆入库。
+                    _extract_longterm(state, memory_key)
                     return {
                         "next": "FINISH",
                         "reason": f"Early finish after {len(final_plan)}/{len(plan_before)} steps: {finish_reason}",
@@ -163,6 +176,15 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                 "{members}", ", ".join(members)
             ) + "\n\n" + _date_context_str())
             messages = [system_msg] + state["messages"]
+            # 跨会话长期记忆注入（首轮规划）：把入口召回的用户背景插在 system 之后、本轮请求之前，
+            # 让“计划”本身就贴合用户画像/偏好（如中文报告、金融口径）。为空则不加，零回归。
+            _recalled = state.get("recalled_memory") or ""
+            if _recalled:
+                messages = ([system_msg,
+                             HumanMessage(content=("[Long-term memory about the USER, recalled from past "
+                                                   "sessions — personalize the plan accordingly; this is "
+                                                   "BACKGROUND, not the task]\n" + _recalled))]
+                            + list(state["messages"]))
 
             # 优先结构化输出；本地 vLLM 对 TypedDict 结构化输出支持不稳定 → 先带错误重试，
             # 全败才回落裸调用+手动抽 JSON（鲁棒性#3）。

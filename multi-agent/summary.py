@@ -10,11 +10,12 @@
 原定义位于 agent.py:597-779，开关位于 1233/1236，拆分时整体迁入。
 """
 import os
+import re
 import logging
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
 from llm import supervisor_llm
-from planutil import _normalize_plan, _goal_text
+from planutil import _normalize_plan, _goal_text, _extract_json_obj
 from compress import _msg_text
 from runlog import write_summary
 
@@ -205,3 +206,102 @@ def _summarize_observations(state: dict) -> str:
         pass
     _summary_cache[fp] = text
     return text
+
+
+# ============================================================================
+# 融合「判对错 + 摘要合并」为 1 次 LLM 调用（用户诉求：一举两得，每步省 1 次 LLM）
+# ----------------------------------------------------------------------------
+# 语义 critic（判本步产出是否满足要求）与跨步摘要（把本步并入 checklist）二者：
+#   · 都在「一步完成时」触发；· 都读同一份新产出；· 都用 supervisor_llm。
+# 故合成一次调用：模型先给 VERDICT（判定），再给 CHECKLIST（合并后的要点清单）。
+# checklist 写回 state.plan_summary 后，supervisor 的 _summarize_observations 因
+# new_count==0 自动短路（零 LLM），于是「判 + 压」总共只花 1 次调用。
+# 判定是安全关键项，故：解析不出明确 passed → 返回 None，调用方 fail-open 回落免费规则门；
+# checklist 太短/缺失 → 返回 None，调用方回落常规 _summarize_observations，绝不写坏摘要。
+# ============================================================================
+
+_FUSED_FORMAT = (
+    "\n\n=== YOU MUST DO TWO THINGS IN ONE REPLY ===\n"
+    "(1) QUALITY VERDICT — judge FIRST whether the NEW step output SATISFIES its STEP REQUIREMENT. "
+    "Be fair but rigorous; do NOT invent extra requirements. When uncertain or only partially "
+    "satisfied, prefer passed=true (never wrongly accuse). Set passed=false ONLY when it clearly "
+    "fails the core ask (wrong, empty, or missing).\n"
+    "(2) CHECKLIST — the updated key-points checklist per the instructions above.\n\n"
+    "Reply in EXACTLY this format (VERDICT line first, then CHECKLIST):\n"
+    "VERDICT: {\"passed\": true, \"reason\": \"<short and concrete>\"}\n"
+    "CHECKLIST:\n<markdown bullet list>"
+)
+
+
+def _parse_verdict(raw: str):
+    """从融合输出解析 VERDICT。返回 (passed: bool|None, reason: str)。无明确 passed → (None, '')。"""
+    m = re.search(r"VERDICT\s*[:：]\s*(.*?)(?:\n\s*CHECKLIST\s*[:：]|\Z)", raw, re.DOTALL | re.IGNORECASE)
+    seg = m.group(1) if m else ""
+    obj = _extract_json_obj(seg) if seg.strip() else None
+    if isinstance(obj, dict) and "passed" in obj:
+        return bool(obj.get("passed")), str(obj.get("reason", ""))
+    return None, ""
+
+
+def _parse_checklist(raw: str):
+    """取 CHECKLIST 段（markdown）。无该标记→剔除 VERDICT 行后的正文兜底。太短→None（调用方回落）。"""
+    m = re.search(r"CHECKLIST\s*[:：]\s*(.*)\Z", raw, re.DOTALL | re.IGNORECASE)
+    if m:
+        cl = m.group(1).strip()
+    else:
+        lines = [ln for ln in raw.splitlines()
+                 if not re.match(r"\s*VERDICT\s*[:：]", ln, re.IGNORECASE)]
+        cl = "\n".join(lines).strip()
+    # 太短的不像合格 checklist（可能模型没按格式来）→ None，交调用方回落常规摘要，避免写坏 plan_summary
+    return cl if len(cl) >= 20 else None
+
+
+def judge_and_summarize(step, final_text, tool_evidence, prev_summary, goal, artifacts, mk="default"):
+    """融合 1 次 LLM 调用：判「本步产出是否满足要求」+ 把本步并入跨步 checklist。
+
+    返回 (passed: bool|None, reason: str, checklist: str|None)：
+      passed=None    → LLM 异常/未给明确判定 → 调用方 fail-open 回落免费规则门；
+      checklist=None → 未拿到可用摘要 → 调用方回落常规 _summarize_observations。
+    checklist 合格时已顺带落盘 log/<mk>_summary.md（与 _summarize_observations 对齐）。
+    复用摘要的两套 prompt（增量合并 / 首次基线），叠加 VERDICT 任务；输出严格分段便于稳健解析。
+    """
+    desc = (f"{step.get('title', '')} {step.get('description', '')}"
+            if isinstance(step, dict) else str(step))
+    ev = (tool_evidence or "")[:2000]
+    out_text = (final_text or "")[:4000]
+    art_lines = "\n".join(f"- {p}" for p in (artifacts or [])[-8:]) or "(none)"
+    base_sys = _SUMMARY_MERGE_PROMPT if prev_summary else _SUMMARY_PROMPT
+    sys_msg = SystemMessage(content=base_sys + _FUSED_FORMAT)
+    head = (
+        f"STEP REQUIREMENT (the step just completed — judge the NEW output against THIS):\n{desc}\n\n"
+        f"NEW step output (final answer):\n{out_text}\n\n"
+        f"NEW step tool-output evidence:\n{ev or '(none)'}\n\n"
+        f"Overall goal: {goal}\n\n"
+    )
+    if prev_summary:
+        user_msg = HumanMessage(content=(
+            head
+            + f"CURRENT checklist (authoritative for older steps — copy forward, do NOT restate):\n{prev_summary}\n\n"
+            + f"Persisted files so far (full data lives here):\n{art_lines}\n\n"
+            + "Now reply with VERDICT then the UPDATED merged CHECKLIST."
+        ))
+    else:
+        user_msg = HumanMessage(content=(
+            head
+            + f"Persisted files (full data lives here):\n{art_lines}\n\n"
+            + "Now reply with VERDICT then the CHECKLIST of key points."
+        ))
+    try:
+        ai = supervisor_llm.invoke([sys_msg, user_msg])
+        raw = (ai.content if isinstance(ai, AIMessage) else str(ai)) or ""
+    except Exception as ce:
+        logger.warning(f"[critic+summary] fused call failed ({ce}); fail-open to rule gate")
+        return None, "", None
+    passed, reason = _parse_verdict(raw)
+    checklist = _parse_checklist(raw)
+    if checklist:
+        try:
+            write_summary(mk, checklist)
+        except Exception:
+            pass
+    return passed, reason, checklist

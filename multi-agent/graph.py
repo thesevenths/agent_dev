@@ -1,7 +1,7 @@
 """Graph 装配 + 快照可视化 + 带记忆调用入口。
 
-- build_graph_with_memory()：按运行模式决定 Checkpointer（直接运行挂 MemorySaver；经 LangGraph
-  API 加载时不挂，由平台接管持久化）；
+- build_graph_with_memory()：按运行模式决定 Checkpointer（直接运行挂 SqliteSaver→./memory/*.sqlite；
+  经 LangGraph API 加载时不挂，由平台接管持久化）；
 - visualize_snapshot(snapshot_id)：把快照渲染成 Mermaid HTML；
 - invoke_with_memory(query, ...)：带记忆的图调用（供 agent.py 的 __main__ 自测与脚本调用）；
 - 模块级 `graph, memory = build_graph_with_memory()`：满足 langgraph.json 的 "agent:graph" 契约
@@ -10,11 +10,11 @@
 """
 import os
 import json
+import sqlite3
 import logging
-from datetime import datetime
 from typing import Optional, Dict
 
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage
 
@@ -37,7 +37,21 @@ def run_start(state: dict) -> dict:
     mk = state.get("memory_key") or "default"
     rid = start_run(mk)
     logger.info(f"[run_start] new run log: {run_file(rid)} (memory_key={mk})")
-    return {}
+    # 跨会话长期记忆召回（“养龙虾”闭环的读取端）：每轮入口按【当前】query（最后一条 HumanMessage）
+    # 语义召回 top-k 条长期记忆，写进 state.recalled_memory，供 supervisor 首轮规划与所有子 agent
+    # 节点注入。召回失败/为空/功能关闭 → 不写字段，行为与改造前完全一致（零回归）。
+    try:
+        from longterm import recall
+        _q = ""
+        for _m in reversed(list(state.get("messages") or [])):
+            if isinstance(_m, HumanMessage):
+                _q = _m.content if isinstance(_m.content, str) else str(_m.content)
+                break
+        recalled = recall(_q, memory_key=mk)
+    except Exception as e:
+        logger.warning(f"[run_start] long-term recall skipped ({e})")
+        recalled = ""
+    return {"recalled_memory": recalled} if recalled else {}
 
 
 def build_graph_with_memory():
@@ -48,9 +62,11 @@ def build_graph_with_memory():
       graph 不能带自定义 checkpointer，否则 dev 服务报 ValueError 拒绝加载。
       用 LANGSMITH_LANGGRAPH_API_VARIANT 环境变量识别，编译时不挂自定义 checkpointer。
     """
-    # 初始化 Checkpointer（SQLite 记忆）
-    os.makedirs("./memory", exist_ok=True)
-    memory = MemorySaver()
+    # Checkpointer 目录：直接运行时 SqliteSaver 落这里（固定到模块目录，不随 CWD 变）；
+    # langgraph dev 由平台持久化、不用它。memory 仅在直接运行分支被赋值为 SqliteSaver。
+    _mem_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory")
+    os.makedirs(_mem_dir, exist_ok=True)
+    memory = None
     workflow = StateGraph(AgentState)
 
     # 添加节点
@@ -85,13 +101,20 @@ def build_graph_with_memory():
     )
 
     # 编译：
-    # - 直接运行（python agent.py / invoke_with_memory）：挂 MemorySaver 以保留跨轮记忆；
+    # - 直接运行（python agent.py / invoke_with_memory）：挂 SqliteSaver，记忆落到 ./memory/*.sqlite，
+    #   跨进程重启不丢（原 MemorySaver 只在内存、重启即失）；
     # - 经 LangGraph API（langgraph dev / langgraph up）加载时，平台自带持久化，
     #   graph 不能带自定义 checkpointer（否则 dev 服务报 ValueError 拒绝加载），故不挂。
     if os.environ.get("LANGSMITH_LANGGRAPH_API_VARIANT"):
         graph = workflow.compile()            # 无 checkpointer，由 LangGraph 平台接管 persistence
     else:
+        # 长生命周期连接：不能用 SqliteSaver.from_conn_string（那是上下文管理器，退出即关连接）。
+        # check_same_thread=False：LangGraph 流式/线程池可能跨线程访问同一连接。setup() 建表（幂等）。
+        _db = os.environ.get("AGENT_CHECKPOINT_DB") or os.path.join(_mem_dir, "checkpoints.sqlite")
+        memory = SqliteSaver(sqlite3.connect(_db, check_same_thread=False))
+        memory.setup()
         graph = workflow.compile(checkpointer=memory)
+        logger.info(f"[checkpoint] SqliteSaver → {_db}（跨重启持久化；每步自动写入，无需手动保存）")
     graph.name = "Resilient Multi-Agent System"
     return graph, memory
 
@@ -149,10 +172,17 @@ graph, memory = build_graph_with_memory()
 
 
 # === 工具函数：带记忆的调用 ===
+# 默认会话线程：直接运行若未显式传 thread_id，用稳定值（而非每次随机时间戳），SqliteSaver 才能
+# 跨进程重启命中同一条线程、把历史读回来（开箱即用的跨重启续接）。thread_id 同时用作 memory_key
+# （决定 log/<key>_*.log 与 <key>_summary.md 命名）。可用 .env 的 AGENT_THREAD_ID 指定具名会话；
+# 显式传参 thread_id 优先级最高。
+_DEFAULT_THREAD_ID = os.environ.get("AGENT_THREAD_ID", "default")
+
+
 def invoke_with_memory(query: str, thread_id: str = None, config: Optional = None):
     """带记忆的 Graph 调用，支持回滚"""
     if thread_id is None:
-        thread_id = str(datetime.now().timestamp())
+        thread_id = _DEFAULT_THREAD_ID
 
     config = config or {"configurable": {"thread_id": thread_id}}
 

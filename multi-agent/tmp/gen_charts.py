@@ -1,70 +1,75 @@
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
-import numpy as np, os
+import os
 
-cands = ["Microsoft YaHei","SimHei","Microsoft JhengHei","PingFang SC","Noto Sans CJK SC","Source Han Sans SC","WenQuanYi Micro Hei"]
-avail = {f.name for f in fm.fontManager.ttflist}
-chosen = next((c for c in cands if c in avail), None)
-print("chosen font:", chosen)
-if chosen:
-    plt.rcParams["font.family"] = chosen
-plt.rcParams["axes.unicode_minus"] = False
+def find_chinese_font():
+    candidates = ['Microsoft YaHei','SimHei','Microsoft JhengHei','Noto Sans CJK SC','WenQuanYi Zen Hei','SimSun']
+    available = {f.name for f in fm.fontManager.ttflist}
+    for c in candidates:
+        if c in available:
+            return c
+    for f in fm.fontManager.ttflist:
+        if any(k in f.name for k in ['Hei','CJK','YaHei','SimSun','Song']):
+            return f.name
+    return None
 
-out = r"E:\agent_dev\multi-agent\tmp"
+font = find_chinese_font()
+print("Using font:", font)
+if font:
+    plt.rcParams['font.family'] = font
+plt.rcParams['axes.unicode_minus'] = False
 
-# ---- Chart 1: Today vs Yesterday ----
-fig, axes = plt.subplots(1, 2, figsize=(11,4.6))
-days = ["昨日\n2026-09-29","今日\n2026-09-30"]
-close = [3830.45, 3842.19]
-chg = [0.18, 0.31]
-colors = ["#8aa0b8", "#d64545"]
-ax = axes[0]
-bars = ax.bar(days, close, color=colors, width=0.5)
-ax.set_title("上证指数收盘价对比 (点)", fontsize=13, fontweight="bold")
-ax.set_ylim(3800, 3860)
-for b,v in zip(bars, close):
-    ax.text(b.get_x()+b.get_width()/2, v+1, f"{v:.2f}", ha="center", fontsize=11, fontweight="bold")
-ax.set_ylabel("收盘点位"); ax.grid(axis="y", alpha=0.3)
-ax = axes[1]
-bars = ax.bar(days, chg, color=colors, width=0.5)
-ax.set_title("涨跌幅对比 (%)", fontsize=13, fontweight="bold")
-ax.axhline(0, color="gray", lw=0.8)
-for b,v in zip(bars, chg):
-    ax.text(b.get_x()+b.get_width()/2, v+0.005, f"+{v:.2f}%", ha="center", fontsize=11, fontweight="bold")
-ax.set_ylabel("涨跌幅 (%)"); ax.grid(axis="y", alpha=0.3)
+out_dir = r"E:\agent_dev\multi-agent\tmp"
+
+# Chart 1: index daily change
+fig, ax = plt.subplots(figsize=(9,5.5))
+idx = ['上证指数','深证成指','创业板指','科创50','北证50']
+chg = [0.31, -0.11, -0.23, -2.51, 0.70]
+colors = ['#d62728' if c>=0 else '#2ca02c' for c in chg]
+bars = ax.bar(idx, chg, color=colors)
+ax.axhline(0, color='gray', lw=0.8)
+for b,c in zip(bars,chg):
+    ax.text(b.get_x()+b.get_width()/2, c + (0.08 if c>=0 else -0.18), f'{c:+.2f}%', ha='center', fontsize=11, fontweight='bold')
+ax.set_ylabel('涨跌幅 (%)')
+ax.set_title('2026-09-30 A股主要指数当日涨跌幅（收盘）', fontsize=14, fontweight='bold')
+ax.grid(axis='y', alpha=0.3)
 plt.tight_layout()
-plt.savefig(os.path.join(out,"chart1_today_vs_yesterday.png"), dpi=130, bbox_inches="tight"); plt.close()
+plt.savefig(os.path.join(out_dir,'chart1_index_change.png'), dpi=110)
+plt.close()
 
-# ---- Chart 2: Historical probability by source ----
-fig, ax = plt.subplots(figsize=(10,5.2))
-periods = ["2000-2011\n财新","2010-2023\n招商/华金","2015-2024\n东财Choice","2016-2025\n证券日报/Wind","2016-2025\n澎湃·郭施亮"]
-up = [60, 64.3, 70, 70, 60]
-down = [40, 35.7, 30, 30, 40]
-x = np.arange(len(periods))
-ax.bar(x, up, color="#d64545", label="上涨概率", width=0.6)
-ax.bar(x, down, bottom=up, color="#5b8def", label="下跌概率", width=0.6)
-for i,(u,d) in enumerate(zip(up,down)):
-    ax.text(i, u/2, f"{u:.1f}%", ha="center", va="center", color="white", fontweight="bold")
-    ax.text(i, u+d/2, f"{d:.1f}%", ha="center", va="center", color="white", fontweight="bold")
-ax.set_xticks(x); ax.set_xticklabels(periods, fontsize=9)
-ax.set_ylim(0,100); ax.set_ylabel("概率 (%)")
-ax.set_title("历年国庆节后第一个交易日 上证指数涨跌概率 (多口径)", fontsize=13, fontweight="bold")
-ax.legend(loc="upper right"); ax.grid(axis="y", alpha=0.3)
+# Chart 2: sector performance
+fig, ax = plt.subplots(figsize=(9,5.5))
+sectors = ['医药生物','美容护理','食品饮料','银行','钢铁','农林牧渔','通信','机械设备','计算机','电子']
+s_chg = [2.73,1.70,1.68,1.47,1.24,1.02,-0.62,-0.90,-0.98,-2.38]
+s_colors = ['#d62728' if c>=0 else '#2ca02c' for c in s_chg]
+bars = ax.barh(sectors[::-1], s_chg[::-1], color=s_colors[::-1])
+ax.axvline(0, color='gray', lw=0.8)
+for b,c in zip(bars, s_chg[::-1]):
+    ax.text(c + (0.05 if c>=0 else -0.05), b.get_y()+b.get_height()/2, f'{c:+.2f}%', va='center', ha='left' if c>=0 else 'right', fontsize=10)
+ax.set_xlabel('涨跌幅 (%)')
+ax.set_title('2026-09-30 申万行业涨跌幅（领涨/领跌）', fontsize=14, fontweight='bold')
+ax.grid(axis='x', alpha=0.3)
 plt.tight_layout()
-plt.savefig(os.path.join(out,"chart2_history_probability.png"), dpi=130, bbox_inches="tight"); plt.close()
+plt.savefig(os.path.join(out_dir,'chart2_sector.png'), dpi=110)
+plt.close()
 
-# ---- Chart 3: Consensus donut ----
-fig, ax = plt.subplots(figsize=(5.5,5.5))
-ax.pie([65,35], colors=["#d64545","#5b8def"], startangle=90,
-       autopct="%1.0f%%", pctdistance=0.75,
-       textprops={"color":"white","fontweight":"bold","fontsize":14},
-       wedgeprops={"width":0.42,"edgecolor":"white"})
-ax.text(0,0.08,"综合口径", ha="center", fontsize=12, color="#555")
-ax.text(0,-0.12,"涨 60~70%", ha="center", fontsize=13, fontweight="bold", color="#d64545")
-ax.set_title("国庆后首个交易日 涨跌概率(综合)", fontsize=13, fontweight="bold")
+# Chart 3: historical post-holiday probability
+fig, ax = plt.subplots(figsize=(9,5.5))
+labels = ['节后首日上涨\n(近十年2016-2025)','节后5日正收益\n(近十年)','节后一周上涨\n(中信建投,剔除18/24)']
+probs = [70, 60, 62.5]
+bars = ax.bar(labels, probs, color=['#d62728','#ff7f0e','#1f77b4'])
+ax.axhline(50, color='gray', ls='--', lw=1)
+ax.text(2.4, 50.5, '50% 中性线', fontsize=9, color='gray')
+for b,p in zip(bars,probs):
+    ax.text(b.get_x()+b.get_width()/2, p+1.5, f'{p}%', ha='center', fontsize=12, fontweight='bold')
+ax.set_ylabel('上涨概率 (%)')
+ax.set_ylim(0,80)
+ax.set_title('国庆后首个交易日 A股上涨概率（历史统计）', fontsize=14, fontweight='bold')
+ax.grid(axis='y', alpha=0.3)
 plt.tight_layout()
-plt.savefig(os.path.join(out,"chart3_consensus_donut.png"), dpi=130, bbox_inches="tight"); plt.close()
+plt.savefig(os.path.join(out_dir,'chart3_probability.png'), dpi=110)
+plt.close()
 
-print("charts:", [f for f in os.listdir(out) if f.endswith(".png")])
+print("Charts saved:", [f for f in os.listdir(out_dir) if f.startswith('chart')])

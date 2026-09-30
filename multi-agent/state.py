@@ -40,3 +40,7 @@ class AgentState(TypedDict):
     # 供产物幂等守卫区分"本次 run 落盘的产物"与 tmp/ 里历史 run 的同号 step 产物
     # （runlog.run_started_at 是进程内的，跨进程续跑时拿不到，故必须存 state）。
     run_started_at: Optional[str]
+    # 跨会话长期记忆召回结果（run_start 每轮按当前 query 向量召回 top-k，写入此字段）：
+    # supervisor 首轮规划与每个子 agent 节点都会把它作为“用户背景”注入 context（“越用越懂你”）。
+    # 纯 last-write-wins 字段；为空表示本轮无相关长期记忆（或功能关闭）。详见 longterm.py。
+    recalled_memory: Optional[str]

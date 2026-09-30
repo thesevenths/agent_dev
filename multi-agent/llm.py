@@ -295,3 +295,21 @@ class ConcurrencyGuardMiddleware(AgentMiddleware):
 def concurrency_guard_middleware():
     """并行开启时返回 [ConcurrencyGuardMiddleware()]，否则返回 []（关闭时零开销、零回归）。"""
     return [ConcurrencyGuardMiddleware()] if _PARALLEL_TOOL_CALLS else []
+
+
+# === 单 agent 上下文摘要（LangChain SummarizationMiddleware）===
+# 与 compress.py 的分工：compress._compress_messages 作用在「节点入口、跨 agent 交接」的历史、
+# 且纯内存易失；SummarizationMiddleware 作用在「单个 agent 自己的」ReAct 循环内——消息 token
+# 超过 trigger 时把较旧消息 LLM 摘要、用 RemoveMessage 替换并写回 state（由 checkpointer 持久化，
+# 属「持久压缩」）。短跑不触发（零开销），只在长工具链逼近上限时才启动，正对「防爆 context」。
+# 调参：AGENT_SUMMARIZE_TOKENS（触发阈值，默认 8000；设 0 整体关闭）、AGENT_SUMMARIZE_KEEP（保留最近 N 条，默认 20）。
+_SUMMARIZE_TOKENS = int(os.environ.get("AGENT_SUMMARIZE_TOKENS", 8000))
+_SUMMARIZE_KEEP = int(os.environ.get("AGENT_SUMMARIZE_KEEP", 20))
+
+
+def summarization_mw(llm):
+    """开启时返回 [SummarizationMiddleware(model=llm, ...)]，否则 []（关闭时零开销、零回归）。"""
+    if _SUMMARIZE_TOKENS <= 0:
+        return []
+    return [SummarizationMiddleware(
+        model=llm, trigger=("tokens", _SUMMARIZE_TOKENS), keep=("messages", _SUMMARIZE_KEEP))]

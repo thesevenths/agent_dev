@@ -22,7 +22,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
 
 from llm import (
-    ToolCallLoggingMiddleware, CustomContextMiddleware, concurrency_guard_middleware,
+    ToolCallLoggingMiddleware, CustomContextMiddleware, concurrency_guard_middleware, summarization_mw,
     chat_llm, db_llm, coder_llm, crawler_llm, rag_llm, context_engineer_llm,
     supervisor_llm,
 )
@@ -43,9 +43,9 @@ from tools import (
 from context import _date_context_str, _data_freshness_check
 from compress import _compress_messages, _msg_text
 from handoff import _step_assignment_text, _save_artifact, TMP_DIR
-from summary import _summarize_observations, _AGENT_SUMMARY_DISABLE, _obs_total
+from summary import _summarize_observations, _AGENT_SUMMARY_DISABLE, _obs_total, judge_and_summarize
 from plan import _mark_failed
-from planutil import _extract_json_obj
+from planutil import _goal_text
 from hitl import hitl_middleware, HITL_ENABLED
 from runlog import set_current, ensure_run, log_event, run_started_at
 
@@ -57,8 +57,10 @@ _AGENT_MAX_ITER = int(os.environ.get("AGENT_MAX_ITERATIONS", "15"))
 
 # === 鲁棒性#1：Critic 质量门（completed ≠ 做对了）===
 # 设计原则「宁可漏判，绝不冤枉」：只在**高置信度失败**时才拒，最大限度避免把正确产出误判为不合格
-# （误判会触发无谓的带反馈重做、浪费 token，甚至把正确步标 failed）。规则层零 LLM 成本、默认开；
-# 语义层（LLM 判定产出是否真满足本步）默认关（AGENT_CRITIC_LLM=1 开启），避免每步多一次 LLM 拖慢。
+# （误判会触发无谓的带反馈重做、浪费 token，甚至把正确步标 failed）。语义层为主（supervisor LLM 判定
+# 产出是否真满足本步要求，更贴近真值，默认开 AGENT_CRITIC_LLM=1，每步多 1 次 LLM 调用）；规则层零成本，
+# 作为语义层拿不到明确判定时的兜底代理（也可 AGENT_CRITIC_LLM=0 关语义层、只用规则）。
+# 诚实：规则/LLM 都不能保证零误判；靠"偏向放行 + 带反馈重做 + 步数有界"把偶发误判代价压到极低。
 # min_len 只是"空泛非答复"的下限（默认极低），不是质量门槛——真实答复再短也不会被它拦下。
 _CRITIC_MIN_LEN = int(os.environ.get("AGENT_CRITIC_MIN_LEN", "4"))
 _CRITIC_RETRIES = int(os.environ.get("AGENT_CRITIC_RETRIES", "2"))  # 质量门不合格时「带反馈重做同一步」的最大次数
@@ -116,57 +118,64 @@ def _critic_feedback_text(reason: str, criteria: str, attempt: int, budget: int)
     )
 
 
-def _critic_gate(state: dict, step, final_text: str, agent_name: str, tool_evidence: str = "") -> tuple:
-    """Critic 质量门：返回 (passed, reason)。「宁可漏判，绝不冤枉」——只在高置信度失败时才拒。
+def _rule_gate(step, text: str, ev: str) -> tuple:
+    """免费规则层（不花 LLM）：Critic 的确定性兜底代理。返回 (passed, reason)。
 
-    硬拒只有两种（都无歧义、几乎不可能冤枉）：
-      A) 产出完全为空（final_text 与本步工具输出 tool_evidence 都空）——agent 明显没干活；
-      B) 交付型步（明确要求生成/保存文件）却在「最终回复 + 本步工具输出」里都找不到任何落盘路径
-         ——声称交付却无落盘证据。
-    其余一律放行：
-      - 交付型步只要找到路径 → 立即通过（不再用长度卡它：文件已生成，回复短不算失败，避免冤枉）；
-      - 非交付步只要非空、且不是"一两个字的空泛答复"（min_len 下限，默认极低）→ 通过。
-    不通过 → 带反馈重做同一步（≤ _CRITIC_RETRIES 次），仍不合格才标 failed 交 supervisor 再规划。
-    评估器自身异常时 fail-open（绝不因工具报错而阻断/冤枉主流程），仅告警。
+    只挡三种：A) 完全空产出；B) 交付型步在「回复+工具输出」都找不到落盘路径；C) 非交付步短于
+    min_len 下限（默认极低，只挡"完成/好的"这类空泛敷衍）。评估器异常 → fail-open。
     """
+    if not (text or "").strip() and not (ev or "").strip():
+        return False, "rule gate: Output is empty but expected non-empty."
     try:
-        text = final_text or ""
-        ev = tool_evidence or ""
-        # A) 完全空产出（唯一无歧义的"没干活"）
-        if not text.strip() and not ev.strip():
-            return False, "rule gate: Output is empty but expected non-empty."
         if _is_deliverable_step(step):
-            # B) 交付型步：找到落盘路径即通过（文本或工具输出任一处）；找不到才拒
             pres = _run_tool(evaluate_output, _PATH_RE, f"{text}\n{ev}")
             if isinstance(pres, dict) and pres.get("passed") is True:
                 return True, ""      # 交付物客观存在 → 放行，不因回复短而冤枉
             return False, "rule gate: 交付型步未给出落盘文件路径（最终回复与工具输出均未发现有效路径）"
-        # 非交付步：只挡"空泛到不可能是真实答复"的极短产出（默认下限极低，几乎不冤枉）
-        if text.strip():
+        if (text or "").strip():
             base = _run_tool(evaluate_output, f"not empty;min_len:{_CRITIC_MIN_LEN}", text)
             if isinstance(base, dict) and base.get("passed") is False:
                 return False, f"rule gate: {base.get('reason', '')}"
     except Exception as ce:
         logger.warning(f"[critic] rule eval error ({ce}); fail-open")
         return True, "critic rule eval skipped"
-    if _CRITIC_LLM:
-        desc = (f"{step.get('title', '')} {step.get('description', '')}"
-                if isinstance(step, dict) else str(step))
-        try:
-            ai = supervisor_llm.invoke([
-                SystemMessage(content=(
-                    "You are a strict Critic. Judge ONLY whether the DELIVERABLE satisfies the STEP "
-                    "REQUIREMENT. Reply with a single JSON object {\"passed\": true|false, "
-                    "\"reason\": \"<short>\"}. Be concise; do not invent requirements."
-                )),
-                HumanMessage(content=f"STEP REQUIREMENT:\n{desc}\n\nDELIVERABLE:\n{final_text[:4000]}"),
-            ])
-            verdict = _extract_json_obj(ai.content if isinstance(ai, AIMessage) else str(ai)) or {}
-            if verdict.get("passed") is False:
-                return False, f"semantic gate: {verdict.get('reason', '')}"
-        except Exception as ce:
-            logger.warning(f"[critic] semantic eval error ({ce}); fail-open")
     return True, ""
+
+
+def _critic_gate(state: dict, step, final_text: str, agent_name: str,
+                 tool_evidence: str = "", artifacts=None) -> tuple:
+    """Critic 质量门（可与跨步摘要融合）。返回 (passed, reason, checklist)。
+
+    checklist 非 None → 本步已由**同一次** LLM 调用并入跨步摘要；调用方应写回 state.plan_summary
+    并把 summary_obs_seen 推进到新的 obs_total，使 supervisor 的 _summarize_observations 短路
+    （new_count==0）零调用——即用户要的「判对错 + 压缩，1 次 LLM 一举两得」。
+
+    分层（宁可漏判，绝不冤枉）：
+      A) 完全空产出 → 免费硬拒（不花 LLM）。
+      B) AGENT_CRITIC_LLM=1 → judge_and_summarize：1 次调用同时判「是否满足本步」+ 合并 checklist。
+         拿不到明确判定（异常/解析失败）→ fail-open，回落 C，且丢弃 checklist（走常规摘要）。
+      C) 规则层（_rule_gate，免费代理）：关语义层或 B 回落时用。
+
+    诚实：规则/LLM 都不能保证零误判；靠偏向放行 + 带反馈重做（≤_CRITIC_RETRIES）+ 步数有界把代价压到极低。
+    """
+    text = final_text or ""
+    ev = tool_evidence or ""
+    # A) 完全空产出：唯一无歧义硬拒（免费，语义层都不调用）
+    if not text.strip() and not ev.strip():
+        return False, "rule gate: Output is empty but expected non-empty.", None
+    # B) 融合：1 次 LLM 同时判对错 + 合并跨步摘要
+    if _CRITIC_LLM:
+        goal = state.get("plan_goal") or _goal_text(state)
+        mk = state.get("memory_key") or "default"
+        passed, reason, checklist = judge_and_summarize(
+            step, text, ev, (state.get("plan_summary") or "").strip(), goal, artifacts or [], mk=mk)
+        if passed is not None:
+            # 判定明确：pass → 顺带带回合并好的 checklist（写回 plan_summary，省去 supervisor 那次摘要）
+            return (True, "", checklist) if passed else (False, f"semantic gate: {reason}", None)
+        logger.warning("[critic] fused judge+summary unavailable; falling back to rule gate + normal summary")
+    # C) 规则层（免费代理）
+    p, r = _rule_gate(step, text, ev)
+    return p, r, None
 
 
 def _is_interpreter_shutdown(exc: Exception) -> bool:
@@ -210,7 +219,8 @@ def create_agents() -> dict:
         chat_llm,
         tools=[read_file, grep_files, create_file, str_replace, send_qq_email, get_current_time],
         system_prompt=chat_system_prompt,
-        agent_name="ChatAgent"
+        agent_name="ChatAgent",
+        middleware=summarization_mw(chat_llm),
     )
 
     # 2. DB Agent
@@ -218,7 +228,8 @@ def create_agents() -> dict:
         db_llm,
         tools=[add_sale, delete_sale, update_sale, query_sales, query_table_schema, execute_sql, get_current_time],
         system_prompt=db_system_prompt,
-        agent_name="DBAgent"
+        agent_name="DBAgent",
+        middleware=summarization_mw(db_llm),
     )
 
     # 3. Code Agent
@@ -229,7 +240,8 @@ def create_agents() -> dict:
         coder_llm,
         tools=[python_repl, create_file, read_file, grep_files, str_replace, shell_exec, get_current_time],
         system_prompt=coder_system_prompt,
-        agent_name="CodeAgent"
+        agent_name="CodeAgent",
+        middleware=summarization_mw(coder_llm),
     )
 
     # 4. Crawler Agent
@@ -237,7 +249,8 @@ def create_agents() -> dict:
         crawler_llm,
         tools=[get_nasdaq_top_gainers, get_crypto_sentiment_indicators, resilient_tavily_search, create_file, get_current_time],
         system_prompt=crawler_system_prompt,
-        agent_name="CrawlerAgent"
+        agent_name="CrawlerAgent",
+        middleware=summarization_mw(crawler_llm),
     )
 
     # 5. RAG Agent
@@ -245,7 +258,8 @@ def create_agents() -> dict:
         rag_llm,
         tools=[list_files_metadata, read_file, grep_files, get_current_time],
         system_prompt=rag_system_prompt.format(file_path=os.getcwd() + "\\documents"),
-        agent_name="RAGAgent"
+        agent_name="RAGAgent",
+        middleware=summarization_mw(rag_llm),
     )
 
     # 6. Context Engineer (with Custom Middleware)
@@ -395,6 +409,14 @@ def create_resilient_node(agent):
                     summary_ctx = _summarize_observations(state)
                     summary_fresh = bool(summary_ctx)
                 extra = []
+                # 跨会话长期记忆注入（“越用越懂你”）：入口召回的用户画像/偏好/历史决策作为“背景”置于最前，
+                # 让子 agent 产出贴合用户（如中文报告、金融口径）。是背景不是本步任务，故显式声明。
+                recalled_mem = state.get("recalled_memory") or ""
+                if recalled_mem:
+                    extra.append(HumanMessage(content=(
+                        "[Long-term memory about the USER, recalled from past sessions — personalize your "
+                        "output accordingly; this is BACKGROUND, not this step's task]\n" + recalled_mem
+                    )))
                 if summary_ctx:
                     extra.append(HumanMessage(content=(
                         "[Summary of completed upstream steps — treat as context; DO NOT redo this work, "
@@ -470,7 +492,27 @@ def create_resilient_node(agent):
                 tool_evidence = "\n".join(
                     _msg_text(m) for m in new_obs if isinstance(m, ToolMessage)
                 )
-                passed, reason = _critic_gate(state, _step, final_text, agent.name, tool_evidence=tool_evidence)
+                passed, reason, fused_checklist = _critic_gate(
+                    state, _step, final_text, agent.name, tool_evidence=tool_evidence, artifacts=artifacts)
+                # 可观测性补丁：此前 critic 的「通过」路径在 run log 里没有任何痕迹，导致"judge+summary
+                # 融合是否真的生效、每步是否只剩 1 次 LLM"无法从日志直接核实（相关 warning 只进控制台、
+                # 不进 run log，只能靠 default_summary.md 的写入时刻反推）。这里把裁决结论与是否走了融合
+                # 补写进 run log，使下一次运行可以一眼确认。
+                if passed:
+                    if fused_checklist:
+                        log_event(
+                            f"[critic+summary] step {_cur}/{len(_plan)} {agent.name}: PASS via FUSED "
+                            f"judge+summary (1 LLM call) — checklist {len(fused_checklist)} chars → plan_summary; "
+                            f"supervisor _summarize_observations will short-circuit (0 extra LLM)", _mk)
+                    elif _CRITIC_LLM:
+                        log_event(
+                            f"[critic+summary] step {_cur}/{len(_plan)} {agent.name}: PASS but fusion produced no "
+                            f"reusable checklist (verdict unclear → rule fallback, or checklist too short) — "
+                            f"summary reverts to normal supervisor path", _mk)
+                    else:
+                        log_event(
+                            f"[critic+summary] step {_cur}/{len(_plan)} {agent.name}: PASS via rule gate "
+                            f"(AGENT_CRITIC_LLM=0, fusion off)", _mk)
                 if not passed:
                     if critic_attempt < critic_retries:
                         # 带反馈重做同一步（不消耗异常预算）：明确告诉 sub agent 上一轮为什么不合格、
@@ -501,7 +543,7 @@ def create_resilient_node(agent):
                         "run_started_at": state.get("run_started_at"),
                     }
 
-                return {
+                _ret = {
                     "messages": result["messages"],
                     "sender": agent.name,
                     "error_count": 0,
@@ -521,6 +563,13 @@ def create_resilient_node(agent):
                     # 又变回每轮全量重述（等于白改）。
                     "summary_obs_seen": (_obs_total(state) if summary_fresh else state.get("summary_obs_seen")),
                 }
+                if fused_checklist:
+                    # 「判+压」融合：本步已在 critic 那次 LLM 调用里并入 checklist。写回 plan_summary，
+                    # 并把游标推进到本步之后的 obs_total，使 supervisor 的 _summarize_observations
+                    # 短路（new_count==0）→ 零 LLM 调用。每步就此省下原本独立的那次摘要调用。
+                    _ret["plan_summary"] = fused_checklist
+                    _ret["summary_obs_seen"] = obs_total
+                return _ret
 
             except GraphBubbleUp:
                 # HITL 中断（interrupt）或父图冒泡信号：必须原样上抛，让外层图暂停 + checkpoint，

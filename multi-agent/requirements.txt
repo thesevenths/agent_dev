@@ -29,10 +29,21 @@ pydantic>=2.7.4
 # 兼容约束：langgraph-api 要求 langgraph<2,>=0.4.10（当前 langgraph==1.2.12 满足，pip 不会升级 langgraph/langchain）。
 # 实测安装并验证 langgraph dev 可起服务、agent graph 可加载；langgraph/langchain 未被改动。
 # agent.py 的 build_graph_with_memory() 已按 LANGSMITH_LANGGRAPH_API_VARIANT 自动判断：
-#   经 LangGraph API 加载时不挂自定义 checkpointer（平台接管持久化），直接 python agent.py 时仍挂 MemorySaver 保记忆。
+#   经 LangGraph API 加载时不挂自定义 checkpointer（平台接管持久化），直接 python agent.py 时挂 SqliteSaver（记忆落 ./memory/*.sqlite，跨重启不丢）。
 langgraph-cli==0.4.32
 langgraph-api==0.15.1
 langgraph-runtime-inmem==0.35.1
+
+# ---- SQLite checkpointer（直接运行模式的对话记忆持久化）----
+# 直接 python agent.py / invoke_with_memory 时，graph.build_graph_with_memory() 挂 SqliteSaver，
+# 把 checkpoint 落到 ./memory/checkpoints.sqlite，跨进程重启不丢记忆（原 MemorySaver 只在内存）。
+# 注：SQLite 引擎是 Python 标准库(sqlite3)、无需单独安装；这里装的是 LangGraph 的 SQLite 适配器。
+# langgraph dev/up 模式由平台自带持久化，不使用本包。
+langgraph-checkpoint-sqlite==3.1.1
+
+# ---- 跨会话长期记忆（longterm.py：向量语义召回 + SQLite 存储 memory/longterm.db）----
+# 无需新增依赖：复用标准库 sqlite3 + 已装的 numpy(向量余弦) + httpx(调 OpenAI 兼容 /embeddings)。
+# embedding 默认走 DashScope text-embedding-v4（本地 vLLM 无 embedding 模型）；不可达时自动回落关键词匹配。
 
 # ---- LLM 客户端（agent.py create_llm 现直接 import openai / httpx）----
 openai>=2.45.0,<4.0.0
