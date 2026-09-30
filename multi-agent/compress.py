@@ -24,8 +24,22 @@ _CTX_AI_CHARS = int(os.environ.get("AGENT_CTX_AI_CHARS", 1500))          # 历�
 _CTX_RECENT_AI_CHARS = int(os.environ.get("AGENT_CTX_RECENT_AI_CHARS", 8000))  # 最近一条上游结果上限
 _CTX_KEEP_LAST = int(os.environ.get("AGENT_CTX_KEEP_LAST_MSGS", 24))     # 送入子 agent 的消息条数上限
 _CTX_NO_TRUNCATE = os.environ.get("AGENT_CTX_NO_TRUNCATE", "").lower() in ("1", "true", "yes")
-# LLM 语义压缩总开关（默认开启）。设 AGENT_CTX_LLM_COMPRESS=0 回退纯盲截断（对照验证用）。
-_CTX_LLM_COMPRESS = os.environ.get("AGENT_CTX_LLM_COMPRESS", "1").lower() not in ("0", "false", "no")
+# LLM 语义压缩模式（三态）：
+#   off    (0/false/no/off)       → 永远盲截断，零 LLM 开销；
+#   always (1/true/yes/always/on) → 只要单条超预算就做 LLM 语义提炼；
+#   auto   (其余，默认)           → 比例触发：仅当窗口内上下文估算字符数达到
+#                                    AGENT_CTX_MAX_CHARS * AGENT_CTX_COMPRESS_RATIO（默认 90%）
+#                                    才启用 LLM 语义提炼，平时盲截断。对齐 cursor/qoder 的
+#                                    “逼近上限才压缩”策略：既不常态烧 LLM，又能在上下文变大时保要点。
+_CTX_LLM_MODE_RAW = os.environ.get("AGENT_CTX_LLM_COMPRESS", "auto").strip().lower()
+_CTX_LLM_MODE = (
+    "off" if _CTX_LLM_MODE_RAW in ("0", "false", "no", "off")
+    else "always" if _CTX_LLM_MODE_RAW in ("1", "true", "yes", "always", "on")
+    else "auto"
+)
+# 比例触发（auto 模式）的两个参数：把模型最大上下文折算成“字符预算”，达到其 ratio 才语义压缩。
+_CTX_MAX_CHARS = int(os.environ.get("AGENT_CTX_MAX_CHARS", 60000))
+_CTX_COMPRESS_RATIO = float(os.environ.get("AGENT_CTX_COMPRESS_RATIO", 0.9))
 
 # LLM 语义提炼 schema：用户在意的"时间/地点/事件/要点/各种id号"都在保留清单里。
 _CONDENSE_PROMPT = (
@@ -65,15 +79,19 @@ def _truncate(text: str, limit: int) -> str:
     return text
 
 
-def _llm_condense(text: str, label: str, budget: int) -> str:
+def _llm_condense(text: str, label: str, budget: int, allow_llm: bool | None = None) -> str:
     """对超过字符预算的消息做 LLM 语义提炼（保留 时间/地点/事件/要点/ID/路径/数值）。
 
     主路径；LLM 不可达或开关关闭时回落盲截断（_truncate），保证安全网不丢。结果按指纹缓存。
+    allow_llm：由调用方（_compress_messages 的比例触发）决定本次是否允许 LLM 语义提炼；
+    None 时回落到模式默认（仅 always 模式默认允许）。
     """
     if _CTX_NO_TRUNCATE:
         return text
-    # 预算内 / 关闭 LLM 压缩 → 直接盲截断（短消息无需 LLM，省开销）
-    if not _CTX_LLM_COMPRESS or len(text) <= budget:
+    if allow_llm is None:
+        allow_llm = (_CTX_LLM_MODE == "always")
+    # 预算内 / 本次不允许 LLM 压缩 → 直接盲截断（短消息无需 LLM，省开销）
+    if not allow_llm or len(text) <= budget:
         return _truncate(text, budget)
     fp = (label, len(text), hash(text) & 0xFFFFFF)
     if fp in _condense_cache:
@@ -126,6 +144,22 @@ def _compress_messages(msgs, keep_last: int = _CTX_KEEP_LAST):
             cut += 1  # 不要落在工具组的中间
         head = [msgs[0]] if (isinstance(msgs[0], HumanMessage) and cut > 0) else []
         msgs = head + msgs[cut:]
+    # 比例触发（auto 模式）：按窗口内存活消息的估算字符数决定是否启用 LLM 语义提炼。
+    # off → 恒 False（盲截断）；always → 恒 True；auto → 达到 max*ratio 才 True。
+    if _CTX_LLM_MODE == "always":
+        allow_llm = True
+    elif _CTX_LLM_MODE == "off":
+        allow_llm = False
+    else:
+        total_chars = sum(len(_msg_text(m)) for m in msgs)
+        threshold = int(_CTX_MAX_CHARS * _CTX_COMPRESS_RATIO)
+        allow_llm = total_chars >= threshold
+        if allow_llm:
+            logger.info(
+                f"[compress] window ctx {total_chars} chars >= {threshold} "
+                f"({_CTX_COMPRESS_RATIO:.0%} of AGENT_CTX_MAX_CHARS={_CTX_MAX_CHARS}) "
+                f"→ enable LLM semantic condense for this pass"
+            )
     last_ai_idx = -1
     for i, m in enumerate(msgs):
         if isinstance(m, AIMessage):
@@ -135,7 +169,7 @@ def _compress_messages(msgs, keep_last: int = _CTX_KEEP_LAST):
         if isinstance(m, ToolMessage):
             # 工具输出体积最大且常含 ID/URL/时间戳 → LLM 语义提炼（保留具体值），盲截断仅作回落
             out.append(ToolMessage(
-                content=_llm_condense(_msg_text(m), f"tool {getattr(m, 'name', None)}", _CTX_TOOL_CHARS),
+                content=_llm_condense(_msg_text(m), f"tool {getattr(m, 'name', None)}", _CTX_TOOL_CHARS, allow_llm),
                 tool_call_id=getattr(m, "tool_call_id", None),
                 name=getattr(m, "name", None),
             ))
@@ -154,7 +188,7 @@ def _compress_messages(msgs, keep_last: int = _CTX_KEEP_LAST):
                 limit = _CTX_AI_CHARS
                 label = f"[Earlier output from {who}] "
                 if not getattr(m, "tool_calls", None):
-                    out.append(AIMessage(content=label + _llm_condense(_msg_text(m), f"output from {who}", limit), name=m.name))
+                    out.append(AIMessage(content=label + _llm_condense(_msg_text(m), f"output from {who}", limit, allow_llm), name=m.name))
                 else:
                     out.append(m)
         else:

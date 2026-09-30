@@ -17,7 +17,7 @@ from llm import supervisor_llm
 from prompt import supervisor_system_prompt
 from planutil import (
     Router, _extract_json_obj, _normalize_plan, _parse_target_agent,
-    _goal_text, _build_replan_context, members,
+    _goal_text, _build_replan_context, members, _structured_with_retry,
 )
 from summary import _summarize_observations, _AGENT_SUMMARY_DISABLE
 from context import _date_context_str
@@ -207,12 +207,8 @@ def _replan_tail(state: dict, plan: list, current: int, summary_ctx: str | None 
         "Return strict JSON with 'next' (agent for current step or FINISH) and 'reason'."
     ))
     messages = [sys_msg, user_msg]
-    parsed = None
-    try:
-        resp = supervisor_llm.with_structured_output(Router).invoke(messages)
-        parsed = dict(resp) if resp is not None else None
-    except Exception as se:
-        logger.warning(f"supervisor re-plan structured output failed ({se}); fallback to manual JSON parse")
+    # 结构化输出 + parse 失败带错误重试（鲁棒性#3）；全败才回落裸调用+手动抽 JSON。
+    parsed = _structured_with_retry(supervisor_llm, messages, Router, label="re-plan")
     if not isinstance(parsed, dict):
         ai = supervisor_llm.invoke(messages)
         content = ai.content if isinstance(ai, AIMessage) else str(ai)

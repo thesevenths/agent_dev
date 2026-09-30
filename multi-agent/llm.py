@@ -13,6 +13,7 @@ import json
 import os
 import time
 import logging
+import threading
 from datetime import datetime
 from typing import Any
 
@@ -28,8 +29,18 @@ from langchain.agents.middleware import (
 from langchain_openai import ChatOpenAI
 
 from tools import _run_tool, evaluate_output, save_context_snapshot, restore_snapshot
+from hitl import risk_of  # 复用 TOOL_RISK 风险分级（单一真源），判定工具是否有副作用
 
 logger = logging.getLogger(__name__)
+
+# === 并行工具调用（对应 key_point.md #2）===
+# 开启后通过 model_kwargs 传 parallel_tool_calls=True，允许模型在一条 AIMessage 里发多个
+# 无依赖的工具调用；LangGraph 的 ToolNode 用线程池 executor.map 并发执行它们，减少串行等待。
+# 默认开（已用探针确认本地 vLLM 接受该参数、模型能在一条消息里发多个 tool_call）。
+# 安全护栏：并发只发生在“模型自行判断无依赖”的一批 tool_call 内，而判断可能出错——故配套
+# ConcurrencyGuardMiddleware 对**有副作用**的工具（TOOL_RISK != safe）加进程级锁强制串行，
+# 只读工具才真正并发。设 AGENT_PARALLEL_TOOL_CALLS=0 可整体关闭（回到每轮单个 tool_call）。
+_PARALLEL_TOOL_CALLS = os.environ.get("AGENT_PARALLEL_TOOL_CALLS", "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def create_llm(temperature=0.1, model_name=None):
@@ -38,6 +49,8 @@ def create_llm(temperature=0.1, model_name=None):
     连接信息全部来自 .env 的 LLM_* 变量，改配置文件即可换模型，无需改代码。
     """
     model = model_name or LLM_MODEL
+    # 并行工具调用开关：仅在显式开启时才把 parallel_tool_calls 注入请求体（避免不支持的后端 400）。
+    extra_kwargs = {"model_kwargs": {"parallel_tool_calls": True}} if _PARALLEL_TOOL_CALLS else {}
     # 本地服务若为自签名/内网证书，LLM_VERIFY_SSL=false 等价于 curl -k。
     # 注意：langchain-openai 会同时构建同步与异步 httpx 客户端，二者都需显式给
     # api_key/base_url 凭证，否则异步客户端会从 OPENAI_API_KEY 环境变量读取而报
@@ -56,6 +69,7 @@ def create_llm(temperature=0.1, model_name=None):
             http_client=sync_http,
             http_async_client=async_http,
             max_retries=2,
+            **extra_kwargs,
         )
     return ChatOpenAI(
         model=model,
@@ -64,6 +78,7 @@ def create_llm(temperature=0.1, model_name=None):
         temperature=temperature,
         timeout=60,
         max_retries=2,
+        **extra_kwargs,
     )
 
 
@@ -241,3 +256,42 @@ class ToolCallLoggingMiddleware(AgentMiddleware):
         logger.info(tail)
         log_event(tail)
         return result
+
+
+# === 并行工具调用的安全护栏（对应 key_point.md #2 的“怕误判”）===
+# 进程级锁：同一时刻只允许一个**有副作用**的工具在执行，防止并发踩踏。
+_SIDE_EFFECT_LOCK = threading.RLock()
+
+
+class ConcurrencyGuardMiddleware(AgentMiddleware):
+    """并行工具调用的安全护栏：只读工具允许并发，有副作用的工具强制串行。
+
+    为什么需要：开启 parallel_tool_calls 后，模型可能在一条 AIMessage 里发多个 tool_call，
+    LangGraph 的 ToolNode 用线程池 executor.map 并发执行（结果顺序保留，但执行是同时的）。
+    关键：“哪些工具之间无依赖”是**模型在生成时自行判断**的（它若认为 B 需要 A 的输出，就会先发 A、
+    拿到结果再发 B），并非框架做静态依赖分析。万一模型误判，把本应串行的有副作用工具
+    （写文件 / 改数据 / 跑代码 / 发邮件）放进同一批并发执行，就可能相互踩踏（如两个写同时落
+    同一文件、create_file 与 str_replace 竞态）。
+
+    本中间件按 TOOL_RISK 分级（单一真源，见 hitl.py）拦截：
+      - safe（只读：read_file / grep_files / query_* / get_*）→ 不加锁，照常并发拿加速；
+      - warn / danger（有副作用）→ 进一把进程级 RLock，强制逐个执行，绝不并发。
+    于是即便模型误判“可并行”，副作用工具也不会真正并发；残余风险仅剩“同一批内多个写的先后
+    顺序不保证”（会报错并被模型下一轮自纠），而非“数据被并发写坏”。
+
+    仅在 AGENT_PARALLEL_TOOL_CALLS 开启时挂载（见 concurrency_guard_middleware）；关闭时模型
+    每轮只发一个 tool_call，本就无并发，无需护栏，行为与改造前一致。
+    """
+
+    def wrap_tool_call(self, request, handler):
+        tc = getattr(request, "tool_call", None) or {}
+        name = tc.get("name") or (request.tool.name if getattr(request, "tool", None) else "")
+        if risk_of(name) == "safe":
+            return handler(request)          # 只读：并发放行
+        with _SIDE_EFFECT_LOCK:              # 有副作用：串行
+            return handler(request)
+
+
+def concurrency_guard_middleware():
+    """并行开启时返回 [ConcurrencyGuardMiddleware()]，否则返回 []（关闭时零开销、零回归）。"""
+    return [ConcurrencyGuardMiddleware()] if _PARALLEL_TOOL_CALLS else []

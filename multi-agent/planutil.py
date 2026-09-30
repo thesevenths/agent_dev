@@ -14,8 +14,12 @@ from typing_extensions import TypedDict
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import re
 import json
+import os
 
 from state import PlanStep
+
+# 结构化输出 parse 失败时的“带错误重试”次数（把上一次报错喂回模型让其重生成）。
+_PARSE_TRIES = int(os.environ.get("AGENT_PARSE_TRIES", "3"))
 
 
 # === 成员配置（图节点名，单一真源）===
@@ -31,6 +35,37 @@ class Router(TypedDict):
     reason: str  # Added for reason
     execution_plan: Optional[List[PlanStep]]   # 首次规划或再规划时输出（结构化步骤列表）
     goal: Optional[str]  # 仅首次规划时输出目标
+
+
+def _structured_with_retry(llm, messages, schema, tries: int | None = None, label: str = "structured"):
+    """结构化输出 + parse 失败带错误重试（鲁棒性#3）。
+
+    首次失败不再直接降级，而是把上一次的 schema/parse 报错作为一条 HumanMessage 喂回模型，
+    让其仅重生成合法 JSON，最多 tries 次（默认 AGENT_PARSE_TRIES=3）；全部失败返回 None，
+    由调用方回落“裸调用 + 手动抽 JSON”。llm 以参数传入，保持本模块叶子属性（不 import llm）。
+    """
+    n = tries if tries is not None else _PARSE_TRIES
+    msgs = list(messages)
+    last_err: object = None
+    for attempt in range(max(1, n)):
+        try:
+            resp = llm.with_structured_output(schema).invoke(msgs)
+            if isinstance(resp, dict):
+                return resp
+            last_err = f"non-dict result: {type(resp).__name__}"
+        except Exception as e:  # schema 校验/网络/后端异常都算一次失败
+            last_err = e
+        if attempt < n - 1:
+            msgs = list(messages) + [HumanMessage(content=(
+                f"Your previous reply failed schema validation / JSON parsing: {last_err}. "
+                "Return ONLY a single strict, valid JSON object matching the required schema now. "
+                "Do not add prose or code fences."
+            ))]
+    import logging as _lg
+    _lg.getLogger(__name__).warning(
+        f"{label}: structured output failed after {n} tries ({last_err}); caller will fall back"
+    )
+    return None
 
 
 def _extract_json_obj(text):

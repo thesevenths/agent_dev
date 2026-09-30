@@ -19,7 +19,7 @@ from plan import (
     _parse_target_agent, _normalize_plan,
 )
 from summary import _summarize_observations, _obs_total, _AGENT_SUMMARY_DISABLE
-from planutil import Router, _extract_json_obj, _goal_text, members
+from planutil import Router, _extract_json_obj, _goal_text, members, _structured_with_retry
 from context import _date_context_str
 from llm import supervisor_llm
 
@@ -164,13 +164,9 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
             ) + "\n\n" + _date_context_str())
             messages = [system_msg] + state["messages"]
 
-            # 优先结构化输出；本地 vLLM 对 TypedDict 结构化输出支持不稳定，失败则手动解析 content
-            parsed = None
-            try:
-                resp = supervisor_llm.with_structured_output(Router).invoke(messages)
-                parsed = dict(resp) if resp is not None else None
-            except Exception as se:
-                logger.warning(f"supervisor structured output failed ({se}); fallback to manual JSON parse")
+            # 优先结构化输出；本地 vLLM 对 TypedDict 结构化输出支持不稳定 → 先带错误重试，
+            # 全败才回落裸调用+手动抽 JSON（鲁棒性#3）。
+            parsed = _structured_with_retry(supervisor_llm, messages, Router, label="first-plan")
             if not isinstance(parsed, dict):
                 ai = supervisor_llm.invoke(messages)
                 content = ai.content if isinstance(ai, AIMessage) else str(ai)

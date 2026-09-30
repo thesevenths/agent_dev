@@ -281,6 +281,99 @@ def read_file(file_name: str) -> dict:
 
 
 @tool
+def grep_files(
+    pattern: str,
+    files_path: str = ".\\tmp",
+    glob: str = "*",
+    ignore_case: bool = True,
+    max_results: int = 50,
+) -> dict:
+    """Search file CONTENTS under a directory for a keyword / regex — like grep / ripgrep.
+
+    Use this to LOCATE which file(s) contain a given ID / absolute path / keyword / error string
+    WITHOUT reading every file whole. Complements read_file (returns one whole file) and
+    list_files_metadata (lists files + descriptions). Typical use: upstream steps wrote several
+    artifacts to tmp/ and a downstream agent must find the one mentioning "AAPL" / a specific
+    order id / a timestamp before reading it.
+
+    Args:
+        pattern (str): Python regular expression, matched line by line (required, non-empty).
+        files_path (str): directory to search. Relative paths resolve under the project tmp/ dir
+            then CWD (same rules as read_file). Default ".\\tmp".
+        glob (str): filename glob filter, e.g. "*.md", "*.json", "*step3*" (default "*" = all).
+        ignore_case (bool): case-insensitive matching (default True).
+        max_results (int): cap on returned matches, to avoid flooding the context (default 50).
+
+    Returns:
+        dict: {"pattern", "searched_dir", "files_scanned", "total", "truncated",
+               "matches": [{"file", "line", "text"}]}  or  {"error": ...}
+    """
+    import re
+    import fnmatch
+    try:
+        if not pattern:
+            return {"error": "pattern must be a non-empty string"}
+        flags = re.IGNORECASE if ignore_case else 0
+        try:
+            rx = re.compile(pattern, flags)
+        except re.error as e:
+            return {"error": f"invalid regex '{pattern}': {e}"}
+        base = _resolve_read_path(files_path)
+        if not base.exists():
+            return {"error": f"search path does not exist: {base}"}
+        if base.is_file():
+            base = base.parent
+        try:
+            max_results = int(max_results)
+        except (TypeError, ValueError):
+            max_results = 50
+        max_results = max(1, min(max_results, 500))
+        # 跳过超大文件（默认 5MB），避免拖慢检索 / 撑爆 context。
+        max_bytes = int(os.environ.get("AGENT_GREP_MAX_FILE_BYTES", str(5 * 1024 * 1024)))
+
+        matches = []
+        files_scanned = 0
+        total = 0
+        truncated = False
+        for root, _dirs, files in os.walk(base):
+            for fn in files:
+                if not fnmatch.fnmatch(fn, glob):
+                    continue
+                fp = os.path.join(root, fn)
+                try:
+                    if os.path.getsize(fp) > max_bytes:
+                        continue
+                    files_scanned += 1
+                    with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                        for lineno, line in enumerate(f, 1):
+                            if rx.search(line):
+                                total += 1
+                                if len(matches) < max_results:
+                                    snippet = line.strip()
+                                    if len(snippet) > 300:
+                                        snippet = snippet[:300] + "…"
+                                    matches.append({
+                                        "file": os.path.relpath(fp, os.getcwd()),
+                                        "line": lineno,
+                                        "text": snippet,
+                                    })
+                                else:
+                                    truncated = True
+                except Exception:
+                    continue
+        return {
+            "pattern": pattern,
+            "searched_dir": str(base),
+            "files_scanned": files_scanned,
+            "total": total,
+            "truncated": truncated,
+            "matches": matches,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
 def str_replace(file_name: str, old_str: str, new_str: str):
     """
     Replace specific text in a file.

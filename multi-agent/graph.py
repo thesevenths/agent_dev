@@ -157,14 +157,28 @@ def invoke_with_memory(query: str, thread_id: str = None, config: Optional = Non
     config = config or {"configurable": {"thread_id": thread_id}}
 
     try:
-        # 流式执行（实时输出）
+        # 流式执行：stream_mode=["updates","messages"] 同时拿「节点级状态更新」与「逐 token 消息增量」，
+        # 后者实时打印模型思考/回答的 token，缓解长等待焦虑（对齐主流 Agent 的流式体验，key_point.md #2）。
+        # 多模式下每个 chunk 是 (mode, data) 元组——messages 模式 data=(message_chunk, metadata)，
+        # updates 模式 data={node_name: state_update}。
+        # 注：子 agent 是嵌套 invoke，其 token 仅在「父 config 被透传进子图」（HITL 开启）或
+        # 经 langgraph dev/Studio 平台回调传播时才会流到这里；本自测入口至少能流外层节点消息。
         final_state = None
-        for chunk in graph.stream(
+        for mode, data in graph.stream(
             {"messages": [HumanMessage(content=query)], "memory_key": thread_id},
-            config=config
+            config=config,
+            stream_mode=["updates", "messages"],
         ):
-            print(chunk)
-            final_state = chunk
+            if mode == "messages":
+                msg_chunk = data[0] if isinstance(data, (tuple, list)) and data else None
+                delta = getattr(msg_chunk, "content", "")
+                if isinstance(delta, str) and delta:
+                    print(delta, end="", flush=True)
+            elif mode == "updates":
+                for _node, upd in (data or {}).items():
+                    if isinstance(upd, dict):
+                        final_state = upd
+        print()  # token 流结束后补一个换行
 
         # 可视化最终快照 (middleware already handles, but fallback)
         if final_state and final_state.get("snapshot_id"):
