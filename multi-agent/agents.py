@@ -10,8 +10,10 @@
 依赖：llm / prompt / tools / context / compress / handoff / summary / plan / runlog。
 """
 import os
+import re
 import json
 import logging
+import concurrent.futures.thread
 from datetime import datetime
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
@@ -42,9 +44,20 @@ from compress import _compress_messages, _msg_text
 from handoff import _step_assignment_text, _save_artifact, TMP_DIR
 from summary import _summarize_observations, _AGENT_SUMMARY_DISABLE, _obs_total
 from plan import _mark_failed
-from runlog import set_current, ensure_run, log_event
+from runlog import set_current, ensure_run, log_event, run_started_at
 
 logger = logging.getLogger(__name__)
+
+
+def _is_interpreter_shutdown(exc: Exception) -> bool:
+    """判断异常是否由"解释器 / 线程池正在关闭"引起。
+
+    langgraph dev 热重载或 Ctrl+C 杀进程时，同步节点所在的 ThreadPoolExecutor 会拒绝新任务
+    （RuntimeError: cannot schedule new futures after interpreter shutdown / after shutdown）。
+    这属于外部进程击杀而非业务失败：重试必然继续失败，也不应把该步标 failed。
+    """
+    msg = str(exc)
+    return "cannot schedule new futures" in msg or bool(concurrent.futures.thread._shutdown)
 
 
 # === 创建 Agent（使用 LangChain 1.4.x create_agent + Middleware for Context Engineer）===
@@ -52,8 +65,9 @@ def create_resilient_agent(llm, tools, system_prompt, agent_name="Agent", middle
     """创建标准化 Agent with resilience"""
     system_msg = SystemMessagePromptTemplate.from_template(system_prompt)
     prompt = ChatPromptTemplate.from_messages([system_msg, MessagesPlaceholder(variable_name="messages")])
-    # 工具调用日志中间件置于最外层（first defined = outermost），保证它包住其余中间件里的工具调用
-    mw = [ToolCallLoggingMiddleware()] + list(middleware or [])
+    # 工具调用日志中间件置于最外层（first defined = outermost），保证它包住其余中间件里的工具调用；
+    # 传入 agent_name，让每条 [tool] 日志带上归属，避免控制台里跨 agent 误读。
+    mw = [ToolCallLoggingMiddleware(agent_name)] + list(middleware or [])
     return create_agent(
         model=llm,
         tools=tools,
@@ -139,8 +153,73 @@ def create_resilient_node(agent):
             _step_txt = f"{_step.get('title', '')} | {_step.get('description', '')}"
         else:
             _step_txt = str(_step) if _step is not None else "No plan"
-        # 让本步内子 agent 触发的工具（如 tavily 检索）把日志落到正确的运行日志文件。
         _mk = state.get("memory_key")
+        # 幂等守卫：计划里该步已标 completed → 说明上一次运行（或续跑）已成功产出，
+        # 直接跳过本轮执行，避免续跑 / 重复派发时重复调 LLM、重复落盘产物（# 用户加固需求）。
+        # 正常流不会误触发：supervisor 派发第 current 步时只对 index<current 标 completed，
+        # 当前步本身在节点进入时仍是 pending（见 plan._mark_progress）。
+        if _plan and 0 < _cur <= len(_plan) and isinstance(_plan[_cur - 1], dict) \
+                and _plan[_cur - 1].get("status") == "completed":
+            logger.info(
+                f"[idempotent] step {_cur}/{len(_plan)} already 'completed' → skip re-execution "
+                f"(resume / double-dispatch safety)."
+            )
+            log_event(
+                f"[idempotent] step {_cur}/{len(_plan)} already 'completed' → skip re-run "
+                f"(no new artifact). step={_step_txt}",
+                _mk,
+            )
+            return {}
+        # 产物感知的幂等守卫（二道防线）：_save_artifact 在节点 return（checkpoint 提交）**之前**落盘，
+        # 若进程恰好死在这个窗口（如 langgraph dev 热重载击杀），续跑时该步在计划里仍是 pending，
+        # 上面基于 status 的守卫拦不住 → 整步被完整重做（2026-09-30 线上现象：step3 产物 11:44:40 已写出，
+        # 11:44:49 续跑又把同样的 str_replace/脚本原样跑了一遍）。
+        # 命中条件（两路）：
+        #   a) state["artifacts"]（随 checkpoint 提交，天然属于本 run）里已有 __step{N}__ 产物；
+        #   b) tmp/ 磁盘扫描：仅限 mtime 晚于**本次 run 启动时刻**的文件 —— tmp/ 永久累积，
+        #      历史 run 的同号 step 产物（实测有 4 个 __step3__）绝不能误认。启动时刻优先读
+        #      state["run_started_at"]（supervisor 首次规划时写入，随 checkpoint 跨进程续跑存活），
+        #      兜底读本进程 runlog；两者都拿不到时宁可放弃 b) 重做一遍，也不冒跳过错误产物的风险。
+        # 例外：该步已被显式标 failed（supervisor 再规划后重试同一步）时不跳过，否则失败步永远无法重做。
+        if _plan and 0 < _cur <= len(_plan) and isinstance(_plan[_cur - 1], dict) \
+                and _plan[_cur - 1].get("status") != "failed":
+            _pat = re.compile(rf"__step{_cur}__")
+            _hit = next((p for p in (state.get("artifacts") or []) if _pat.search(str(p))), None)
+            if _hit is None:
+                _start = None
+                _rs = state.get("run_started_at")
+                if _rs:
+                    try:
+                        _start = datetime.fromisoformat(str(_rs))
+                    except ValueError:
+                        _start = None
+                if _start is None:
+                    _start = run_started_at()  # 兜底：本进程内 runlog 记录的启动时刻（跨进程为 None）
+                if _start is not None:
+                    _hit = next(
+                        (str(p) for p in TMP_DIR.glob(f"*__step{_cur}__*")
+                         if p.is_file()
+                         and datetime.fromtimestamp(p.stat().st_mtime) >= _start),
+                        None,
+                    )
+            if _hit:
+                logger.info(
+                    f"[idempotent] step {_cur}/{len(_plan)} artifact already exists → skip re-execution: {_hit}"
+                )
+                log_event(
+                    f"[idempotent] step {_cur}/{len(_plan)} artifact already on disk → skip re-run: {_hit}. step={_step_txt}",
+                    _mk,
+                )
+                return {
+                    "messages": [AIMessage(content=(
+                        f"[idempotent] Step {_cur} artifact already produced ({os.path.basename(str(_hit))}); "
+                        "skipped re-execution after interrupted run / resume."
+                    ))],
+                    "sender": agent.name,
+                    "current_step": _cur,
+                    "run_started_at": state.get("run_started_at"),
+                }
+        # 让本步内子 agent 触发的工具（如 tavily 检索）把日志落到正确的运行日志文件。
         set_current(_mk)
         ensure_run(_mk)
         logger.info(f"Executing plan step {_cur}/{len(_plan)}: {_step_txt}")
@@ -249,6 +328,7 @@ def create_resilient_node(agent):
                     # 把计划状态原样带回，让 supervisor 能继续追踪进度（None 归一为空列表）
                     "execution_plan": state.get("execution_plan") or [],
                     "plan_goal": state.get("plan_goal"),
+                    "run_started_at": state.get("run_started_at"),
                     "observations": observations,
                     "obs_total": obs_total,
                     "artifacts": artifacts,
@@ -269,9 +349,20 @@ def create_resilient_node(agent):
                     # 递归超限同样算本步未成功：显式标 failed，避免被后续 _mark_progress 洗成 completed
                     "execution_plan": _mark_failed(_plan, _cur - 1),
                     "current_step": _cur,
+                    "run_started_at": state.get("run_started_at"),
                 }
 
             except Exception as e:
+                # 解释器/线程池正在关闭（langgraph dev 热重载、Ctrl+C 杀进程）：重试必然继续失败
+                # （2026-09-30 线上现象：15ms 内连打 3 次 Attempt failed，全是同一个 executor 拒绝错误），
+                # 且会把一次外部击杀误记成业务失败。快速退出：不标 failed、不动 error_count，
+                # 返回空更新保持 checkpoint 干净，该步维持 pending，待进程重启后续跑。
+                if _is_interpreter_shutdown(e):
+                    logger.warning(
+                        f"[shutdown] interpreter/thread-pool shutting down; abort {agent.name} "
+                        f"step {_cur} WITHOUT retries and WITHOUT marking failed: {e}"
+                    )
+                    return {}
                 logger.error(f"Attempt {attempt + 1} failed for {agent.name}: {e}")
                 if attempt == max_retries - 1:
                     # 关键：把本步标 failed 并写回 state。supervisor 在派发时已把 current_step +1，
@@ -287,6 +378,7 @@ def create_resilient_node(agent):
                             "error_count": state.get("error_count", 0) + 1,
                             "execution_plan": failed_plan,
                             "current_step": _cur,
+                            "run_started_at": state.get("run_started_at"),
                         }
                     else:
                         return {
@@ -295,6 +387,7 @@ def create_resilient_node(agent):
                             "error_count": state.get("error_count", 0) + 1,
                             "execution_plan": failed_plan,
                             "current_step": _cur,
+                            "run_started_at": state.get("run_started_at"),
                         }
 
                 # 重试：清理部分状态

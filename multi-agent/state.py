@@ -36,3 +36,7 @@ class AgentState(TypedDict):
     obs_total: int  # 单调递增：累计追加到 observations 的条数
     summary_obs_seen: int  # 已折叠进 plan_summary 的条数（= 上次摘要时的 obs_total）
     replan_noop_streak: int  # 连续"再规划空转"（BEFORE==AFTER）次数，达阈值后停用再规划
+    # 本次 run 的启动时刻（ISO 字符串）：supervisor 规划时写入，随 checkpoint 续命。
+    # 供产物幂等守卫区分"本次 run 落盘的产物"与 tmp/ 里历史 run 的同号 step 产物
+    # （runlog.run_started_at 是进程内的，跨进程续跑时拿不到，故必须存 state）。
+    run_started_at: Optional[str]

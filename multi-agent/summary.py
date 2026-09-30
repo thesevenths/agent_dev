@@ -37,6 +37,8 @@ _SUMMARY_PROMPT = (
     "- Any conclusion or decision it reached.\n\n"
     "Rules:\n"
     "- Be concrete and faithful to the source; never invent data.\n"
+    "- MUST retain every concrete identifier: ticket/order/entity IDs, file absolute paths, URLs, "
+    "timestamps, numeric/stock codes — never drop them even if long.\n"
     "- Total under ~400 words. Use a markdown bullet list.\n"
     "- Do NOT paste raw tool JSON or long excerpts; keep only what a later agent needs to act.\n"
 )
@@ -57,6 +59,8 @@ _SUMMARY_MERGE_PROMPT = (
     "(c) every conclusion/decision reached.\n\n"
     "Rules:\n"
     "- Be concrete and faithful to the source; never invent data.\n"
+    "- MUST retain every concrete identifier: ticket/order/entity IDs, file absolute paths, URLs, "
+    "timestamps, numeric/stock codes — never drop them even if long.\n"
     "- Total under ~450 words. Markdown bullet list, ordered by step number.\n"
     "- Do NOT paste raw tool JSON or long excerpts.\n"
 )

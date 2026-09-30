@@ -23,8 +23,21 @@ from supervisor import supervisor
 from agents import create_nodes
 from planutil import members
 from tools import _run_tool, list_context_snapshots, restore_snapshot
+from runlog import start_run, run_file, get_run_id
 
 logger = logging.getLogger(__name__)
+
+
+def run_start(state: dict) -> dict:
+    """图入口节点：每次新提交（graph.stream 启动）开一个唯一 run_id 的日志文件，避免同线程复用 / 续跑时日志交织。
+
+    仅做副作用（调用 runlog.start_run 写模块级 _current_run_id），不回写任何 state 字段，
+    以免污染 AgentState 快照。返回空 dict 表示本节点不产生状态更新。
+    """
+    mk = state.get("memory_key") or "default"
+    rid = start_run(mk)
+    logger.info(f"[run_start] new run log: {run_file(rid)} (memory_key={mk})")
+    return {}
 
 
 def build_graph_with_memory():
@@ -41,6 +54,7 @@ def build_graph_with_memory():
     workflow = StateGraph(AgentState)
 
     # 添加节点
+    workflow.add_node("run_start", run_start)
     workflow.add_node("supervisor", supervisor)
     nodes = create_nodes()
     for member in members:
@@ -50,8 +64,10 @@ def build_graph_with_memory():
     for member in members:
         workflow.add_edge(member, "supervisor")
 
-    # START → Supervisor
-    workflow.add_edge(START, "supervisor")
+    # START → run_start → Supervisor：run_start 在每次新提交（stream 启动）时开一个
+    # 唯一 run_id 的日志文件，避免同线程复用 / 续跑时日志交织到同一文件（见 runlog.py）。
+    workflow.add_edge(START, "run_start")
+    workflow.add_edge("run_start", "supervisor")
 
     # 条件边
     workflow.add_conditional_edges(

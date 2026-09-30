@@ -7,12 +7,13 @@
 原定义位于 agent.py:1014-1209，拆分时整体迁入。
 """
 import logging
+from datetime import datetime
 from typing import Dict, Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from prompt import supervisor_system_prompt
 from state import AgentState
-from runlog import set_current, ensure_run, start_run, log_event
+from runlog import set_current, ensure_run, log_event, run_file, get_run_id
 from plan import (
     _should_replan, _replan_tail, _mark_progress, _plan_view,
     _parse_target_agent, _normalize_plan,
@@ -56,6 +57,7 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                     "current_step": current,
                     "execution_plan": final_plan,
                     "plan_goal": state.get("plan_goal"),
+                    "run_started_at": state.get("run_started_at"),
                 }
 
             step_text = plan[current]
@@ -84,6 +86,7 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                     "reason": f"Following execution plan step {current + 1}/{len(plan)}: {step_text} (re-plan skipped: {why})",
                     "execution_plan": plan,
                     "plan_goal": state.get("plan_goal"),
+                    "run_started_at": state.get("run_started_at"),
                     "plan_summary": summary_ctx,
                     "summary_obs_seen": _obs_total(state),
                     # 关键：跳过时**必须原样带回**空转计数。若这里不写（或写成 0），
@@ -118,6 +121,7 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                         "current_step": len(final_plan),
                         "execution_plan": final_plan,
                         "plan_goal": state.get("plan_goal"),
+                        "run_started_at": state.get("run_started_at"),
                         "plan_summary": summary_ctx,
                         "summary_obs_seen": _obs_total(state),
                         "replan_noop_streak": streak,
@@ -144,6 +148,7 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                 "reason": f"Following execution plan step {current + 1}/{len(plan)}: {step_text}",
                 "execution_plan": plan,
                 "plan_goal": state.get("plan_goal"),  # 原样带回，再规划不改 goal
+                "run_started_at": state.get("run_started_at"),  # 原样带回，供产物幂等守卫跨进程续跑时仍能区分历史产物
                 "plan_summary": summary_ctx,          # 跨步语义摘要，随 state 下发给子 agent
                 "summary_obs_seen": _obs_total(state),  # 摘要游标：标记这些 observations 已折叠进 plan_summary
                 "replan_noop_streak": streak,         # 空转计数：连续多次无效后停用再规划
@@ -177,13 +182,14 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
             if plan:
                 goal = response.get("goal") or _goal_text(state)
                 memory_key = state.get("memory_key")
-                run_path = start_run(memory_key)  # 新运行：开一个带时间戳的日志文件
+                # 日志文件已由图入口节点 run_start 统一开好（唯一 run_id），此处确保存在即可，不重复开文件。
+                ensure_run(memory_key)
                 logger.info(f"Supervisor created execution plan (goal={goal!r}):\n" + "\n".join(
                     f"{i+1}. {s.get('title','')}: {s.get('description','')}" for i, s in enumerate(plan)
                 ))
                 log_event(
                     f"[supervisor] created execution plan (goal={goal!r}):\n{_plan_view(plan)}\n"
-                    f"[supervisor] run log file: {run_path}",
+                    f"[supervisor] run log file: {run_file(get_run_id())}",
                     memory_key,
                 )
                 # 第一步立刻执行
@@ -193,7 +199,10 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                     "reason": f"Starting execution plan step 1/{len(plan)}: {plan[0].get('description','')}",
                     "execution_plan": plan,
                     "plan_goal": goal,
-                    "current_step": 1
+                    "current_step": 1,
+                    # 本次 run 启动时刻（仅在首次规划时写入，随 checkpoint 续命）：
+                    # 产物幂等守卫用它区分 tmp/ 里"本次 run 的产物"与历史 run 的同号 step 产物。
+                    "run_started_at": state.get("run_started_at") or datetime.now().isoformat(),
                 }
             else:
                 # 降级为传统单轮路由（兼容旧逻辑）

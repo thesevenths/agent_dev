@@ -203,21 +203,32 @@ class ToolCallLoggingMiddleware(AgentMiddleware):
     为什么用 middleware 的 wrap_tool_call 钩子，而不是逐个改 tools.py：
       1) 一处生效即覆盖全部工具（含以后新增的工具），不会出现"新工具忘了加日志"的漏网；
       2) 完全不触碰工具的 schema / 签名，零破坏风险。
+
+    每条日志都带上"所属 agent 名"（[tool][CodeAgent] ...）：此前 [tool] 行不含归属，
+    在控制台里与平台的 langgraph_node= 标记（不同 logger，且并发/续跑时会交错）就近配对，
+    极易被误读成"code_agent 调了 tavily、chat_agent 调了 shell_exec"。实际上工具集在
+    create_agent 时已按 agent 固定绑定（code_agent 无 tavily、chat_agent 无 shell_exec），
+    根本不可能跨 agent 调用；带上归属标识即可彻底消除这种"错位"错觉。
     """
+
+    def __init__(self, agent_name: str | None = None):
+        super().__init__()
+        self._agent = agent_name or "?"
+        self._tag = f"[tool][{self._agent}]"
 
     def wrap_tool_call(self, request, handler):
         tc = getattr(request, "tool_call", None) or {}
         name = tc.get("name") or (request.tool.name if getattr(request, "tool", None) else "unknown")
         args = tc.get("args") or {}
         t0 = time.time()
-        head = f"[tool] ▶ {name}({_tool_args_preview(args)})"
+        head = f"{self._tag} ▶ {name}({_tool_args_preview(args)})"
         logger.info(head)
         log_event(head)
         try:
             result = handler(request)
         except Exception as e:
             dur = time.time() - t0
-            msg = f"[tool] ✖ {name} raised after {dur:.2f}s: {type(e).__name__}: {e}"
+            msg = f"{self._tag} ✖ {name} raised after {dur:.2f}s: {type(e).__name__}: {e}"
             logger.error(msg)
             log_event(msg)
             raise  # 不吞异常：重试/回滚逻辑依赖异常向上传播
@@ -226,7 +237,7 @@ class ToolCallLoggingMiddleware(AgentMiddleware):
         content = getattr(result, "content", "")
         content = content if isinstance(content, str) else str(content)
         flag = "✖" if status == "error" else "✔"
-        tail = f"[tool] {flag} {name} ({dur:.2f}s, {len(content)} chars) -> {content[:200]}"
+        tail = f"{self._tag} {flag} {name} ({dur:.2f}s, {len(content)} chars) -> {content[:200]}"
         logger.info(tail)
         log_event(tail)
         return result
