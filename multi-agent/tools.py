@@ -1107,3 +1107,16 @@ def get_crypto_sentiment_indicators():
         logger.error(f"Unexpected error in get_sentiment_indicators: {e}")
         return None
 
+
+# === 工具调用辅助（供 middleware / 节点 / invoke_with_memory 调用工具）===
+# @tool 装饰的 StructuredTool 在 langchain-core>=1.6 已不可直接调用（tool(...) 会抛
+# TypeError: 'StructuredTool' object is not callable）。这里统一走底层 .func 调用。
+# 原定义位于 agent.py，拆分时迁至本模块（tools.py 是工具定义的叶子模块，无内部依赖）。
+def _run_tool(tool, *args, **kwargs):
+    func = getattr(tool, "func", None)
+    if callable(func):
+        return func(*args, **kwargs)
+    if hasattr(tool, "invoke") and kwargs:
+        return tool.invoke(kwargs)
+    return tool(*args, **kwargs)
+
