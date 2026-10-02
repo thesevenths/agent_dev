@@ -129,7 +129,11 @@ def main() -> int:
     print("\n[A] 判定库里向量是否由当前模型生成（同模型自比应 ≈1.00）")
     sample = with_emb[: max(1, min(args.sample, len(with_emb)))] if with_emb else []
     if not sample:
-        print("  没有带向量的记忆，跳过（先跑一轮 agent 写入）。")
+        if rows:
+            print(f"  库里有 {len(rows)} 条记忆，但全都没有向量（embedding IS NULL）→ 语义召回对它们完全无效。")
+            print("  跑 `python check_memory_vectors.py --reembed` 给它们补上向量（会先备份 DB）。")
+        else:
+            print("  空库：先正常跑一轮 agent 写入记忆，再回来校准。")
         same_model = False
     else:
         try:
@@ -149,18 +153,31 @@ def main() -> int:
             print(f"  其中 {n_bad}/{len(sample)} 条自比明显 <1 → 这些是旧模型（DashScope）留下的向量。")
             print("  注意：两个模型维度都是 1024，longterm.py 的维度护栏拦不住，不会报错、只会召回变烂。")
 
-    # ---------- Phase B：按需全量重编码 ----------
+    # ---------- Phase B：按需重编码 ----------
+    # 两类要修：
+    #   ① 跨模型混用（same_model=False）→ 全部重编码；
+    #   ② 缺向量的条目（embedding IS NULL，dim=0）→ 典型成因是写入那一刻 embedding 服务不可达，
+    #      remember() 只存了文本。这类条目对语义召回永久不可见。
+    # 原实现只遍历 with_emb（带向量的行），所以"全库都是 NULL 向量"时它一条也修不了 —— 已修。
+    stale = [r for r in rows if r["embedding"] is None]
     if args.reembed:
-        if same_model:
-            print("\n[B] 跳过：库里向量已是当前模型，无需重编码。")
+        if same_model and not stale:
+            print("\n[B] 跳过：库里向量已是当前模型，且没有缺向量的条目。")
         else:
-            print(f"\n[B] 全量重编码 {len(with_emb)} 条（CPU 上 0.6B 约 0.4s/条，预计 {len(with_emb) * 0.4:.0f}s 起）")
+            targets = [r for r in rows if (not same_model) or r["embedding"] is None]
+            why = []
+            if not same_model:
+                why.append(f"{len(with_emb)} 条跨模型旧向量")
+            if stale:
+                why.append(f"{len(stale)} 条缺向量")
+            print(f"\n[B] 重编码 {len(targets)} 条（{' + '.join(why)}；"
+                  f"CPU 上 0.6B 约 0.4s/条，预计 {len(targets) * 0.4:.0f}s 起）")
             bak = f"{_DB}.bak-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
             shutil.copy2(_DB, bak)
             ok(True, "已备份原始 DB", bak)
             done, failed = 0, 0
-            for i in range(0, len(with_emb), _BATCH):
-                chunk = with_emb[i:i + _BATCH]
+            for i in range(0, len(targets), _BATCH):
+                chunk = targets[i:i + _BATCH]
                 try:
                     vecs = embed([r["text"] for r in chunk])
                 except Exception as e:
@@ -172,7 +189,7 @@ def main() -> int:
                                  (v.tobytes(), int(v.shape[0]), r["id"]))
                 conn.commit()
                 done += len(chunk)
-                print(f"  ... {done}/{len(with_emb)}")
+                print(f"  ... {done}/{len(targets)}")
             ok(failed == 0, "重编码完成", f"成功 {done} 条，失败 {failed} 条")
             if failed:
                 print(f"  失败的可从备份恢复：cp '{bak}' '{_DB}'")
@@ -181,6 +198,7 @@ def main() -> int:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("SELECT id, text, dim, embedding FROM memories").fetchall()
             with_emb = [r for r in rows if r["embedding"] is not None]
+            stale = [r for r in rows if r["embedding"] is None]   # 必须刷新，否则修好了仍报"还有缺向量"
             print("  重编码后再验一次自比（应全部 ≈1.00）：")
             if with_emb:
                 s2 = embed([r["text"] for r in with_emb[: min(8, len(with_emb))]])
@@ -272,8 +290,12 @@ def main() -> int:
     print("\n" + "=" * 72)
     if FAILS:
         print("未通过：" + "; ".join(FAILS))
-        if not same_model and not args.reembed and with_emb:
-            print("→ 跑 `python check_memory_vectors.py --reembed` 修复向量空间混用（会先备份 DB）")
+        if (not same_model or stale) and not args.reembed:
+            print("→ 跑 `python check_memory_vectors.py --reembed` 修复（跨模型旧向量 / 缺向量条目，会先备份 DB）")
+        return 1
+    if stale:
+        print(f"提示：还有 {len(stale)} 条记忆没有向量（embedding IS NULL），它们对语义召回不可见。")
+        print("→ 跑 `python check_memory_vectors.py --reembed` 补上（会先备份 DB）。")
         return 1
     print("通过：记忆库向量与阈值均可用。")
     return 0

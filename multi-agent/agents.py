@@ -42,9 +42,9 @@ from tools import (
 )
 from context import _date_context_str, _data_freshness_check
 from compress import _compress_messages, _msg_text
-from handoff import _step_assignment_text, _save_artifact, TMP_DIR
+from handoff import _step_assignment_text, _save_artifact, TMP_DIR, _failure_hint
 from summary import _summarize_observations, _AGENT_SUMMARY_DISABLE, _obs_total, judge_and_summarize
-from plan import _mark_failed
+from plan import _mark_failed, _mark_progress
 from planutil import _goal_text
 from hitl import hitl_middleware, HITL_ENABLED
 from runlog import set_current, ensure_run, log_event, run_started_at
@@ -54,6 +54,37 @@ logger = logging.getLogger(__name__)
 # === 鲁棒性#3：单子 agent 内部 ReAct 循环的显式步数上限（recursion_limit）===
 # 不再吃 LangGraph 默认 25；超限抛 GraphRecursionError，已被 node 捕获并标 failed，杜绝无限工具循环烧钱。
 _AGENT_MAX_ITER = int(os.environ.get("AGENT_MAX_ITERATIONS", "15"))
+
+
+def _agent_max_iter(agent_name: str) -> int:
+    """按 agent 类型解析 ReAct 步数预算，未配置则回落全局 AGENT_MAX_ITERATIONS。
+
+    为什么必须分类型：一次工具往返 = 2 个 super-step（LLM 决策 1 + 工具执行 1），
+    再叠加 middleware/图节点开销，故 15 的预算实际只够 **5~6 次**工具往返。
+    交付型 agent（写脚本 → 跑 → 看结果 → 打磨 → 收尾）天然需要 6~9 次，统一 15 会在
+    "产物已落盘、只剩收尾"的阶段被硬截断 —— 2026-10-02 step3/step4 连续两次撞上限，
+    报告其实 23:47:42 就已生成（5409B md + 87KB png），却因没走到收尾被判 failed，
+    supervisor 于是又派一步重做。给 code_agent 更大预算即可消掉这类"假失败"。
+
+    配置：AGENT_MAX_ITERATIONS_<TYPE>，TYPE 为去掉 agent/Agent 后缀的小写名
+    （CodeAgent → AGENT_MAX_ITERATIONS_CODE；crawler_agent → AGENT_MAX_ITERATIONS_CRAWLER）。
+    """
+    key = (agent_name or "").strip().lower()
+    for suffix in ("_agent", "agent"):
+        if key.endswith(suffix) and len(key) > len(suffix):
+            key = key[: -len(suffix)]
+            break
+    if not key:
+        return _AGENT_MAX_ITER
+    raw = os.environ.get(f"AGENT_MAX_ITERATIONS_{key.upper()}", "")
+    if raw and raw.strip():
+        try:
+            v = int(raw.strip())
+            if v > 0:
+                return v
+        except ValueError:
+            logger.warning(f"[budget] AGENT_MAX_ITERATIONS_{key.upper()}={raw!r} 非法，回落 {_AGENT_MAX_ITER}")
+    return _AGENT_MAX_ITER
 
 # === 鲁棒性#1：Critic 质量门（completed ≠ 做对了）===
 # 设计原则「宁可漏判，绝不冤枉」：只在**高置信度失败**时才拒，最大限度避免把正确产出误判为不合格
@@ -118,6 +149,63 @@ def _critic_feedback_text(reason: str, criteria: str, attempt: int, budget: int)
     )
 
 
+# === 动作契约：本步"要求的关键动作"是否真的发生（不只是"有没有产出"）===
+# 背景（2026-10-02 step5）：plan 写的是"将报告通过邮件发送给用户 → chat_agent"，
+# supervisor 把执行者换成了 code_agent，它只做了 dir + read_file 就收尾 —— critic 判 PASS，
+# 于是**邮件根本没发，整条链路却显示完成**。根因是 critic 只判"这步有没有产出"，
+# 不判"这步要求的动作有没有发生"。
+# 机制保持通用（可配），默认内置最常见的一类"交付动作"契约：
+#   格式：动作关键词(逗号分隔)=>证据关键词(逗号分隔)；多组用 ; 分隔。设 AGENT_ACTION_PROBES=0 关闭。
+_ACTION_PROBES_ENV = os.environ.get("AGENT_ACTION_PROBES", "")
+_DEFAULT_ACTION_PROBES = "邮件,email,e-mail,mail,发邮件,发送给用户,发送报告=>send_email,已发送,smtp,sent,邮件已发"
+
+
+def _parse_action_probes() -> list:
+    raw = _ACTION_PROBES_ENV if _ACTION_PROBES_ENV.strip() else _DEFAULT_ACTION_PROBES
+    if raw.strip() in ("0", "off", "none"):
+        return []
+    out = []
+    for grp in raw.split(";"):
+        if "=>" not in grp:
+            continue
+        left, right = grp.split("=>", 1)
+        acts = [a.strip().lower() for a in left.split(",") if a.strip()]
+        evs = [e.strip().lower() for e in right.split(",") if e.strip()]
+        if acts and evs:
+            out.append((acts, evs))
+    return out
+
+
+_ACTION_PROBES = _parse_action_probes()
+
+
+def _action_contract_gate(step, final_text: str, tool_evidence: str, tool_names: str = "") -> tuple:
+    """返回 (checked, passed, reason)。checked=False 表示本步没有动作契约要求（不干预）。
+
+    只在 step 描述**明确出现**动作关键词时才生效（窄触发，避免冤枉），
+    并要求在"最终回复 + 工具输出 + 工具名"三者之一留下该动作发生的痕迹。
+    纯确定性字符串匹配，不花 LLM；异常吞掉。
+    """
+    if not _ACTION_PROBES:
+        return False, True, ""
+    try:
+        desc = (f"{step.get('title', '')} {step.get('description', '')}"
+                if isinstance(step, dict) else str(step)).lower()
+        blob = f"{final_text or ''}\n{tool_evidence or ''}\n{tool_names or ''}".lower()
+        for act_kws, ev_kws in _ACTION_PROBES:
+            if any(a in desc for a in act_kws):
+                if any(e in blob for e in ev_kws):
+                    return True, True, ""
+                return True, False, (
+                    f"本步要求执行动作（{'/'.join(act_kws[:3])}），但最终回复、工具输出与调用过的工具名里"
+                    f"都没有该动作发生的痕迹（未出现 {'/'.join(ev_kws[:4])}）。"
+                    f"只读取/描述而不真正执行该动作，不算完成本步。"
+                )
+    except Exception as e:
+        logger.warning(f"[critic] action contract check skipped ({e})")
+    return False, True, ""
+
+
 def _rule_gate(step, text: str, ev: str) -> tuple:
     """免费规则层（不花 LLM）：Critic 的确定性兜底代理。返回 (passed, reason)。
 
@@ -142,8 +230,56 @@ def _rule_gate(step, text: str, ev: str) -> tuple:
     return True, ""
 
 
+# === 截断（truncated）≠ 失败（failed）：产物已落盘时不再判死 ===
+# 铁证（2026-10-02 23:47）：step4 在 23:47:42 就生成了 btc_analysis_report_2026-10-02.md(5409B)
+# 与 btc_technical_chart_2026-10-02.png(87KB)，23:48:14 才撞上 ReAct 步数上限被截断 —— 打掉的只是
+# "打磨 + 收尾"，交付物早已在盘上。旧逻辑一律标 failed，supervisor 于是又派一步重做同一件事。
+# 现改为：截断后先扫本步执行期间新落盘的非空产物，送进 critic 质量门；
+#   通过 → 标 completed（并留痕 TRUNCATED-but-salvaged，下游不重做）；不通过 → 维持 failed。
+# 设 AGENT_TRUNCATED_SALVAGE=0 可退回原语义。
+_TRUNCATED_SALVAGE = os.environ.get("AGENT_TRUNCATED_SALVAGE", "1").lower() in ("1", "true", "yes")
+_SALVAGE_EXTS = tuple(
+    e.strip().lower() for e in
+    (os.environ.get("AGENT_SALVAGE_EXTS", ".md,.png,.jpg,.jpeg,.csv,.json,.txt,.html,.xlsx,.pdf")
+     or ".md").split(",") if e.strip()
+)
+
+
+def _salvage_truncated_artifacts(step_start_ts: float, known: list) -> list:
+    """截断后扫描 tmp/，找出**本步执行期间**新落盘的非空产物文件。
+
+    时间窗用 step_start_ts（本步 invoke 之前的时刻）而非 run_started_at，否则会把上游步
+    的数据文件也算成本步产物，导致"上游有文件 → 本步算完成"的错误挽救。
+    known 里已有的产物（上游 handoff 清单）一并排除。异常一律吞掉，最多是不挽救。
+    """
+    if not _TRUNCATED_SALVAGE or not step_start_ts:
+        return []
+    try:
+        from handoff import TMP_DIR
+        known_set = {str(k) for k in (known or [])}
+        hits = []
+        for p in TMP_DIR.iterdir():
+            try:
+                if not p.is_file() or p.suffix.lower() not in _SALVAGE_EXTS:
+                    continue
+                st = p.stat()
+                if st.st_mtime < step_start_ts - 1 or st.st_size == 0:
+                    continue
+                sp = str(p)
+                if sp in known_set:
+                    continue
+                hits.append((st.st_mtime, sp))
+            except OSError:
+                continue
+        hits.sort(reverse=True)
+        return [p for _, p in hits[:8]]
+    except Exception as e:
+        logger.warning(f"[salvage] scan skipped ({e})")
+        return []
+
+
 def _critic_gate(state: dict, step, final_text: str, agent_name: str,
-                 tool_evidence: str = "", artifacts=None) -> tuple:
+                 tool_evidence: str = "", artifacts=None, tool_names: str = "") -> tuple:
     """Critic 质量门（可与跨步摘要融合）。返回 (passed, reason, checklist)。
 
     checklist 非 None → 本步已由**同一次** LLM 调用并入跨步摘要；调用方应写回 state.plan_summary
@@ -162,7 +298,12 @@ def _critic_gate(state: dict, step, final_text: str, agent_name: str,
     ev = tool_evidence or ""
     # A) 完全空产出：唯一无歧义硬拒（免费，语义层都不调用）
     if not text.strip() and not ev.strip():
-        return False, "rule gate: Output is empty but expected non-empty.", None
+        return False, "rule gate: Output is empty but expected non-empty."
+    # A2) 动作契约：本步要求的关键动作是否真的发生了（不是"有没有产出"，而是"做了没有"）。
+    # 免费且确定性；只在 step 描述明确出现动作词时才介入，避免冤枉普通分析步。
+    _act_checked, _act_ok, _act_reason = _action_contract_gate(step, text, ev, tool_names)
+    if _act_checked and not _act_ok:
+        return False, f"action gate: {_act_reason}", None, None
     # B) 融合：1 次 LLM 同时判对错 + 合并跨步摘要
     if _CRITIC_LLM:
         goal = state.get("plan_goal") or _goal_text(state)
@@ -176,6 +317,57 @@ def _critic_gate(state: dict, step, final_text: str, agent_name: str,
     # C) 规则层（免费代理）
     p, r = _rule_gate(step, text, ev)
     return p, r, None
+
+
+# 失败档案保留上限（跨多轮累积，防止无限膨胀；同 observations 只保最近 40 条的思路）
+_STEP_FAILURES_MAX = int(os.environ.get("AGENT_STEP_FAILURES_MAX", "20"))
+
+
+def _append_step_failure(state: dict, step_no: int, agent_name: str, kind: str, reason: str) -> list:
+    """把本步失败写进 `step_failures`，并在 run log 留一条 `[step-failure]`；返回供写回 state 的完整列表。
+
+    为什么要有这个通道：历史上失败只表现为 plan 里的 status="failed" 三个字，原因最多出现在
+    logger.warning（且多数分支不写 log_event → run log 零留痕）。后果是 supervisor 拿不到失败原因、
+    下游 sub agent 不知道该怎么改，只能反复重做同一件事（2026-10-02 线上：step3/4/5 三连撞 ReAct
+    步数上限，同一份报告被生成三遍）。
+
+    step_failures 是 last-write-wins 字段，故必须返回**完整新列表**由调用方写回，
+    否则旧记录会被下一次写入覆盖丢失。
+
+    kind: "recursion"（ReAct 步数耗尽，执行被截断）/ "exception"（异常重试耗尽）/ "critic"（质量门重做后仍不合格）。
+    异常一律吞掉：失败档案是诊断 + 提示通道，绝不能反过来把节点本身搞崩。
+    """
+    try:
+        prev = [f for f in (state.get("step_failures") or []) if isinstance(f, dict)]
+        attempt = 1 + sum(1 for f in prev if f.get("step") == step_no)
+        rec = {
+            "step": int(step_no),
+            "agent": str(agent_name),
+            "kind": str(kind),
+            "reason": str(reason or "")[:600],
+            "hint": _failure_hint(kind),
+            "attempt": attempt,
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+        # 关键：失败原因必须进 run log —— 只 logger.warning 的话，事后排查依旧是"看到 failed 查不到为什么"。
+        log_event(
+            f"[step-failure] step {step_no} attempt #{attempt} kind={kind} agent={agent_name}\n"
+            f"  WHY: {rec['reason']}",
+            state.get("memory_key"),
+        )
+        prev.append(rec)
+        return prev[-_STEP_FAILURES_MAX:]
+    except Exception as e:
+        # 兜底本身也必须绝对安全：这里的职责是"记录失败"，若兜底路径再抛异常反而会让节点崩溃，
+        # 那就彻底违背了这个通道存在的意义（记录失败绝不能反过来制造失败）。
+        try:
+            logger.warning(f"[step-failure] record failed (ignored): {e}")
+        except Exception:
+            pass
+        try:
+            return list(state.get("step_failures") or [])
+        except Exception:
+            return []
 
 
 def _is_interpreter_shutdown(exc: Exception) -> bool:
@@ -436,11 +628,15 @@ def create_resilient_node(agent):
                         HumanMessage(content=critic_feedback),
                     ]
                     log_event(f"{agent.name} critic-retry #{critic_attempt} feedback:\n{critic_feedback}", _mk)
-                invoke_config = {"recursion_limit": _AGENT_MAX_ITER}
+                _iter_budget = _agent_max_iter(agent.name)
+                # 本步执行起始时刻：用于截断后精确识别"本步期间新落盘的产物"
+                # （不能用 run_started_at —— 那会把上游步的文件也算进来，造成错误挽救）。
+                _step_start_ts = datetime.now().timestamp()
+                invoke_config = {"recursion_limit": _iter_budget}
                 if config is not None and HITL_ENABLED:
                     # 透传父 config：让子 agent 内的 interrupt()（HITL）能冒泡到外层图并被 Studio 恢复。
                     # 仅在 HITL 开启时透传——关闭时保持原有「子图无 checkpointer、每次全新执行」的行为，零回归。
-                    invoke_config = {**config, "recursion_limit": _AGENT_MAX_ITER}
+                    invoke_config = {**config, "recursion_limit": _iter_budget}
                 result = agent.invoke(run_state, config=invoke_config)
 
                 # 保存快照（每 3 轮对话一次，middleware handles visualization）
@@ -492,8 +688,14 @@ def create_resilient_node(agent):
                 tool_evidence = "\n".join(
                     _msg_text(m) for m in new_obs if isinstance(m, ToolMessage)
                 )
+                # 工具名单独收集：动作是否发生，往往只体现在"调用了哪个工具"上
+                # （如发了邮件的证据是调用过 send_email，而它的返回文本未必再复述这个词）。
+                tool_names = " ".join(
+                    str(getattr(m, "name", "") or "") for m in new_obs if isinstance(m, ToolMessage)
+                )
                 passed, reason, fused_checklist = _critic_gate(
-                    state, _step, final_text, agent.name, tool_evidence=tool_evidence, artifacts=artifacts)
+                    state, _step, final_text, agent.name, tool_evidence=tool_evidence,
+                    artifacts=artifacts, tool_names=tool_names)
                 # 可观测性补丁：此前 critic 的「通过」路径在 run log 里没有任何痕迹，导致"judge+summary
                 # 融合是否真的生效、每步是否只剩 1 次 LLM"无法从日志直接核实（相关 warning 只进控制台、
                 # 不进 run log，只能靠 default_summary.md 的写入时刻反推）。这里把裁决结论与是否走了融合
@@ -539,6 +741,9 @@ def create_resilient_node(agent):
                         ))],
                         "sender": agent.name,
                         "execution_plan": _mark_failed(_plan, _cur - 1),
+                        # 失败档案：把"为什么不合格 + 下次怎么改"留给下一个 agent（critic 自己的
+                        # feedback 只用于同步重做，跨步/跨 agent 时必须靠这条通道）。
+                        "step_failures": _append_step_failure(state, _cur, agent.name, "critic", reason),
                         "current_step": _cur,
                         "run_started_at": state.get("run_started_at"),
                     }
@@ -578,12 +783,83 @@ def create_resilient_node(agent):
                 raise
 
             except GraphRecursionError:
+                # 预算在此重算一次（而非复用 try 内的 _iter_budget）：若异常发生在 invoke_config
+                # 赋值之前（理论上可能），复用会 NameError；重算幂等且无副作用，保证日志口径正确。
+                _iter_budget = _agent_max_iter(agent.name)
+                # 这条路径的性质是「执行被截断」，不是「产出做错了」：agent.invoke 抛异常后，
+                # 后面的"取最终答复 / 落盘 artifact / critic 质量门"整段被跳过，于是既没有
+                # artifact 也没有任何 critic 记录，plan 里只剩 failed 三个字——2026-10-02 的
+                # step3/4/5 三连 failed 正是这样，且当时这里只有一条 logger.warning（不写
+                # log_event），run log 里零留痕，事后完全无法归因。此处补齐两点：
+                #   1) 结构化失败档案（供 supervisor 再规划 + 下游 sub agent 派发时读取）；
+                #   2) 把根因（recursion_limit 具体值）写进 run log。
+                _reason = (
+                    f"ReAct step budget exhausted: recursion_limit={_iter_budget} "
+                    f"(AGENT_MAX_ITERATIONS{'' if _iter_budget == _AGENT_MAX_ITER else f'_{agent.name}'}) "
+                    f"reached before this step produced its final answer, "
+                    f"so it was TRUNCATED. Any partial deliverables may already exist on disk, but "
+                    f"no final summary / artifact was recorded. Typical cause: too many tool "
+                    f"round-trips (each LLM call AND each tool execution counts as one super-step, "
+                    f"so {_iter_budget} allows only ~{_iter_budget // 2} round-trips)."
+                )
                 logger.warning("Recursion detected, breaking loop")
+
+                # 截断 ≠ 失败：先看看本步执行期间有没有产物落到盘上。
+                # 实证（2026-10-02 23:47）：报告 md(5409B) 与图表 png(87KB) 在 23:47:42 就已生成，
+                # 23:48:14 才撞上限 —— 被截掉的只是"打磨 + 收尾"。旧逻辑一律标 failed，
+                # supervisor 于是再派一步把同一件事重做一遍。现在改为：产物送 critic，
+                # 通过就标 completed（留痕 TRUNCATED-but-salvaged），不通过才维持 failed。
+                _salvaged = _salvage_truncated_artifacts(
+                    locals().get("_step_start_ts") or 0.0, list(state.get("artifacts") or []))
+                if _salvaged:
+                    _note = (
+                        f"Execution was TRUNCATED (ReAct step budget {_iter_budget} exhausted before a "
+                        f"final summary was produced), but the following deliverable(s) were written to "
+                        f"disk during this step:\n" + "\n".join(f"  - {p}" for p in _salvaged)
+                    )
+                    _s_passed, _s_reason, _s_checklist = _critic_gate(
+                        state, _step, _note, agent.name,
+                        tool_evidence="\n".join(_salvaged), artifacts=_salvaged)
+                    if _s_passed:
+                        logger.warning(
+                            f"step {_cur} TRUNCATED but deliverables salvaged ({len(_salvaged)}): {_salvaged}")
+                        _failures = _append_step_failure(
+                            state, _cur, agent.name, "truncated",
+                            f"TRUNCATED (recursion_limit={_iter_budget}) before final summary, but "
+                            f"deliverable(s) already on disk and passed the quality gate: {_salvaged}")
+                        _ret = {
+                            "messages": [AIMessage(content=(
+                                "Task completed to avoid infinite loop. "
+                                f"(ReAct step budget {_iter_budget} exhausted → TRUNCATED, but "
+                                f"{len(_salvaged)} deliverable(s) were already on disk and passed the "
+                                f"quality gate → step marked COMPLETED, no redo needed.)\n" + _note
+                            ))],
+                            "sender": agent.name,
+                            # 关键：产物已在盘上并通过质量门 → 标 completed 而不是 failed
+                            "execution_plan": _mark_progress(_plan, _cur),
+                            "artifacts": list(state.get("artifacts") or []) + _salvaged,
+                            "step_failures": _failures,
+                            "current_step": _cur,
+                            "run_started_at": state.get("run_started_at"),
+                        }
+                        if _s_checklist:
+                            _ret["plan_summary"] = _s_checklist
+                            _ret["summary_obs_seen"] = _obs_total(state)
+                        return _ret
+                    # 产物在盘上但没通过质量门 → 按原语义标 failed（理由带上挽救失败的原因）
+                    _reason = f"{_reason} | 本步期间有 {len(_salvaged)} 个产物落盘但未通过质量门: {_s_reason}"
+
+                _failures = _append_step_failure(state, _cur, agent.name, "recursion", _reason)
                 return {
-                    "messages": [AIMessage(content="Task completed to avoid infinite loop.")],
+                    "messages": [AIMessage(content=(
+                        "Task completed to avoid infinite loop. "
+                        f"(ReAct step budget {_iter_budget} exhausted → output TRUNCATED; "
+                        f"step marked FAILED for re-plan.)"
+                    ))],
                     "sender": agent.name,
                     # 递归超限同样算本步未成功：显式标 failed，避免被后续 _mark_progress 洗成 completed
                     "execution_plan": _mark_failed(_plan, _cur - 1),
+                    "step_failures": _failures,
                     "current_step": _cur,
                     "run_started_at": state.get("run_started_at"),
                 }
@@ -605,6 +881,9 @@ def create_resilient_node(agent):
                     # 若不显式标 failed，下一轮 _mark_progress 会按索引把它算成 completed，
                     # 于是"重试三次全败"的步骤在 UI/日志里反而显示成已完成，掩盖真实故障。
                     failed_plan = _mark_failed(_plan, _cur - 1)
+                    _failures = _append_step_failure(
+                        state, _cur, agent.name, "exception",
+                        f"Exception retries exhausted ({max_retries} attempts): {e}")
                     # 最终失败：回滚到上一个快照
                     if state.get("snapshot_id"):
                         rollback_msg = _run_tool(restore_snapshot, state["snapshot_id"])
@@ -613,6 +892,7 @@ def create_resilient_node(agent):
                             "sender": "Recovery",
                             "error_count": state.get("error_count", 0) + 1,
                             "execution_plan": failed_plan,
+                            "step_failures": _failures,
                             "current_step": _cur,
                             "run_started_at": state.get("run_started_at"),
                         }
@@ -622,6 +902,7 @@ def create_resilient_node(agent):
                             "sender": "ErrorHandler",
                             "error_count": state.get("error_count", 0) + 1,
                             "execution_plan": failed_plan,
+                            "step_failures": _failures,
                             "current_step": _cur,
                             "run_started_at": state.get("run_started_at"),
                         }

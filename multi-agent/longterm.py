@@ -97,13 +97,40 @@ def _connect() -> sqlite3.Connection:
 
 
 # === 向量工具 ===
+# embedding 失败呼叫器。用 list 做计数器，不在函数里给模块级变量赋值（避免漏写 global 那类坑）。
+# 为什么必须外放：原实现只有 logger.warning —— 那只进进程控制台（langgraph dev 的终端），
+# 滚动即失、跑完就没了。实测踩过：一轮 run 里 remember() 写进 2 条记忆，embedding 全为 NULL、
+# dim=0 —— 这些条目**永远无法被语义召回**，而 log/<thread>_run.log 里一个字都没有，完全静默。
+_EMBED_FAILS: list = []
+_EMBED_FAIL_WARN_MAX = 5
+
+
+def _note_embed_failure(why: str) -> None:
+    """记录一次 embedding 失败：控制台 logger 一条 + log/<thread>_run.log 一条（可事后回溯）。"""
+    if len(_EMBED_FAILS) >= _EMBED_FAIL_WARN_MAX:
+        return
+    _EMBED_FAILS.append(why)
+    n = len(_EMBED_FAILS)
+    msg = f"[longterm] embedding 失败 #{n}（{why}）endpoint={_EMBED_BASE}"
+    if n == 1:
+        msg += " —— 本次 remember() 写进去的记忆只有文本没有向量，将永远无法被语义召回；召回也退化为关键词匹配"
+    logger.warning(msg)
+    try:
+        log_event(msg)
+    except Exception:
+        pass
+
+
 def _embed(texts, role=None):
     """批量取 embedding（1 次 HTTP，input 为列表）。返回 list[list[float]]；未配置/失败返回 None（调用方回落）。
 
     role="query" 且配了 AGENT_MEMORY_EMBED_QUERY_PREFIX 时，给每个待编码文本加检索指令前缀
     （见文件上方 _EMBED_QUERY_PREFIX 的注释）。role 为 None 时行为与旧版完全一致。
     """
-    if not _EMBED_KEY or not texts:
+    if not texts:
+        return None
+    if not _EMBED_KEY:      # 配置缺失：以前这里静默 return，是最难查的一种"记忆变傻"
+        _note_embed_failure("未配置 AGENT_MEMORY_EMBED_API_KEY（或 DASHSCOPE_API_KEY）")
         return None
     import httpx
     payload_texts = ([f"{_EMBED_QUERY_PREFIX}\nQuery: {t}" for t in texts]
@@ -116,15 +143,16 @@ def _embed(texts, role=None):
                        headers={"Authorization": f"Bearer {_EMBED_KEY}"},
                        json=payload, timeout=_EMBED_TIMEOUT)
         if r.status_code != 200:
-            logger.warning(f"[longterm] embeddings HTTP {r.status_code}: {r.text[:150]}")
+            _note_embed_failure(f"HTTP {r.status_code}: {r.text[:120]}")
             return None
         data = sorted(r.json().get("data", []), key=lambda d: d.get("index", 0))  # 保持与输入同序
         vecs = [d.get("embedding") for d in data]
         if len(vecs) != len(texts) or any(v is None for v in vecs):
+            _note_embed_failure(f"返回条数/内容异常（got {len(vecs)}，expect {len(texts)}）")
             return None
         return vecs
     except Exception as e:
-        logger.warning(f"[longterm] embeddings failed ({type(e).__name__}: {e}); falling back to keyword recall")
+        _note_embed_failure(f"{type(e).__name__}: {e}")
         return None
 
 

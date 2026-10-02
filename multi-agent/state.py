@@ -44,3 +44,20 @@ class AgentState(TypedDict):
     # supervisor 首轮规划与每个子 agent 节点都会把它作为“用户背景”注入 context（“越用越懂你”）。
     # 纯 last-write-wins 字段；为空表示本轮无相关长期记忆（或功能关闭）。详见 longterm.py。
     recalled_memory: Optional[str]
+    # === 步骤级失败档案（跨步 / 跨 agent 的"失败原因通道"）===
+    # 背景：以前某步失败后，plan 里只会留下 status="failed" 三个字，失败原因只存在于
+    # logger.warning（甚至不进 run log），下游既看不到"上一步为什么错"，也不知道"该怎么改"，
+    # supervisor 只能靠猜改写计划（"重新执行：…"），于是同一根因被反复踩（2026-10-02 线上：
+    # step3/4/5 连续三次撞 ReAct 步数上限，同一份报告被生成三遍）。
+    # 本字段由 agents.py 在三种失败处统一追加（critic 质量门耗尽 / 异常重试耗尽 / ReAct 步数触顶），
+    # 由 handoff._render_step_failures 注入下一次派发，由 plan._replan_tail 喂给再规划 LLM。
+    # last-write-wins：节点自行读取旧列表 → 追加 → 整列表写回（内部截断到最近 N 条）。
+    # 单条结构（dict）：
+    #   step    : 1-based 步号（与日志/UI 一致，plan 的下标是 step-1）
+    #   agent   : 失败的 sub agent 名
+    #   kind    : "recursion" | "exception" | "critic"
+    #   reason  : 机器可读的失败原因（截断到 600 字）
+    #   hint    : 给下一个 sub agent 的「可操作改进要求」（见 handoff._failure_hint）
+    #   attempt : 该步累计失败次数（第 1 次=1）
+    #   at      : 记录时刻（ISO）
+    step_failures: List

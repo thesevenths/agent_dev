@@ -73,6 +73,9 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
 
             step_text = plan[current]
             target_agent = _parse_target_agent(step_text)
+            # 保存"原计划给本步指定的 agent"，供下方空转判定比较：再规划可能只换了执行者
+            # （plan 文本一字未改），那也是一次有效决策，不能记成空转。
+            planned_agent = target_agent
             plan_before = _mark_progress(plan, current)
             # 跨步语义摘要：把已完成步的 observations 提炼成要点清单（落盘 log/<thread>_summary.md），
             # 作为再规划与下游 agent 的语义上下文；LLM 不可达时 _summarize_observations 内部回落提取式摘要。
@@ -109,13 +112,30 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
             try:
                 # 调用 LLM 审视剩余步骤（可跳过/改写已失效步骤），带防死循环硬约束
                 target_agent, plan, finish_reason = _replan_tail(state, plan, current, summary_ctx=summary_ctx)
-                # 空转检测：BEFORE==AFTER 说明这次 LLM 调用没有任何收益，累计到阈值后自动停用
-                changed = _plan_view(plan_before, current) != _plan_view(plan, current)
+                # 空转检测：BEFORE==AFTER 说明这次 LLM 调用没有任何收益，累计到阈值后自动停用。
+                # 注意：只比 plan 文本会把"plan 未改但换了执行者"误记成空转 —— 2026-10-02 step5 就是
+                # plan 一字未改、却把 chat_agent(发邮件) 换成了 code_agent(重做报告)，这是一次真实决策
+                # （虽然该决策本身有问题），若记成空转会累积 streak 进而停用后续再规划。
+                def _norm_agent(a):
+                    # 同时兼容 "chat_agent"（plan 解析结果）与 "ChatAgent"（agent.name）两种写法
+                    t = str(a or "").strip().lower().replace("_agent", "")
+                    if t.endswith("agent") and len(t) > len("agent"):
+                        t = t[: -len("agent")]
+                    return t
+
+                agent_changed = current < len(plan_before) and (
+                    _norm_agent(target_agent) != _norm_agent(planned_agent))
+                changed = (_plan_view(plan_before, current) != _plan_view(plan, current)) or agent_changed
                 streak = 0 if changed else (int(state.get("replan_noop_streak") or 0) + 1)
                 if not changed:
                     logger.warning(
                         f"supervisor re-plan was a NO-OP (BEFORE==AFTER) at step {current + 1}; "
                         f"noop streak={streak}"
+                    )
+                elif agent_changed and _plan_view(plan_before, current) == _plan_view(plan, current):
+                    logger.info(
+                        f"supervisor re-plan changed ONLY the executor at step {current + 1}: "
+                        f"{planned_agent} -> {target_agent} (plan text unchanged)"
                     )
                 if finish_reason is not None:
                     # 早停：模型显式截断了计划 → 剩余步骤作废，直接收尾（#6）
