@@ -61,3 +61,14 @@ class AgentState(TypedDict):
     #   attempt : 该步累计失败次数（第 1 次=1）
     #   at      : 记录时刻（ISO）
     step_failures: List
+    # === 计划长度增长计数（E2「重做载体」）===
+    # 背景：再规划原本硬约束「只减不增」（plan.py 把超长的新计划截断回原长），于是模型
+    # 想插入一个「重试 step N」的专用步时会被直接削掉 —— 失败步又因 current_step 只增不减
+    # 而永不再派发，两者叠加导致**没有任何重做载体**（2026-10-02 线上：step5 邮件没发出去，
+    # 却只能静默 FINISH）。现允许整个 run 内计划长度净增最多 AGENT_PLAN_GROW_MAX 步，
+    # 专用于追加「retry of step N」。计数由 supervisor 维护，防止无限增长/死循环。
+    plan_grown: int
+    # === 终局对账结论（E1）===
+    # FINISH 时若存在 failed 步，由 LLM 决策后写入的「向用户说明」文本（降级交付/未完成的说明）。
+    # 为空表示无失败或模型判定无需说明。
+    final_note: Optional[str]

@@ -6,6 +6,7 @@
 后端（vLLM）不可达时直接终止并给出可操作提示，避免对不堪重负的后端反复横跳形成死循环。
 原定义位于 agent.py:1014-1209，拆分时整体迁入。
 """
+import os
 import logging
 from datetime import datetime
 from typing import Dict, Any
@@ -16,7 +17,7 @@ from state import AgentState
 from runlog import set_current, ensure_run, log_event, run_file, get_run_id
 from plan import (
     _should_replan, _replan_tail, _mark_progress, _plan_view,
-    _parse_target_agent, _normalize_plan,
+    _parse_target_agent, _normalize_plan, _PLAN_GROW_MAX, _render_step_failures,
 )
 from summary import _summarize_observations, _obs_total, _AGENT_SUMMARY_DISABLE
 from planutil import Router, _extract_json_obj, _goal_text, members, _structured_with_retry
@@ -24,6 +25,15 @@ from context import _date_context_str
 from llm import supervisor_llm
 
 logger = logging.getLogger(__name__)
+
+# === E1 终局对账：FINISH 前若存在 failed 步，强制一次 LLM 决策 ===
+# 背景（2026-10-02 线上实证）：current >= len(plan) 的分支早于再规划判定，直接 FINISH，
+# **完全不调 LLM** —— 失败步既不重试、也不改写、更不会告知用户，只在日志里留一行
+# "failed steps: [5]"。用户拿到的是"任务完成了"的假象（step5 邮件实际没发出去）。
+# 现在：只要终态计划里还有 failed 步，就花一次 LLM 让模型在三条路里选一条：
+#   ① 重试（追加一个 retry 步，需 E2 的长度配额） ② 降级交付 ③ 明确告知用户哪步没做成。
+# 设 0 即恢复原「静默 FINISH」语义（零回归）。LLM 不可达/解析失败一律 fail-safe 走原逻辑。
+_FINAL_ADJUDICATE = os.environ.get("AGENT_FINAL_ADJUDICATE", "1").lower() in ("1", "true", "yes")
 
 
 def _extract_longterm(state, memory_key):
@@ -33,6 +43,121 @@ def _extract_longterm(state, memory_key):
         extract_and_remember_from_run(state, memory_key)
     except Exception as e:
         logger.warning(f"[longterm] FINISH extract skipped ({e})")
+
+
+def _adjudicate_failures(state: dict, plan: list, failed_idx: list, memory_key: str,
+                         summary_ctx: str = "") -> dict:
+    """FINISH 前的终局对账：存在 failed 步时强制一次 LLM 决策（E1）。
+
+    返回：
+      - {"next": <agent>, "execution_plan": ..., "current_step": N, ...} → 追加重试步，继续跑；
+      - {"final_note": "..."}                                            → 接受失败，带上说明 FINISH；
+      - {}                                                               → 无需干预（走原 FINISH）。
+    任何异常一律吞掉并返回 {}，绝不能让对账反过来卡住收尾。
+    """
+    if not _FINAL_ADJUDICATE or not failed_idx:
+        return {}
+    try:
+        from planutil import Router, members as _members
+        goal = state.get("plan_goal") or _goal_text(state)
+        grown = int(state.get("plan_grown") or 0)
+        quota = max(0, _PLAN_GROW_MAX - grown)
+        # 失败原因：优先用结构化档案（step_failures），没有则退化成"仅知道某步 failed"
+        fails = state.get("step_failures") or []
+        detail = []
+        for i in failed_idx:
+            rel = [f for f in fails if int(f.get("step") or 0) == i]
+            if rel:
+                f = rel[-1]
+                detail.append(
+                    f"  - step {i} (agent={f.get('agent')}, kind={f.get('kind')}): "
+                    f"{str(f.get('reason') or '')[:300]}"
+                    + (f"\n    how to avoid: {str(f.get('hint') or '')[:200]}"
+                       if f.get("hint") else "")
+                )
+            else:
+                st = plan[i - 1] if 0 < i <= len(plan) else {}
+                detail.append(f"  - step {i} ({st.get('title', '')}): 标记为 failed（无结构化原因记录）")
+        # 无增长配额时不再提供"重试"选项，只让模型在降级/说明之间选，杜绝无限追加。
+        if quota > 0:
+            rule = (
+                f"You may RETRY: return next=<agent> and an 'execution_plan' of length "
+                f"{len(plan) + 1} whose LAST step is a retry of the failed step — its description "
+                f"MUST encode the failure cause and the concrete constraint that avoids repeating it.\n"
+                f"Or return next=\"FINISH\" with 'reason' explaining what was NOT accomplished "
+                f"(degraded delivery / tell the user explicitly).\n"
+            )
+        else:
+            rule = (
+                "RETRY QUOTA EXHAUSTED — you MUST return next=\"FINISH\". "
+                "Use 'reason' to state plainly which step(s) failed and what the user is missing.\n"
+            )
+        sys_msg = SystemMessage(content=supervisor_system_prompt.replace("{members}", ", ".join(_members)))
+        user_msg = HumanMessage(content=(
+            f"FINAL ADJUDICATION before finishing this run.\n"
+            f"User goal (NEVER change):\n{goal}\n\n"
+            f"Plan at finish:\n{_plan_view(plan)}\n\n"
+            f"FAILED step(s): {failed_idx}\n" + "\n".join(detail) + "\n\n"
+            + (f"Completed steps summary:\n{summary_ctx}\n\n" if summary_ctx else "")
+            + f"Artifacts on disk: {state.get('artifacts') or []}\n\n"
+            + rule
+            + "Return strict JSON with 'next' and 'reason' (plus 'execution_plan' only if retrying)."
+        ))
+        parsed = _structured_with_retry(supervisor_llm, [sys_msg, user_msg], Router,
+                                        label="final-adjudicate")
+        if not isinstance(parsed, dict):
+            return {}
+        nxt = str(parsed.get("next") or "").strip()
+        valid = [m.replace("_agent", "") for m in _members] + ["FINISH"]
+        if nxt.replace("_agent", "") not in valid:
+            return {}
+        if nxt == "FINISH":
+            note = str(parsed.get("reason") or "").strip()
+            log_event(f"[supervisor] final adjudication: accept failure(s) {failed_idx}; "
+                      f"note={note[:200]}", memory_key)
+            return {"final_note": note}
+        rev = _normalize_plan(parsed.get("execution_plan"))
+        if not rev:
+            return {}
+        if len(rev) > len(plan) + quota:
+            rev = rev[: len(plan) + quota]
+        if len(rev) <= len(plan):
+            # 模型没有真正追加重试步 → 无法重做，降级为带说明的 FINISH
+            note = str(parsed.get("reason") or "").strip() or \
+                f"step {failed_idx} failed and no retry step was produced"
+            return {"final_note": note}
+        new_plan = rev
+        # 关键：把失败步的原因"搬运"到新步号上，否则 handoff 的前向回溯
+        # （AGENT_FAIL_LOOKBACK 只看最近 2 步）看不到原失败步的根因，重试必然再踩同一个坑。
+        carried = list(state.get("step_failures") or [])
+        new_step_no = len(new_plan)
+        for i in failed_idx:
+            rel = [f for f in fails if int(f.get("step") or 0) == i]
+            for f in rel:
+                g = dict(f)
+                g["step"] = new_step_no
+                g["kind"] = f"retry-of-{i}"
+                carried.append(g)
+        log_event(
+            f"[supervisor] final adjudication: RETRY step {failed_idx} → appended as step "
+            f"{new_step_no} ({new_plan[-1].get('title', '')}); "
+            f"plan_grown {grown} -> {grown + (len(new_plan) - len(plan))}",
+            memory_key,
+        )
+        return {
+            "next": nxt,
+            "reason": f"Final adjudication: retrying failed step {failed_idx} as step {new_step_no}.",
+            "current_step": len(plan),          # 指向新追加的重试步
+            "execution_plan": new_plan,
+            "plan_goal": state.get("plan_goal"),
+            "run_started_at": state.get("run_started_at"),
+            "plan_grown": grown + (len(new_plan) - len(plan)),
+            "step_failures": carried[-20:],
+            "replan_noop_streak": 0,
+        }
+    except Exception as e:
+        logger.warning(f"[supervisor] final adjudication skipped ({e}); finishing as-is")
+        return {}
 
 
 def supervisor(state: AgentState) -> Dict[str, Any]:
@@ -54,9 +179,18 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                 # 导致终态 execution_plan 里最后一步永远是 pending，看不出这次运行到底做完没有。
                 final_plan = _mark_progress(plan, len(plan))
                 failed_idx = [i + 1 for i, s in enumerate(final_plan) if s.get("status") == "failed"]
+                # E1 终局对账：有 failed 步时不再静默 FINISH，先让模型在
+                # 重试 / 降级交付 / 明确告知 之间做一次决策。
+                adj = _adjudicate_failures(state, final_plan, failed_idx, memory_key) \
+                    if failed_idx else {}
+                if adj.get("next") and str(adj.get("next")) != "FINISH":
+                    # 追加重试步 → 本轮尚未结束，不抽取长期记忆（避免把半成品蒸馏入库）
+                    return adj
+                note = str(adj.get("final_note") or "")
                 log_event(
                     "[supervisor] FINISH: all steps in execution plan completed."
                     + (f" (failed steps: {failed_idx})" if failed_idx else "")
+                    + (f"\n[FINAL NOTE] {note}" if note else "")
                     + f"\n{_plan_view(final_plan)}",
                     memory_key,
                 )
@@ -64,11 +198,13 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                 _extract_longterm(state, memory_key)
                 return {
                     "next": "FINISH",
-                    "reason": "All tasks in execution plan completed.",
+                    "reason": (f"Finished with {len(failed_idx)} failed step(s): {note}"
+                               if note else "All tasks in execution plan completed."),
                     "current_step": current,
                     "execution_plan": final_plan,
                     "plan_goal": state.get("plan_goal"),
                     "run_started_at": state.get("run_started_at"),
+                    "final_note": note,
                 }
 
             step_text = plan[current]
@@ -185,6 +321,9 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                 "plan_summary": summary_ctx,          # 跨步语义摘要，随 state 下发给子 agent
                 "summary_obs_seen": _obs_total(state),  # 摘要游标：标记这些 observations 已折叠进 plan_summary
                 "replan_noop_streak": streak,         # 空转计数：连续多次无效后停用再规划
+                # E2：计划长度增长计数（只在真正变长时累加，用于约束「重做载体」配额）
+                "plan_grown": int(state.get("plan_grown") or 0)
+                              + max(0, len(plan) - len(plan_before)),
                 "current_step": current + 1   # 关键：推进进度
             }
 

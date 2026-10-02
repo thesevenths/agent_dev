@@ -50,6 +50,10 @@ _REPLAN_OBS_WINDOW = int(os.environ.get("AGENT_REPLAN_OBS_WINDOW", "20") or 0)
 # 于是"文件写了但内容为空/不是约定结构"这种静默降级完全不会被发现。
 _REPLAN_ARTIFACT_CHECK = os.environ.get("AGENT_REPLAN_ARTIFACT_CHECK", "1").lower() in ("1", "true", "yes")
 _REPLAN_ARTIFACT_MAX = int(os.environ.get("AGENT_REPLAN_ARTIFACT_MAX", "3") or 3)
+# 计划长度增长上限（E2「重做载体」）：整个 run 内允许 execution_plan 净增的最大步数。
+# 0 = 恢复原「只减不增」语义（零回归）。默认 1：只允许追加一步，专用于「retry of step N」。
+# 为什么不是放开：放开会让模型无限追加步骤（历史上出现过步数膨胀烧钱），必须硬上限。
+_PLAN_GROW_MAX = int(os.environ.get("AGENT_PLAN_GROW_MAX", "1") or 0)
 
 
 def _mark_progress(plan: list, current: int) -> list:
@@ -336,8 +340,24 @@ def _replan_tail(state: dict, plan: list, current: int, summary_ctx: str | None 
         tail = norm_rev[current:]  # 模型掌控 current 及之后
         if tail:
             new_plan = new_plan[:current] + tail
-            if len(new_plan) > len(plan):          # 只减不增：截断到原长
-                new_plan = new_plan[:len(plan)]
+            # 长度约束：原为「只减不增」硬截断到原长，但那样模型无法插入「重试 step N」的专用步
+            # —— 而失败步又因 current_step 只增不减永不再派发，等于没有重做载体。
+            # 现允许净增最多 _PLAN_GROW_MAX 步（整个 run 累计，见 state.plan_grown），
+            # 超出部分仍截断。设 0 即完全恢复原语义。
+            _grown = 0
+            try:
+                _grown = int(state.get("plan_grown") or 0)
+            except (TypeError, ValueError):
+                _grown = 0
+            _cap = len(plan) + max(0, _PLAN_GROW_MAX - _grown)
+            if len(new_plan) > _cap:
+                new_plan = new_plan[:_cap]
+            if len(new_plan) > len(plan):
+                logger.info(
+                    f"[replan] plan grew by {len(new_plan) - len(plan)} step(s) "
+                    f"(plan_grown={_grown}, cap=+{max(0, _PLAN_GROW_MAX - _grown)}) "
+                    f"— expected use: appending a 'retry of step N' step"
+                )
     # 其余情形（模型未给计划 / 给了比 current 更短的计划却仍要跑 agent）→ 保留原尾部，避免出现
     # "plan 比 current_step 还短"导致 supervisor 索引越界。
     if len(new_plan) < current:            # 安全兜底
