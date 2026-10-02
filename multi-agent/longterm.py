@@ -50,6 +50,13 @@ _EMBED_KEY = (os.environ.get("AGENT_MEMORY_EMBED_API_KEY")
 _EMBED_MODEL = os.environ.get("AGENT_MEMORY_EMBED_MODEL") or "text-embedding-v4"
 _EMBED_DIM = int(os.environ.get("AGENT_MEMORY_EMBED_DIM", "1024"))
 _EMBED_TIMEOUT = float(os.environ.get("AGENT_MEMORY_EMBED_TIMEOUT", "15"))
+# 非对称检索的 query 侧检索指令（留空 = 完全保持旧行为，逐字节不变）。
+# 为什么需要：Qwen3-Embedding 这类非对称检索模型，query 与 passage 的编码方式不同。
+# query 侧不加官方指令时，两侧向量不在同一"语义刻度"上 —— 实测 33 条记忆库上噪声最高 0.69，
+# 与相关条目 0.66~0.83 交错，任何全局阈值都切不干净；加上指令后噪声顶降到 0.545、
+# 相关底 0.611，才出现干净切点（配 AGENT_MEMORY_MIN_SCORE=0.58）。
+# 前缀**只作用于 query 侧**，passage 编码不变 → 与库内已存向量兼容，无需 re-embed。
+_EMBED_QUERY_PREFIX = (os.environ.get("AGENT_MEMORY_EMBED_QUERY_PREFIX") or "").strip()
 
 _lock = threading.RLock()   # 可重入：公开方法持锁，内部 helper 复用同一连接不再单独加锁
 _conn = None
@@ -90,12 +97,18 @@ def _connect() -> sqlite3.Connection:
 
 
 # === 向量工具 ===
-def _embed(texts):
-    """批量取 embedding（1 次 HTTP，input 为列表）。返回 list[list[float]]；未配置/失败返回 None（调用方回落）。"""
+def _embed(texts, role=None):
+    """批量取 embedding（1 次 HTTP，input 为列表）。返回 list[list[float]]；未配置/失败返回 None（调用方回落）。
+
+    role="query" 且配了 AGENT_MEMORY_EMBED_QUERY_PREFIX 时，给每个待编码文本加检索指令前缀
+    （见文件上方 _EMBED_QUERY_PREFIX 的注释）。role 为 None 时行为与旧版完全一致。
+    """
     if not _EMBED_KEY or not texts:
         return None
     import httpx
-    payload = {"model": _EMBED_MODEL, "input": list(texts), "encoding_format": "float"}
+    payload_texts = ([f"{_EMBED_QUERY_PREFIX}\nQuery: {t}" for t in texts]
+                     if (role == "query" and _EMBED_QUERY_PREFIX) else list(texts))
+    payload = {"model": _EMBED_MODEL, "input": payload_texts, "encoding_format": "float"}
     if _EMBED_DIM:
         payload["dimensions"] = _EMBED_DIM   # DashScope v3/v4 支持指定维度
     try:
@@ -227,7 +240,7 @@ def recall(query, k=None, budget=None, memory_key=None) -> str:
             if not rows:
                 return ""
             scored, mode = [], "keyword"
-            vecs = _embed([query])
+            vecs = _embed([query], role="query")
             if vecs is not None:
                 qv = np.asarray(vecs[0], dtype=np.float32)
                 for r in rows:
