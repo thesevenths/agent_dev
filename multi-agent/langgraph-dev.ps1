@@ -19,10 +19,24 @@
 #   "cannot schedule new futures after interpreter shutdown"。这就是为什么偏偏每次都是 code_agent
 #   报错：crawler 写 .json/.md、chat 写 .md，只有 code_agent 写 .py。跑 agent 期间从不需要热重载，
 #   故默认关闭；确需边改代码边自动重载时，用 -Watch 显式开启（此时不要同时跑 agent）。
+#
+# 排障备忘（2026-10-03，一次真实事故）：
+#   现象：控制台只停在 "Worker stats ... active=0" 心跳，http://127.0.0.1:2024 连不上、
+#        浏览器不自动弹，看着像"卡住"。
+#   真因：tools.py 模块顶层执行 `Base.metadata.create_all(engine)`，而 PG
+#        (192.168.50.75:5432) 不可达 -> psycopg 卡到 OS TCP 超时(133s) -> import tools 阻塞
+#        -> graph 加载 GraphLoadError -> "Application startup failed. Exiting."
+#        -> uvicorn 从未绑定 2024，langgraph 的 _open_browser 线程死等 /ok 而静默。
+#   结论：这【不是】langgraph 或浏览器的问题，是业务代码在 import 期连 DB。已修：
+#        tools.py 给 engine 加 connect_args={"connect_timeout":5} + create_all 包 try/except。
 
 param(
     # 加 -Watch 开启热重载（仅在"纯改代码、不跑 agent"时用）；默认关闭，见上方说明。
-    [switch]$Watch
+    [switch]$Watch,
+    # 加 -NoBrowser：不自动弹浏览器（无桌面/远程服务器时用）。默认会自动弹，见下方说明。
+    [switch]$NoBrowser,
+    # 加 -Bg：把服务丢到独立窗口后台跑，当前 PowerShell 立即释放（默认前台阻塞）。
+    [switch]$Bg
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,18 +47,67 @@ Set-Location -Path (Split-Path -Parent $MyInvocation.MyCommand.Path)
 # 关键：全局默认 UTF-8，子进程（langgraph.exe -> python） inherited
 $env:PYTHONUTF8 = "1"
 
-# 组装 langgraph dev 参数：默认追加 --no-reload（除非 -Watch，或调用方已显式传入 --no-reload）
+# 组装 langgraph dev 参数
 $devArgs = @("dev")
 $callerArgs = @($args)
 if (-not $Watch -and ($callerArgs -notcontains "--no-reload")) {
     $devArgs += "--no-reload"
 }
+# 浏览器自动打开（2026-10-03 勘误）：
+#   langgraph dev **默认就会开浏览器**，开关只有一个否定式 `--no-browser`（langgraph_cli/cli.py:692，
+#   Click is_flag 默认 False -> 第 844 行 open_browser=not no_browser=True -> langgraph_api/cli.py:373
+#   起 _open_browser 线程）。本版本【不存在】--open-browser 选项，误加会让 langgraph dev 直接报
+#   "No such option '--open-browser'. Did you mean '--no-browser'?" 并退出。
+#   故这里只在 -NoBrowser 时追加 --no-browser 关闭自动打开。
+if ($NoBrowser -and ($callerArgs -notcontains "--no-browser")) {
+    $devArgs += "--no-browser"
+}
 $devArgs += $callerArgs
 
 # 优先用 venv 里的 langgraph；venv 不存在时退化为 PATH 上的
 $venvLanggraph = "D:\venvs\multi-agent\Scripts\langgraph.exe"
-if (Test-Path -LiteralPath $venvLanggraph) {
-    & $venvLanggraph @devArgs
-} else {
-    & langgraph @devArgs
+if (-not (Test-Path -LiteralPath $venvLanggraph)) {
+    $venvLanggraph = (Get-Command langgraph -ErrorAction SilentlyContinue).Source
+    if (-not $venvLanggraph) {
+        throw "找不到 langgraph.exe：D:\venvs\multi-agent\Scripts\langgraph.exe 不存在且 PATH 上也没有 langgraph 命令。"
+    }
 }
+
+if ($Bg) {
+    # 后台模式：服务独立窗口跑，日志落盘，当前 shell 立刻还给你（默认不占 PowerShell）
+    if (-not (Test-Path -LiteralPath .\log)) {
+        New-Item -ItemType Directory -Path .\log -Force | Out-Null
+    }
+    $logFile = "F:\agent\multi-agent\log\dev_stdout.log"
+    Write-Host "后台启动：$(Split-Path $venvLanggraph -Leaf) $($devArgs -join ' ')" -ForegroundColor Cyan
+    $inner = "`$env:PYTHONUTF8='1'; Set-Location 'F:\agent\multi-agent'; & '" + $venvLanggraph + "' " + ($devArgs -join ' ') + " *>&1 | Tee-Object -FilePath '" + $logFile + "'"
+    try {
+        Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile", "-Command", $inner -WindowStyle Minimized -ErrorAction Stop
+    } catch {
+        Write-Host "自动开窗口失败：$($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "请手动另开一个 PowerShell 窗口，执行：" -ForegroundColor Yellow
+        Write-Host "  cd F:\agent\multi-agent; .\langgraph-dev.ps1" -ForegroundColor Yellow
+        exit 1
+    }
+    # 轮询探测：图加载含 DB 连接，首次可能数秒，给足 45s
+    $ok = $false
+    for ($i = 1; $i -le 15; $i++) {
+        Start-Sleep -Seconds 3
+        try {
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:2024/ok" -TimeoutSec 4 -UseBasicParsing
+            Write-Host "服务已就绪（约 $($i * 3)s）：HTTP $([int]$r.StatusCode)  $($r.Content)" -ForegroundColor Green
+            Write-Host "本机兜底页（不依赖外网，Smith 打不开时用）： http://127.0.0.1:2024/docs" -ForegroundColor Yellow
+            $ok = $true
+            break
+        } catch { }
+    }
+    if (-not $ok) {
+        Write-Host "45s 内 2024 端口仍未监听 -> 启动失败。日志末尾：" -ForegroundColor Red
+        if (Test-Path -LiteralPath $logFile) {
+            Get-Content -LiteralPath $logFile -Tail 12 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+        }
+    }
+    exit 0
+}
+
+& $venvLanggraph @devArgs

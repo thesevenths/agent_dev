@@ -75,8 +75,20 @@ tavily_search = TavilySearch(
 
 # 创建基类
 Base = declarative_base()
-engine = create_engine(PG_CONN_STR)
-Base.metadata.create_all(engine)
+# connect_timeout：PG 不可达时快速失败（默认会走 OS 级 TCP 超时，可达 100s+）。
+# 本模块是 import 链 tools -> llm -> supervisor -> graph -> agent 的必经节点，
+# 顶层一旦阻塞，langgraph dev 的 graph 加载会整体失败（GraphLoadError: startup failed），
+# 表现为"服务只打印心跳、2024 端口不监听、浏览器打不开"。故超时必须收敛。
+engine = create_engine(
+    PG_CONN_STR,
+    pool_pre_ping=True,
+    connect_args={"connect_timeout": 5},
+)
+try:
+    Base.metadata.create_all(engine)
+except Exception as _db_err:
+    # DB 不可用（PG 挂了/网段不通）不应阻断整个服务启动：只告警，依赖 DB 的工具调用时再暴露。
+    logger.warning("[db] create_all 跳过（DB 不可达？）：%s", _db_err)
 
 Session = sessionmaker(bind=engine)
 session = Session()
