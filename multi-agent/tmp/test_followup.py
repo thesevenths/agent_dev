@@ -54,22 +54,25 @@ def make_state(sub_diff=True, tail=None):
         ],
         "current_step": 2,
         "plan_goal": "分析纳斯达克100",
-        "run_started_at": None,
+        # 故意设成“很久以前”的旧值：模拟 21:48 首次规划写入后、续问新建计划时未重置的 bug 现场。
+        # 旧实现（state.get(...) or now）会原样带回这个旧值，新实现必须刷新为当前时刻。
+        "run_started_at": "2020-01-01T00:00:00",
         "recalled_memory": "",
-        "plan_summary": "",
-        "observations": [],
-        "summary_obs_seen": 0,
-        "replan_noop_streak": 0,
-        "plan_grown": 0,
-        "step_failures": [],
+        # 旧计划的跨步上下文（非空）：模拟上一问题 run 遗留的污染现场，新建计划必须清空
+        "plan_summary": "- **Step 6 (Final Delivery) Accomplished**: Sent via email (旧计划步号，会污染早停判定)",
+        "observations": ["old obs 1", "old obs 2"],
+        "summary_obs_seen": 115,
+        "replan_noop_streak": 2,
+        "plan_grown": 1,
+        "step_failures": [{"step": 6, "agent": "ChatAgent", "kind": "critic", "reason": "old", "hint": "", "attempt": 1, "at": "x"}],
         "error_count": 0,
         "snapshot_id": None,
         "sender": None,
         "next": None,
         "reason": None,
         "hallucination_check": None,
-        "artifacts": [],
-        "obs_total": 0,
+        "artifacts": ["F:\\agent\\multi-agent\\tmp\\20261007T214810__step1__ChatAgent.md"],
+        "obs_total": 115,
         "final_note": None,
         "_submission_id": "SUB_NEW" if sub_diff else _PLANNED,
         "_plan_submission_id": _PLANNED,
@@ -93,7 +96,18 @@ nxt_a, plan_a = out_a.get("next"), out_a.get("execution_plan") or []
 print("  next =", nxt_a, "| plan 步数 =", len(plan_a), "| current_step =", out_a.get("current_step"))
 assert nxt_a and nxt_a != "FINISH", f"BUG: 续问却 FINISH 了 (next={nxt_a})"
 assert len(plan_a) > 0 and out_a.get("current_step") == 1
-print("  ok: 同线程续问（提交序号不同）被正确识别并重新规划")
+# 新任务边界：run_started_at 必须重置，旧计划跨步上下文必须清空
+# （否则幂等守卫拿上一问题的同号产物假跳过新计划各步 + 旧步号摘要污染早停判定）
+from datetime import datetime as _dt, timedelta as _td
+assert out_a.get("run_started_at"), "BUG: 新计划未写 run_started_at"
+assert _dt.fromisoformat(out_a["run_started_at"]) >= _dt.now() - _td(minutes=1), \
+    f"BUG: run_started_at 未重置（仍是旧值 {out_a['run_started_at']}）"
+assert out_a.get("plan_summary") is None and out_a.get("observations") == [] \
+    and out_a.get("artifacts") == [] and out_a.get("obs_total") == 0 \
+    and out_a.get("summary_obs_seen") == 0 and out_a.get("step_failures") == [] \
+    and out_a.get("replan_noop_streak") == 0, \
+    "BUG: 新计划未清空旧跨步上下文（plan_summary/observations/artifacts/...）"
+print("  ok: 同线程续问被正确识别并重新规划，且任务边界字段已重置")
 
 
 print("\n=== 用例 B：同提交(无续问) -> 维持 FINISH ===")

@@ -320,7 +320,9 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                         "reason": f"Light follow-up (refine previous output): route to {last_agent} without full re-plan.",
                         "execution_plan": [step],
                         "plan_goal": state.get("plan_goal"),
-                        "run_started_at": state.get("run_started_at"),
+                        # 新提交 = 新任务边界：必须重置 run 启动时刻，否则幂等守卫会把
+                        # 上一轮遗留的同号 step 产物误认成“本 run 已产出”而跳过 LIGHT 步。
+                        "run_started_at": datetime.now().isoformat(),
                         "current_step": 1,
                         "_plan_submission_id": _sub,
                     }
@@ -544,9 +546,23 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                     "current_step": 1,
                     # 记录本次规划对应的提交序号，供「情况0 接着聊」判定续问（_submission_id 变化时即为新提交）
                     "_plan_submission_id": state.get("_submission_id"),
-                    # 本次 run 启动时刻（仅在首次规划时写入，随 checkpoint 续命）：
-                    # 产物幂等守卫用它区分 tmp/ 里"本次 run 的产物"与历史 run 的同号 step 产物。
-                    "run_started_at": state.get("run_started_at") or datetime.now().isoformat(),
+                    # 新计划 = 新任务边界，以下字段必须重置（2026-10-07 23:21 线上实证三连 bug）：
+                    # 1) run_started_at 若沿用旧值（旧实现 `state.get(...) or now`），幂等守卫
+                    #    （agents.py 按 *__stepN__* + mtime≥start 匹配）会把【上一个问题】计划留下的
+                    #    同号产物误认成【本问题】已产出 → 新计划各步被整排假跳过；
+                    # 2) 旧 plan_summary/observations 带着【旧计划步号】喂进再规划/早停 LLM，
+                    #    导致“Step 6 已发邮件”式幻觉触发 EARLY FINISH（新计划根本只有 5 步）。
+                    #    历史产物文件仍在盘上、完整对话仍在 messages 里，清空不丢信息。
+                    # 注意：同一次提交的中途崩溃续跑不走本分支（plan 非空→情况1），
+                    # 幂等守卫对真·断点续跑的保护不受影响。
+                    "run_started_at": datetime.now().isoformat(),
+                    "plan_summary": None,
+                    "observations": [],
+                    "obs_total": 0,
+                    "summary_obs_seen": 0,
+                    "artifacts": [],
+                    "replan_noop_streak": 0,
+                    "step_failures": [],
                 }
             else:
                 # 降级为传统单轮路由（兼容旧逻辑）
