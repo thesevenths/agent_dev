@@ -72,3 +72,13 @@ class AgentState(TypedDict):
     # FINISH 时若存在 failed 步，由 LLM 决策后写入的「向用户说明」文本（降级交付/未完成的说明）。
     # 为空表示无失败或模型判定无需说明。
     final_note: Optional[str]
+    # === 同线程“接着聊”提交序号（2026-10-07 实证修复）===
+    # 背景：langgraph dev 平台在续跑线程时会在 messages 末尾注入“对话摘要”合成消息
+    # （"Here is a summary of the conversation to date..."），导致“最后一条消息是否为新用户消息”
+    # 的判定彻底失效、续问被误 FINISH。改用提交序号判定：
+    #   - 每次用户新提交 -> run_start 节点生成新 _submission_id 写入 state；
+    #   - supervisor 首次规划时把当时的 _submission_id 记入 _plan_submission_id；
+    #   - 后续若「计划已完成 且 _submission_id != _plan_submission_id」即说明是一次新提交（续问），
+    #     清空旧计划重新规划/轻量微调。与 messages 是否被平台注入完全无关，稳定。
+    _submission_id: Optional[str]
+    _plan_submission_id: Optional[str]

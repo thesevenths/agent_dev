@@ -15,8 +15,10 @@
 向量：OpenAI 兼容 /embeddings（默认 DashScope text-embedding-v4, dim=1024）。本地 vLLM 只有 chat
 模型、无 embedding（已探针确认），故默认走 DashScope；AGENT_MEMORY_EMBED_* 可改。embedding 不可达
 或未配置时，recall 自动回落「关键词+标签」词面匹配，绝不 hard-break 运行。
-存储：SQLite 单表；embedding 以 float32 BLOB 存，召回时 numpy 暴力余弦（个人助手量级几百~几千条，
-全表扫描毫秒级，无需额外向量库依赖）。设 AGENT_LONGTERM_MEMORY=0 可整体关闭（零回归）。
+存储：SQLite 单表（含 type 列 + 索引，类型枚举 profile/preference/decision/fact）；embedding 以
+float32 BLOB 存，召回时 numpy 暴力余弦（个人助手量级几百~几千条，全表扫描毫秒级，无需额外向量库依赖）。
+召回支持按 type 过滤：函数参数 types= 或全局 AGENT_MEMORY_RECALL_TYPES（逗号分隔）限定只召回某些类型，
+二者取交集，留空则召回全部（零回归）。设 AGENT_LONGTERM_MEMORY=0 可整体关闭（零回归）。
 """
 import os
 import re
@@ -42,6 +44,11 @@ _TOPK = int(os.environ.get("AGENT_MEMORY_TOPK", "5"))
 _BUDGET = int(os.environ.get("AGENT_MEMORY_BUDGET_CHARS", "1600"))
 _MIN_SCORE = float(os.environ.get("AGENT_MEMORY_MIN_SCORE", "0.25"))     # 向量余弦下限，低于视为不相关
 _NEAR_DUP = float(os.environ.get("AGENT_MEMORY_DEDUP_COS", "0.95"))      # 近重复阈值，≥则合并而非新增
+# 长期记忆类型枚举（与 _EXTRACT_PROMPT 对齐）。落库时非枚举值回落 fact，召回时可按类型过滤。
+_MEM_TYPES = ("profile", "preference", "decision", "fact")
+# 全局召回类型过滤（逗号分隔，如 "preference,profile"）。留空=不过滤（召回全部类型，零回归）。
+_RECALL_TYPES = {t.strip().lower() for t in
+                 (os.environ.get("AGENT_MEMORY_RECALL_TYPES") or "").split(",") if t.strip()}
 # embedding 端点（OpenAI 兼容）：默认 DashScope（本地 vLLM 无 embedding 模型）
 _EMBED_BASE = (os.environ.get("AGENT_MEMORY_EMBED_BASE_URL")
                or "https://dashscope.aliyuncs.com/compatible-mode/v1").rstrip("/")
@@ -209,6 +216,10 @@ def remember(text, mtype="fact", tags=None, importance=0.5, memory_key=None):
     text = (text or "").strip()
     if len(text) < 4:
         return None, "skipped"
+    # type 枚举校验（唯一写入入口，保证落库 type 干净可被过滤）：非枚举值回落 fact
+    mtype = str(mtype or "fact").strip().lower()
+    if mtype not in _MEM_TYPES:
+        mtype = "fact"
     try:
         importance = min(1.0, max(0.0, float(importance)))
     except (TypeError, ValueError):
@@ -249,10 +260,13 @@ def remember(text, mtype="fact", tags=None, importance=0.5, memory_key=None):
 
 
 # === 召回 ===
-def recall(query, k=None, budget=None, memory_key=None) -> str:
+def recall(query, k=None, budget=None, types=None, memory_key=None) -> str:
     """按 query 语义召回 top-k 条长期记忆，预算封顶，返回可直接注入 context 的 markdown 项目符号列表（无则空串）。
 
     向量不可达时回落关键词/标签词面匹配。命中的条目更新 last_used_ts/use_count（为新近度打分与后续淘汰留数据）。
+
+    types: 可选，list/set/tuple，限定只召回这些 type（profile/preference/decision/fact）。
+           与全局开关 AGENT_MEMORY_RECALL_TYPES 取交集；都为空则召回全部类型（零回归）。
     """
     if not _ENABLED:
         return ""
@@ -261,10 +275,23 @@ def recall(query, k=None, budget=None, memory_key=None) -> str:
         return ""
     k = k or _TOPK
     budget = budget or _BUDGET
+    # 类型过滤：全局 env (AGENT_MEMORY_RECALL_TYPES) ∩ 本次调用参数 types。
+    # 任意一侧指定了类型即开启过滤；交集为空集合 -> 显式"无命中"，返回空（而非退化为全量）。
+    filter_active = False
+    allow: set = set()
+    if _RECALL_TYPES:
+        allow |= _RECALL_TYPES
+        filter_active = True
+    if types:
+        tset = {str(t).strip().lower() for t in types if str(t).strip()}
+        allow = tset if not filter_active else (allow & tset)
+        filter_active = True
     try:
         conn = _connect()
         with _lock:
             rows = conn.execute("SELECT * FROM memories").fetchall()
+            if filter_active:
+                rows = [r for r in rows if (r["type"] or "").lower() in allow]
             if not rows:
                 return ""
             scored, mode = [], "keyword"
@@ -303,7 +330,8 @@ def recall(query, k=None, budget=None, memory_key=None) -> str:
                 conn.commit()
         block = "\n".join(lines)
         if block and memory_key:
-            log_event(f"[longterm] recalled {len(picked_ids)} memory(ies) via {mode} for query "
+            _ty = f" types={sorted(allow)}" if allow else ""
+            log_event(f"[longterm] recalled {len(picked_ids)} memory(ies) via {mode}{_ty} for query "
                       f"'{query[:60]}':\n{block}", memory_key)
         return block
     except Exception as e:
@@ -374,7 +402,9 @@ def extract_and_remember_from_run(state, memory_key=None) -> int:
             tags = it.get("tags") or []
             if isinstance(tags, str):
                 tags = [t for t in re.split(r"[,，]", tags) if t.strip()]
-            _, action = remember(txt, mtype=str(it.get("type") or "fact"), tags=tags,
+            # type 枚举校验集中在 remember() 唯一写入入口，这里只透传（非枚举值由 remember 回落 fact）
+            mtype = str(it.get("type") or "fact").strip().lower()
+            _, action = remember(txt, mtype=mtype, tags=tags,
                                  importance=it.get("importance", 0.5), memory_key=memory_key)
             if action == "inserted":
                 added += 1

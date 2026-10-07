@@ -11,6 +11,7 @@
 import os
 import json
 import sqlite3
+import uuid
 import logging
 from typing import Optional, Dict
 
@@ -19,7 +20,7 @@ from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage
 
 from state import AgentState
-from supervisor import supervisor
+from supervisor import supervisor, _INJECT_PREFIXES
 from agents import create_nodes
 from planutil import members
 from tools import _run_tool, list_context_snapshots, restore_snapshot
@@ -37,6 +38,9 @@ def run_start(state: dict) -> dict:
     mk = state.get("memory_key") or "default"
     rid = start_run(mk)
     logger.info(f"[run_start] new run log: {run_file(rid)} (memory_key={mk})")
+    # 每次新提交都打一个唯一提交序号，供 supervisor「情况0 接着聊」判定续问
+    # （与平台是否在 messages 末尾注入“对话摘要”完全无关）。
+    submission_id = uuid.uuid4().hex[:12]
     # 跨会话长期记忆召回（“养龙虾”闭环的读取端）：每轮入口按【当前】query（最后一条 HumanMessage）
     # 语义召回 top-k 条长期记忆，写进 state.recalled_memory，供 supervisor 首轮规划与所有子 agent
     # 节点注入。召回失败/为空/功能关闭 → 不写字段，行为与改造前完全一致（零回归）。
@@ -45,13 +49,23 @@ def run_start(state: dict) -> dict:
         _q = ""
         for _m in reversed(list(state.get("messages") or [])):
             if isinstance(_m, HumanMessage):
-                _q = _m.content if isinstance(_m.content, str) else str(_m.content)
+                _c = _m.content if isinstance(_m.content, str) else str(_m.content)
+                # 跳过本系统/平台注入的背景消息（日期上下文 / 跨会话记忆 / 上游摘要 / 线程恢复摘要），
+                # 否则会拿注入背景当 query 去召回，召回质量被拖劣
+                # （2026-10-07 实证：续问 run 的 recall query 竟是系统日期上下文 / 平台对话摘要，
+                #  而非用户真实问题）。
+                if _c.strip().startswith(_INJECT_PREFIXES):
+                    continue
+                _q = _c
                 break
         recalled = recall(_q, memory_key=mk)
     except Exception as e:
         logger.warning(f"[run_start] long-term recall skipped ({e})")
         recalled = ""
-    return {"recalled_memory": recalled} if recalled else {}
+    out = {"_submission_id": submission_id}
+    if recalled:
+        out["recalled_memory"] = recalled
+    return out
 
 
 def build_graph_with_memory():

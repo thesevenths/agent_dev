@@ -20,7 +20,7 @@ from plan import (
     _parse_target_agent, _normalize_plan, _PLAN_GROW_MAX, _render_step_failures,
 )
 from summary import _summarize_observations, _obs_total, _AGENT_SUMMARY_DISABLE
-from planutil import Router, _extract_json_obj, _goal_text, members, _structured_with_retry
+from planutil import Router, _extract_json_obj, _goal_text, members, _structured_with_retry, _parse_target_agent
 from context import _date_context_str
 from llm import supervisor_llm
 
@@ -160,13 +160,178 @@ def _adjudicate_failures(state: dict, plan: list, failed_idx: list, memory_key: 
         return {}
 
 
+# === 同线程“接着聊”支持（2026-10-07 实证修复）===
+# 背景：旧逻辑在 current_step>=len(plan) 时无条件 FINISH，导致同线程续问被完全忽略——
+# 用户首问“分析纳斯达克100”跑完后，再发一条追问，supervisor 只看已完成计划直接收尾，
+# 新消息从未被处理（日志铁证：续问 run 直接打印 “FINISH: all steps ... completed”）。
+# 修复：计划已完成且最后一条消息是一条“新的用户 HumanMessage”（非本系统注入的背景/任务消息）
+# 时，清空旧计划、落到“情况2”按新请求重新规划，保留 messages 历史作为上下文。
+# 判定用的前缀清单：agents.py 给首条用户消息前缀的日期上下文、跨会话记忆注入、上游步骤摘要、
+# 子 agent 任务下发——这些都不是用户真实输入，绝不误判为追问。
+_INJECT_PREFIXES = (
+    "[System context]",       # agents.py 给首条用户消息前缀的日期/时段上下文
+    "[Long-term memory",      # 跨会话长期记忆注入（run_start 召回结果）
+    "[Summary of completed",  # 上游已完成步摘要
+    "Assignment:",            # 子 agent 任务下发（_step_assignment_text）
+    "Here is a summary",      # langgraph dev 线程恢复时注入的“对话摘要”合成消息
+    "Here's a summary",       # 同上（口语化变体）
+    "Here is a summary of the conversation",  # 同上（完整前缀）
+)
+
+
+def _starts_with_inject_prefix(c: str) -> bool:
+    """内容是否以系统/平台注入背景前缀开头（用于识别非用户真实输入）。"""
+    c = (c or "").strip()
+    return any(c.startswith(p) for p in _INJECT_PREFIXES)
+
+
+def _is_new_user_followup(msg) -> bool:
+    """最后一条消息是否是一条“用户新追问”（而非系统注入背景/任务消息）。"""
+    if not isinstance(msg, HumanMessage):
+        return False
+    c = msg.content if isinstance(msg.content, str) else str(msg.content)
+    c = c.strip()
+    if not c:
+        return False
+    return not _starts_with_inject_prefix(c)
+
+
+def _extract_followup_text(messages) -> str:
+    """从线程消息里抽取“用户真实的新追问文本”，用于 LIGHT/FULL 意图分类与轻量微调 step 描述。
+
+    采用「最后一条非工具 AIMessage 之后的第一条非注入用户消息」——即使 langgraph dev 在末尾注入了
+    “对话摘要”合成消息也能跳过它、拿到用户真正的追问（若平台把追问原文作为独立 HumanMessage 附在
+    摘要之前）；若平台把追问合并进摘要（唯一 HumanMessage 就是摘要）则返回空串（调用方回落 FULL 重规划）。
+    """
+    msgs = messages or []
+    last_ai = -1
+    for i, m in enumerate(msgs):
+        if isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
+            last_ai = i
+    window = msgs[last_ai + 1:] if last_ai >= 0 else msgs
+    for m in window:
+        if isinstance(m, HumanMessage):
+            c = m.content if isinstance(m.content, str) else str(m.content)
+            if not _starts_with_inject_prefix(c):
+                return c.strip()
+    # 兜底：后续窗口里找不到非注入用户消息（如平台把追问合并进末尾摘要）→ 返回空串，
+    # 调用方回落为 FULL 整轮重规划（安全，绝不误走 LIGHT 把原任务当微调）。
+    return ""
+
+
+# === 同线程“轻量追加”意图判定（2026-10-07 新增）===
+# 背景：情况0 对“任何新追问”一律整轮全量重规划（一次 LLM 规划调用）。但很多续问只是对上一轮
+# 产物的微调（“换个说法”“再补充一句”“简短点”“详细点”），完全不需要重做整个任务。这类轻量追问
+# 直接路由给“上一轮最后一个执行的 agent”，挂一个单步计划（不会触发再规划 LLM，见 plan._should_replan
+# 对 current<=0 直接跳过），由该 agent 基于 messages 历史里的已有产出直接改写/补一句即可，
+# 省掉整轮重规划开销。判定纯关键词启发式、零 LLM、确定性、可经开关回滚到改造前行为。
+_LIGHT_FOLLOWUP_ON = os.environ.get("AGENT_LIGHT_FOLLOWUP", "1").lower() in ("1", "true", "yes")
+_LIGHT_FOLLOWUP_MAXLEN = int(os.environ.get("AGENT_LIGHT_FOLLOWUP_MAXLEN", "200") or 200)
+# 正向信号：命中即“候选 LIGHT”。覆盖中英文常见微调措辞（加一句/改写/润色/长短/口吻等）。
+_LIGHT_POSITIVE = (
+    "换个说法", "换种说法", "换一种说法", "重新表述", "换种表达", "重新表达", "用更",
+    "再补充", "补充一句", "加一句", "再写一句", "润色", "改写", "措辞", "语气",
+    "口吻", "简短点", "更短一点", "简短文", "太长了", "精简", "详细点", "更详细",
+    "展开说", "换个角度", "换个方式", "换种风格", "重新组织", "重新写", "重新生成一下",
+    "重新措辞", "措辞能不能", "这样写", "换个写法", "换一种表达", "说得通俗", "更口语",
+    "rephrase", "reword", "put it differently", "in other words", "add a sentence",
+    "append", "shorten", "make it shorter", "more concise", "more detail", "rewrite",
+    "word it", "polish", "tone",
+)
+# 负向信号：命中即“强制 FULL 重规划”，绝不走轻量，避免把新任务误判成微调。
+_LIGHT_NEGATIVE = (
+    "现在去", "帮我做", "再做一个", "再分析", "重新分析", "分析一下", "写一份",
+    "写一个新", "生成一份", "生成一个新的", "创建一个", "查一下", "查一查", "搜索",
+    "搜一下", "爬取", "抓取", "对比", "比较", "总结一下", "翻译", "帮我写", "新任务",
+    "换一个主题", "另一个", "新的报告", "再做", "重新来", "换个项目", "重新做",
+    "now go", "analyze", "create a", "write a", "generate a new", "build a",
+)
+
+
+def _classify_followup(text: str) -> str:
+    """把一条新追问分类为 'LIGHT'（轻量微调，挂单步计划路由到上一轮 agent）或
+    'FULL'（新任务/大改，整轮全量重规划）。
+
+    判定顺序（确定性、零 LLM）：
+      1) 总开关关闭 -> FULL（= 改造前行为，零回归）；
+      2) 命中负向信号 -> FULL（新任务优先，绝不误走轻量）；
+      3) 长度超门（默认 200 字）-> FULL（长文几乎都是新任务）；
+      4) 命中正向信号 -> LIGHT；
+      5) 其余 -> FULL（保守默认，宁可多花一次规划也不误判）。
+    """
+    if not _LIGHT_FOLLOWUP_ON:
+        return "FULL"
+    t = (text or "").strip().lower()
+    if not t:
+        return "FULL"
+    if any(k in t for k in _LIGHT_NEGATIVE):
+        return "FULL"
+    if len(t) > _LIGHT_FOLLOWUP_MAXLEN:
+        return "FULL"
+    if any(k in t for k in _LIGHT_POSITIVE):
+        return "LIGHT"
+    return "FULL"
+
+
 def supervisor(state: AgentState) -> Dict[str, Any]:
-    """Supervisor：支持一次性规划 + 多轮顺序执行"""
+    """Supervisor：支持一次性规划 + 多轮顺序执行；同线程可“接着聊”（见上方检测）"""
     try:
         # 让本轮运行的关键日志（含子 agent 内触发的 tavily 检索）落到正确的运行日志文件。
         set_current(state.get("memory_key"))
-        # 情况1：已有执行计划 → 自适应再规划（每步根据上一步结果审视/改写剩余步骤）
+        # 情况0：同线程“接着聊”——计划已完成，且这是一次【新的用户提交】。
+        # 判定用「提交序号」而非「messages[-1] 是否为新用户消息」：langgraph dev 续跑线程时会在
+        # messages 末尾注入“对话摘要”合成消息（"Here is a summary of the conversation to date..."），
+        # 导致 messages[-1] 不可靠。改为比较 run_start 每次提交生成的 _submission_id 与计划创建时
+        # 记录的 _plan_submission_id —— 二者不同即说明是续问，与平台注入无关，稳定。
         plan = state.get("execution_plan") or []
+        if plan and len(plan) > 0 and state.get("current_step", 0) >= len(plan):
+            _sub = state.get("_submission_id")
+            _plan_sub = state.get("_plan_submission_id")
+            # 旧 checkpoint（本修复前）没有 _plan_submission_id 字段（为 None）；
+            # 此时一律视为“新提交”（None 视作与任何新序号都不同），避免旧线程续问仍被误 FINISH。
+            if _sub and _sub != (_plan_sub or ""):
+                mk = state.get("memory_key")
+                _txt = _extract_followup_text(state.get("messages") or [])
+                intent = _classify_followup(_txt) if _txt else "FULL"
+                if intent == "LIGHT":
+                    # 轻量追加：直接路由到上一轮最后一个执行的 agent，挂一个单步计划。
+                    # 该单步计划 current_step=1、len=1，下一轮 supervisor 进入 FINISH 分支，
+                    # 且 plan._should_replan 对 current<=0 直接跳过 —— 全程不触发任何额外规划 LLM。
+                    last_agent = _parse_target_agent(plan[-1]) if plan else "context_engineer_agent"
+                    if last_agent not in members:
+                        last_agent = "context_engineer_agent"
+                    step = {
+                        "title": "按用户追加请求微调上一轮产物",
+                        "description": (
+                            "用户追加请求（轻量微调，不要重新规划整个任务）：\n" + (_txt or "(见对话历史中的最新追问)") +
+                            "\n\n这是对该会话上一轮已完成的答复/产物的微调，不要重做整个任务；"
+                            "直接基于 messages 历史里已有的产出（上一轮的答复/落盘文件）进行改写、"
+                            "补充或润色后回复用户。"
+                        ),
+                        "status": "pending",
+                    }
+                    log_event(
+                        f"[supervisor] 检测到同线程轻量微调追问（LIGHT, 提交 {_sub}≠{_plan_sub}）"
+                        f"-> 路由到 {last_agent}，挂单步计划，跳过全量重规划",
+                        mk,
+                    )
+                    return {
+                        "next": last_agent,
+                        "reason": f"Light follow-up (refine previous output): route to {last_agent} without full re-plan.",
+                        "execution_plan": [step],
+                        "plan_goal": state.get("plan_goal"),
+                        "run_started_at": state.get("run_started_at"),
+                        "current_step": 1,
+                        "_plan_submission_id": _sub,
+                    }
+                # FULL：清空旧计划，落到下方情况2 重新规划（= 原逻辑）
+                log_event(
+                    f"[supervisor] 检测到同线程新追问（提交 {_sub}≠{_plan_sub}）"
+                    f"-> 清空旧计划，按新请求重新规划",
+                    mk,
+                )
+                plan = []   # 落到情况2
+        # 情况1：已有执行计划 → 自适应再规划（每步根据上一步结果审视/改写剩余步骤）
         if plan and len(plan) > 0:
             memory_key = state.get("memory_key")
             ensure_run(memory_key)
@@ -377,6 +542,8 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                     "execution_plan": plan,
                     "plan_goal": goal,
                     "current_step": 1,
+                    # 记录本次规划对应的提交序号，供「情况0 接着聊」判定续问（_submission_id 变化时即为新提交）
+                    "_plan_submission_id": state.get("_submission_id"),
                     # 本次 run 启动时刻（仅在首次规划时写入，随 checkpoint 续命）：
                     # 产物幂等守卫用它区分 tmp/ 里"本次 run 的产物"与历史 run 的同号 step 产物。
                     "run_started_at": state.get("run_started_at") or datetime.now().isoformat(),

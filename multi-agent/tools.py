@@ -93,6 +93,14 @@ except Exception as _db_err:
 Session = sessionmaker(bind=engine)
 session = Session()
 
+# === matplotlib 后端防呆（必须在任何 matplotlib 导入/执行之前生效）===
+# PythonREPL 在 langgraph dev 服务进程的工作线程里执行模型生成的代码；若模型忘了
+# matplotlib.use('Agg') 就 import pyplot（或调了 plt.show()），Windows 默认 TkAgg 后端会
+# 创建 Tk 窗口对象，GC 在非主线程回收时触发 "main thread is not in main loop"，最终
+# "Tcl_AsyncDelete: async handler deleted by the wrong thread" 直接 abort 整个服务进程
+# （2026-10-07 线上 run 中断实证）。MPLBACKEND 环境变量对进程内后续 import 一律生效。
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 repl = PythonREPL()
 
 
