@@ -1,0 +1,136 @@
+# XTX Markets 的 ML 预测方法：具体是怎么做的？
+
+AS_OF: 2026-10-08 23:08（综合检索时间；以下为公开报道/学术/官网信息，非实时行情）
+
+---
+
+## 一、先说结论
+
+XTX Markets 的核心逻辑可以用一句话概括：
+
+> **用大规模算力训练深度学习/基础模型，对 5 万+ 金融工具做价格预测，然后据此自动交易。**
+
+这不是传统高频交易（HFT）"拼速度抢单"的模式，而是**"拼预测精度"**的模式。Gerko 的原话是：
+
+> "Because of the way we use machine learning to build our trading strategies, we have been confident that **we can apply more compute power to ultimately generate better returns**."
+> —— Alex Gerko, Bloomberg 2025-01-22
+
+翻译成大白话：**算力越多 → 模型越好 → 预测越准 → 赚得越多。** 这是一个典型的 "scale law" 思路，和 AI 行业"模型越大越聪明"的逻辑一脉相承。
+
+---
+
+## 二、具体技术架构（基于公开信息）
+
+### 1. 模型类型：深度学习 + 基础模型（Foundation Models）
+
+XTX 的 Research Director、纽约 AI Lab 负责人 **Dr. Zhangyang "Atlas" Wang**（原 UT Austin 副教授）在 2026 年 3 月 Stony Brook 大学的公开演讲中明确说：
+
+> "At XTX Markets, we view algorithmic trading as one of the most compelling real-world frontiers for **deep learning and foundation models**."
+
+这意味着 XTX 不是用简单的线性回归或传统统计模型，而是用**大规模深度学习模型**（很可能是 Transformer 类架构，因为"foundation model"在 2024-2026 年的语境下基本等同于大语言模型/大视觉模型的架构范式）来处理金融时间序列。
+
+### 2. 数据规模
+
+| 维度 | 数据 |
+|------|------|
+| 覆盖工具 | **53,000+** 金融工具（股票、固收、外汇、商品、加密） |
+| 日交易量 | **>$300B**（3000 亿美元） |
+| 存储 | **650 PB**（650 拍字节） |
+| GPU | **25,000+** 张 Nvidia GPU |
+
+### 3. 基础设施：自建数据中心
+
+XTX 没有依赖 AWS/GCP/Azure 等第三方云，而是**自建数据中心**：
+
+- **芬兰 Kajaani**：投资 >€10 亿，建设 **5 座数据中心**（2025 年 1 月 Bloomberg 报道）
+- **冰岛**：WSJ 2026 年 4 月提到 XTX 有一台**地热能源驱动的超算**（与芬兰设施为不同地点/时期）
+
+为什么自建？Gerko 说："By building things ourselves, we can build ahead of our needs."——自建可以**提前规划算力规模**，不被第三方云的限制卡住。
+
+### 4. 执行方式：全自动
+
+Atlas Wang 的演讲摘要中明确：
+
+> "Every day, our systems generate forecasts for tens of thousands of financial instruments and execute over $300B in global trading volume: **fully automated, with no discretionary human intervention**."
+
+即：模型预测 → 自动下单 → 自动执行，**全程无人工干预**。
+
+### 5. 团队构成
+
+XTX 的研究团队不是传统 HFT 的"工程师为主"，而是：
+- **纯数学**（Gerko 本人就是数学博士）
+- **物理学**
+- **计算机科学**
+- **机器学习**
+
+这种组合更接近 AI 实验室（如 OpenAI、DeepMind）的构成，而非传统量化对冲基金。
+
+---
+
+## 三、与传统高频交易（HFT）的核心区别
+
+| 维度 | 传统 HFT | XTX Markets（ML 路线） |
+|------|----------|------------------------|
+| **核心优势** | 速度（低延迟、colocation） | **预测精度**（用算力换 alpha） |
+| **信号来源** | 简单统计/微观结构信号（如订单簿不平衡） | **深度学习/基础模型**对 5 万+ 工具做价格预测 |
+| **算力用途** | 加速执行（FPGA、专用网络） | **训练与推理大规模 ML 模型**（25,000+ GPU） |
+| **基础设施** | 交易所机房 colocation（离撮合引擎越近越好） | **自建数据中心**（芬兰×5 + 冰岛超算） |
+| **团队** | 工程师为主（C++、FPGA、网络优化） | **纯数学/物理/CS/ML 研究员** |
+| **策略逻辑** | 抢在其他人前面成交（速度优势） | **预测价格方向，提前布局**（精度优势） |
+| **华尔街质疑** | — | 数据有限且噪声大，深度学习能否真正预测市场存疑 |
+
+**关键区别**：传统 HFT 是"我知道价格会怎么动，但我比你快"；XTX 是"我比你更准确地预测价格会怎么动"。
+
+---
+
+## 四、面临的挑战（Atlas Wang 公开提及）
+
+XTX 的 ML 方法面临四大挑战：
+
+1. **大规模数据**：5 万+ 工具、650 PB 存储，数据量巨大
+2. **高噪声**：金融市场噪声极大，信噪比远低于图像/文本
+3. **对抗性**：市场参与者会适应你的策略，导致 alpha 衰减
+4. **频繁 regime shift**：市场状态（牛/熊/震荡）频繁切换，模型需要快速适应
+
+---
+
+## 五、关于 Alex Gerko 的背景
+
+### 教育（已证实）
+- **莫斯科国立大学（MSU）**：数学学士 + 硕士 + **数学博士（PhD）**
+- **新经济学院（NES）**：经济学硕士
+- **莫斯科独立大学**：硕士
+- 发表过多篇论文，其中一篇研究"市场择时（market timing）"
+
+### "苏联数学世家"——未证实
+公开英文资料（Wikipedia、LinkedIn、Bloomberg、Lifestyles Magazine）中**未直接出现"数学世家/家族"的明确表述**，仅确认其出生于俄罗斯犹太家庭、自幼热爱数学。该说法可能来自中文媒体转述，**建议引用时标注"未证实"**。
+
+### 公司
+- 2015 年 1 月在伦敦创立，**自融资、零外部融资**
+- 名称"XTX"取自线性代数运算 $X^TX$
+- Gerko 持股约 75%，2026 年身家约 171 亿美元
+- 2022 年利润 11 亿英镑（同比 +64%）
+- 2026 年 4 月分红 30 亿美元（Bloomberg Business Facebook）
+
+---
+
+## 六、信息透明度说明
+
+**XTX 未公开具体模型架构、特征工程、训练流程的技术细节。** 截至检索时间：
+- 无公开技术论文
+- 无技术博客
+- WSJ 2026-04-23 长文（付费墙）仅摘要可见
+- 最接近公开技术细节的渠道：Atlas Wang 在 Stony Brook 的演讲（2026-03-09，仅摘要）
+
+因此，上述技术架构描述是**基于公开信息的合理推断**，非官方确认。
+
+---
+
+## 七、主要来源
+
+1. XTX Markets 官网: https://www.xtxmarkets.com
+2. Stony Brook AI3 Seminar（Atlas Wang, 2026-03-09）: https://ai.stonybrook.edu/news/seminars/algorithmic-trading-large-scale-deep-learning
+3. Bloomberg 2025-01-22（Gerko 访谈）: https://www.bloomberg.com/news/articles/2025-01-22/gerko-s-xtx-to-build-1-billion-data-hub-in-machine-learning-bet
+4. WSJ 2026-04-23（付费墙）: https://www.wsj.com/finance/alex-gerko-xtx-markets-ai-d155626a
+5. Wikipedia — Alex Gerko: https://en.wikipedia.org/wiki/Alex_Gerko
+6. Lifestyles Magazine（2026）: https://lifestylesmagazine.com/latest-news/10-million-new-gift-from-46-year-old-emigre-alex-gerko-boosts-ai-math-raises-his-donations-to-math-education-and-research-to-near-400-million
