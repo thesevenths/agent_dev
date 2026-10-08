@@ -22,6 +22,7 @@ from plan import (
 from summary import _summarize_observations, _obs_total, _AGENT_SUMMARY_DISABLE
 from planutil import Router, _extract_json_obj, _goal_text, members, _structured_with_retry, _parse_target_agent
 from context import _date_context_str
+from compress import _compress_messages
 from llm import supervisor_llm
 
 logger = logging.getLogger(__name__)
@@ -273,6 +274,30 @@ def _classify_followup(text: str) -> str:
     return "FULL"
 
 
+def _classify_supervisor_error(e: Exception) -> str:
+    """把 supervisor 调用后端的异常分类，避免把“上下文超长/参数被拒”一律误报成“后端连不上”。
+
+    返回 'context_overflow' | 'unreachable' | 'other'。纯字符串匹配、零依赖、绝不抛。
+    """
+    try:
+        s = f"{type(e).__name__}: {e}".lower()
+    except Exception:
+        return "other"
+    if any(k in s for k in (
+        "maximum context length", "context_length_exceeded", "input_tokens",
+        "reduce the length of the input", "context length", "too many tokens",
+    )):
+        return "context_overflow"
+    if any(k in s for k in (
+        "connection error", "connectionerror", "connection refused", "connection aborted",
+        "failed to establish", "max retries", "timeout", "timed out", "read timed out",
+        "getaddrinfo", "name or service not known", "could not connect", "unreachable",
+        "ssl", "502 bad gateway", "503 service", "504 gateway", "peer closed connection",
+    )):
+        return "unreachable"
+    return "other"
+
+
 def supervisor(state: AgentState) -> Dict[str, Any]:
     """Supervisor：支持一次性规划 + 多轮顺序执行；同线程可“接着聊”（见上方检测）"""
     try:
@@ -501,7 +526,14 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
             system_msg = SystemMessage(content=supervisor_system_prompt.replace(
                 "{members}", ", ".join(members)
             ) + "\n\n" + _date_context_str())
-            messages = [system_msg] + state["messages"]
+            # 关键：给 supervisor 首轮规划也套上与子 agent 同一道防溢出保险 _compress_messages。
+            # 之前这里把整条线程 state["messages"]（跨很多轮累加、被 checkpoint 持久化）原样塞进一个
+            # prompt，长线程会把输入顶到模型上限（实证 2026-10-08：262145 > 262144 → vLLM 回 400）。
+            # 规划只需「目标 + 最近几轮 + 摘要」，不需全量原始历史；_compress_messages 保首条用户 query
+            # + 最近若干条，并对超长 Tool/AI 消息做语义提炼（时间/地点/人物/事件/ID/IP/路径/数值等核心
+            # 要素一律保留，见 compress._CONDENSE_PROMPT），既防溢出又不丢要点。
+            _hist = _compress_messages(state["messages"])
+            messages = [system_msg] + _hist
             # 跨会话长期记忆注入（首轮规划）：把入口召回的用户背景插在 system 之后、本轮请求之前，
             # 让“计划”本身就贴合用户画像/偏好（如中文报告、金融口径）。为空则不加，零回归。
             _recalled = state.get("recalled_memory") or ""
@@ -510,7 +542,7 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                              HumanMessage(content=("[Long-term memory about the USER, recalled from past "
                                                    "sessions — personalize the plan accordingly; this is "
                                                    "BACKGROUND, not the task]\n" + _recalled))]
-                            + list(state["messages"]))
+                            + _hist)
 
             # 优先结构化输出；本地 vLLM 对 TypedDict 结构化输出支持不稳定 → 先带错误重试，
             # 全败才回落裸调用+手动抽 JSON（鲁棒性#3）。
@@ -574,19 +606,42 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Supervisor error: {e}")
         ec = state.get("error_count", 0) + 1
-        # 后端（vLLM）不可达时，supervisor 自身无法完成规划；若按旧逻辑盲目路由到
-        # context_engineer_agent（它同样依赖该后端去调用 LLM），二者会反复横跳、永不终止，
-        # 并持续对已经不堪重负的后端发起连接、形成正反馈。故直接终止并给出可操作提示。
-        return {
-            "next": "FINISH",
-            "reason": f"Supervisor failed ({e}); backend LLM unreachable, stopping to avoid infinite loop.",
-            "error_count": ec,
-            "messages": [AIMessage(content=(
+        # 分类归因：避免把“上下文超长/参数被拒”一律误报成“后端连不上”（实证 2026-10-08 那次 400
+        # 是输入 token 超模型上限，后端其实在线）。三类各给准确、可操作的提示。若真·不可达，
+        # 绝不能盲目路由到同样依赖该后端的子 agent，否则反复横跳、对过载后端形成正反馈 → 直接收尾。
+        kind = _classify_supervisor_error(e)
+        if kind == "context_overflow":
+            reason = f"Supervisor failed: context length exceeded ({e}); backend reachable, input too long."
+            detail = (
+                "⚠️ 上下文超长：后端模型在线，但本次请求的输入 token 超过了模型上限，被以 400 拒绝"
+                "（这不是连不上）。\n"
+                f"底层错误：{e}\n\n"
+                "处理方向：\n"
+                "1. 这条线程历史太长（messages 跨很多轮累加）——最省事：点顶部 + 新开一个 thread 再继续。\n"
+                "2. 单条工具/文件内容过大——让相关 agent 把大产物落盘到 tmp/，只回传路径而非全文。\n"
+                "3. supervisor 首轮规划已接入 _compress_messages 防溢出；若仍触发，多为单条消息本身超限，"
+                "可调低 AGENT_CTX_TOOL_CHARS / AGENT_CTX_AI_CHARS 或缩小单次读取范围。"
+            )
+        elif kind == "unreachable":
+            reason = f"Supervisor failed ({e}); backend LLM unreachable, stopping to avoid infinite loop."
+            detail = (
                 "⚠️ 调度器（supervisor）无法连接后端模型服务，已停止本次任务以避免死循环。\n"
                 f"底层错误：{e}\n\n"
                 "排查方向（修复后端后重新提交即可）：\n"
                 "1. 在 .env 的 LLM_BASE_URL 配置的 vLLM 服务是否在线/已崩溃（这是最常见原因）。\n"
                 "2. 网络是否通畅；当前 LLM_VERIFY_SSL=false 已跳过证书校验，连不上多为地址或网络问题。\n"
                 "3. vLLM 是否过载被拒连——并发过高时也会批量 Connection error，稍后重试或扩容。"
-            ))],
+            )
+        else:
+            reason = f"Supervisor failed ({e}); stopping to avoid infinite loop."
+            detail = (
+                "⚠️ 调度器（supervisor）调用后端模型失败，已停止本次任务以避免死循环。\n"
+                f"底层错误：{e}\n\n"
+                "排查方向：确认后端在线、模型名/参数正确、请求未超出上下文上限；修复后重新提交即可。"
+            )
+        return {
+            "next": "FINISH",
+            "reason": reason,
+            "error_count": ec,
+            "messages": [AIMessage(content=detail)],
         }
