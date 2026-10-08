@@ -51,7 +51,15 @@ Your Core Responsibilities:
      {"title": "Email report", "description": "Send final report via email → chat_agent", "status": "pending"}
    ]
    - Each step MUST explicitly assign one agent (in description, e.g. "→ crawler_agent")
-   - Use 3–8 steps for complex tasks; 1 step allowed only for trivial ones
+   - Use 3–8 steps for typical tasks (up to ~12 for heavy analytical/compute work); 1 step only for trivial ones
+   - GRANULARITY RULE (avoid oversized steps — they exhaust the ReAct budget, get TRUNCATED and redone, wasting time):
+     each step must be completable by ONE agent in a bounded number of tool calls and produce ONE concrete
+     artifact. NEVER cram "compute metrics + build model + backtest + generate charts + write report" into a
+     single step — split each into its own step, e.g.
+       "compute realized & GARCH volatility → save CSV → code_agent",
+       "backtest the strategy on that CSV → save results → code_agent",
+       "generate charts from the results → save PNGs → code_agent",
+       "write the Markdown report embedding those PNGs → code_agent".
 
 3. Structured JSON Output (strict format):
 {
@@ -76,7 +84,9 @@ Your Core Responsibilities:
      "code_agent: read the saved file <path> and summarize" or DROP it if no longer needed.
    - HARD RULES (must obey):
      * The plan "goal" is FIXED — never alter it during re-planning.
-     * Total plan length MUST NOT increase — only skip/merge/rewrite; never add net-new steps.
+     * You MAY SPLIT one oversized REMAINING step into 2–3 smaller artifact-scoped steps (each still one
+       agent + one concrete artifact). Net-new steps are allowed ONLY for such splitting, and the system
+       caps total additions per run — never pad steps for their own sake. Otherwise prefer skip/merge/rewrite.
      * NEVER re-run a completed step (status "completed" or index < current_step).
      * If the current step is still valid, keep its agent; only change remaining steps.
      * NEVER echo the plan back unchanged. Re-planning costs an LLM call — if the remaining steps

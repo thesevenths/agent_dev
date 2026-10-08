@@ -50,10 +50,12 @@ _REPLAN_OBS_WINDOW = int(os.environ.get("AGENT_REPLAN_OBS_WINDOW", "20") or 0)
 # 于是"文件写了但内容为空/不是约定结构"这种静默降级完全不会被发现。
 _REPLAN_ARTIFACT_CHECK = os.environ.get("AGENT_REPLAN_ARTIFACT_CHECK", "1").lower() in ("1", "true", "yes")
 _REPLAN_ARTIFACT_MAX = int(os.environ.get("AGENT_REPLAN_ARTIFACT_MAX", "3") or 3)
-# 计划长度增长上限（E2「重做载体」）：整个 run 内允许 execution_plan 净增的最大步数。
-# 0 = 恢复原「只减不增」语义（零回归）。默认 1：只允许追加一步，专用于「retry of step N」。
-# 为什么不是放开：放开会让模型无限追加步骤（历史上出现过步数膨胀烧钱），必须硬上限。
-_PLAN_GROW_MAX = int(os.environ.get("AGENT_PLAN_GROW_MAX", "1") or 0)
+# 计划长度增长上限（E2「重做载体」+ E3「就地分裂大步」）：整个 run 内允许 execution_plan 净增的最大步数。
+# 0 = 恢复原「只减不增」语义（零回归）。用途有两类：(a) 追加一步「retry of step N」重做失败步；
+# (b) 再规划时把一个过大的剩余步就地分裂成 2-3 个「一 agent 一产物」的小步（消 code_agent 预算触顶）。
+# 为什么不是完全放开：放开会让模型无限追加步骤（历史上出现过步数膨胀烧钱），必须保留硬上限；
+# 分裂一次净增 1-2 步，默认 4 足够覆盖整轮里少数几次真实分裂，又不至于失控。可用 AGENT_PLAN_GROW_MAX 覆盖。
+_PLAN_GROW_MAX = int(os.environ.get("AGENT_PLAN_GROW_MAX", "4") or 0)
 
 
 def _mark_progress(plan: list, current: int) -> list:
@@ -258,8 +260,11 @@ def _replan_tail(state: dict, plan: list, current: int, summary_ctx: str | None 
         "Do NOT echo the plan back."
     ).format(n=current) if is_last else (
         "Decide the agent for the CURRENT step, then revise ONLY the REMAINING steps (index > current) "
-        "based on what actually happened. You may skip/merge/rewrite remaining steps, but you MUST: "
-        "1) keep the goal unchanged; 2) NOT increase total plan length; 3) NOT re-run completed steps; "
+        "based on what actually happened. You may skip/merge/rewrite remaining steps, and you MUST: "
+        "1) keep the goal unchanged; 2) you MAY SPLIT one oversized remaining step into 2-3 smaller "
+        "artifact-scoped steps (each = one agent + one concrete artifact) — net-new steps are allowed ONLY "
+        "for such splitting and are hard-capped by the system per run, so NEVER pad steps for their own sake "
+        "(otherwise prefer skip/merge/rewrite, which do not grow the plan); 3) NOT re-run completed steps; "
         "4) keep each remaining step's 'status' as 'pending' (completed steps are already marked).\n"
         # 关键补充：以前模型只知道"某步 failed"，改写出来的一句话常常是"重新执行：…"，
         # 既没说清根因也没给出任何新约束 → 下游必然再撞同一个坑（如再撞一次 ReAct 步数上限）。
@@ -356,7 +361,7 @@ def _replan_tail(state: dict, plan: list, current: int, summary_ctx: str | None 
                 logger.info(
                     f"[replan] plan grew by {len(new_plan) - len(plan)} step(s) "
                     f"(plan_grown={_grown}, cap=+{max(0, _PLAN_GROW_MAX - _grown)}) "
-                    f"— expected use: appending a 'retry of step N' step"
+                    f"— expected use: splitting an oversized step or appending a 'retry of step N' step"
                 )
     # 其余情形（模型未给计划 / 给了比 current 更短的计划却仍要跑 agent）→ 保留原尾部，避免出现
     # "plan 比 current_step 还短"导致 supervisor 索引越界。
