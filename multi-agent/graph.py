@@ -10,9 +10,12 @@
 """
 import os
 import json
+import time
 import sqlite3
 import uuid
 import logging
+import functools
+from datetime import datetime
 from typing import Optional, Dict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -24,9 +27,43 @@ from supervisor import supervisor, _INJECT_PREFIXES
 from agents import create_nodes
 from planutil import members
 from tools import _run_tool, list_context_snapshots, restore_snapshot
-from runlog import start_run, run_file, get_run_id
+from runlog import start_run, run_file, get_run_id, log_event, record_timing
 
 logger = logging.getLogger(__name__)
+
+
+# === 节点耗时计时（定位“每次提问等很久”到底卡在哪一步）===
+# 纯观测性副作用：不改动节点返回值/异常行为（异常原样抛出，零回归）；
+# 受 AGENT_TIMING 开关控制（默认开启，设 0/false 整体关闭）。
+# 仅记录“节点级”耗时；若要 LLM/工具级更细耗时，另接 LangSmith
+# （LANGCHAIN_TRACING_V2=true，config.py 已备 LANGSMITH_API_KEY）。
+def _timing_enabled() -> bool:
+    return os.environ.get("AGENT_TIMING", "1").lower() in ("1", "true", "yes", "on")
+
+
+def with_timing(name: str):
+    """包裹一个图节点函数：进入/离开时向【当前 run 日志】与控制台写带时间戳+耗时。"""
+    def deco(func):
+        @functools.wraps(func)
+        def wrapper(state, *a, **kw):
+            if not _timing_enabled():
+                return func(state, *a, **kw)
+            t0 = time.perf_counter()
+            t0_iso = datetime.now().isoformat(timespec="milliseconds")
+            # START 行：run_start 自身尚未 mint run_id，为避免误建空日志，
+            # 仅当已有活跃 run 时才写进 run 日志；控制台 logger 始终打，便于实时观察。
+            logger.info(f"[timing] ▶ {name} start @ {t0_iso}")
+            if get_run_id():
+                log_event(f"[timing] ▶ {name} start @ {t0_iso}")
+            try:
+                return func(state, *a, **kw)
+            finally:
+                dt = time.perf_counter() - t0
+                logger.info(f"[timing] ■ {name} end   +{dt:.2f}s")
+                log_event(f"[timing] ■ {name} end   +{dt:.2f}s (run={get_run_id()})")
+                record_timing(name, dt)
+        return wrapper
+    return deco
 
 
 def run_start(state: dict) -> dict:
@@ -83,12 +120,14 @@ def build_graph_with_memory():
     memory = None
     workflow = StateGraph(AgentState)
 
-    # 添加节点
-    workflow.add_node("run_start", run_start)
-    workflow.add_node("supervisor", supervisor)
+    # 添加节点（包一层耗时计时：进入/离开节点写带时间戳+耗时到 run 日志，
+    # 用于定位“每次提问等很久”到底卡在 LLM 规划、子 agent 还是某步工具调用）。
+    # AGENT_TIMING=0 可整体关闭（零回归）。
+    workflow.add_node("run_start", with_timing("run_start")(run_start))
+    workflow.add_node("supervisor", with_timing("supervisor")(supervisor))
     nodes = create_nodes()
     for member in members:
-        workflow.add_node(member, nodes[member])
+        workflow.add_node(member, with_timing(member)(nodes[member]))
 
     # 边：Agent → Supervisor
     for member in members:

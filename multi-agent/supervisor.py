@@ -14,7 +14,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from prompt import supervisor_system_prompt
 from state import AgentState
-from runlog import set_current, ensure_run, log_event, run_file, get_run_id
+from runlog import set_current, ensure_run, log_event, run_file, get_run_id, flush_timing_summary
 from plan import (
     _should_replan, _replan_tail, _mark_progress, _plan_view,
     _parse_target_agent, _normalize_plan, _PLAN_GROW_MAX, _render_step_failures,
@@ -386,6 +386,9 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                     + f"\n{_plan_view(final_plan)}",
                     memory_key,
                 )
+                # 本 run 结束：把节点耗时汇总（按节点聚合 + top-N 最慢）写进 run 日志，
+                # 一眼定位瓶颈，无需手动 grep。
+                flush_timing_summary()
                 # 长期记忆抽取（写入端）：本轮真正结束，用 1 次 LLM 蒸馏跨会话记忆入库。
                 _extract_longterm(state, memory_key)
                 return {
@@ -474,6 +477,8 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                         f"{_plan_view(final_plan)}",
                         memory_key,
                     )
+                    # 早停同样是一次 run 结束：flush 本 run 耗时汇总。
+                    flush_timing_summary()
                     # 长期记忆抽取（写入端）：早停同样是一次 run 结束，蒸馏跨会话记忆入库。
                     _extract_longterm(state, memory_key)
                     return {
@@ -639,6 +644,11 @@ def supervisor(state: AgentState) -> Dict[str, Any]:
                 f"底层错误：{e}\n\n"
                 "排查方向：确认后端在线、模型名/参数正确、请求未超出上下文上限；修复后重新提交即可。"
             )
+        # 异常兜底分支也 flush 本 run 已累计的节点耗时（run 至此结束）。
+        try:
+            flush_timing_summary()
+        except Exception:
+            pass
         return {
             "next": "FINISH",
             "reason": reason,

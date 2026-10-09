@@ -26,6 +26,7 @@ Usage:
     log_event("some important event")   # append to the CURRENT run's file
 """
 import logging
+import os
 import re
 import uuid
 from datetime import datetime
@@ -154,3 +155,55 @@ def write_summary(memory_key, text: str):
             f.write(str(text))
     except Exception:
         pass
+
+
+# === 节点耗时累计（按 run_id 隔离，供 graph.with_timing 投递、supervisor FINISH 汇总）===
+# 设计：with_timing 每次节点结束投递 (node, seconds)；supervisor 在 FINISH 分支调
+# flush_timing_summary() 把本 run 的「按节点聚合 + top-N 单次最慢」写进 run 日志，
+# 定位“哪一步最慢”。按 run_id 隔离，并发/续跑/多提交不串。
+_timings: dict[str, list[tuple[str, float]]] = {}
+
+
+def record_timing(node: str, seconds: float):
+    """节点结束投递一次耗时（仅在已有活跃 run 时记录，避免误建空日志）。"""
+    rid = _current_run_id
+    if not rid:
+        return
+    _timings.setdefault(rid, []).append((node, float(seconds)))
+
+
+def _timing_topn() -> int:
+    try:
+        return max(1, int(os.environ.get("AGENT_TIMING_TOPN", "10")))
+    except Exception:
+        return 10
+
+
+def timing_summary(top_n: int | None = None) -> str:
+    """生成本 run 的耗时汇总文本（按节点聚合 + top-N 单次最慢）。不写文件，返回字符串。"""
+    rid = _current_run_id
+    rows = _timings.get(rid) if rid else None
+    if not rows:
+        return ""
+    n = top_n if top_n is not None else _timing_topn()
+    # 聚合：节点 -> (count, total, max)
+    agg: dict[str, tuple[int, float, float]] = {}
+    for node, dt in rows:
+        c, tot, mx = agg.get(node, (0, 0.0, 0.0))
+        agg[node] = (c + 1, tot + dt, max(mx, dt))
+    lines = ["=== 本 run 节点耗时汇总（按节点聚合，total 降序）==="]
+    for node, (c, tot, mx) in sorted(agg.items(), key=lambda kv: kv[1][1], reverse=True):
+        avg = tot / c if c else 0.0
+        lines.append(f"  {node:24s} count={c:3d}  total={tot:8.2f}s  avg={avg:7.2f}s  max={mx:8.2f}s")
+    lines.append("")
+    lines.append(f"=== Top-{n} 单次最慢步骤（按耗时降序）===")
+    for i, (node, dt) in enumerate(sorted(rows, key=lambda x: x[1], reverse=True)[:n], 1):
+        lines.append(f"  {i:2d}. {node:24s} {dt:8.2f}s")
+    return "\n".join(lines)
+
+
+def flush_timing_summary(top_n: int | None = None):
+    """把本 run 耗时汇总写进 run 日志（仅当有数据时）。"""
+    txt = timing_summary(top_n=top_n)
+    if txt:
+        log_event(txt)
