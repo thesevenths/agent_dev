@@ -654,7 +654,7 @@ def create_resilient_node(agent):
                     state["snapshot_id"] = snapshot_id
                     logger.info(f"Snapshot saved: {snapshot_id}")
 
-                # 累积 observations：本轮新生成的 ToolMessage + 最终 AIMessage（对应 demo 的 state["observations"]）
+                # 累积 observations：本轮新生成的 ToolMessage + 最终 AIMessage（语义同 LangGraph 单智能体示例的 observations）
                 # 供 supervisor 再规划时作为"已完成步的真实产出"上下文，避免只看单条文本。
                 prev_obs = list(state.get("observations", []) or [])
                 new_obs = list(result.get("messages", [])) if isinstance(result, dict) else []

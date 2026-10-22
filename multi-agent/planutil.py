@@ -149,7 +149,7 @@ def _latest_result_text(state: dict) -> str:
 def _build_replan_context(state: dict) -> str:
     """再规划上下文：优先用 observations（每步 ToolMessage + 总结 AIMessage），无则回落最近 messages。
 
-    对应 single-agent demo 的 update_planner_node 喂 state["observations"] 的做法——比只看
+    对应 LangGraph 单智能体示例中 update_planner_node 传入 state["observations"] 的做法——比只看
     "上一步单条文本"更完整，supervisor 能真正看到 crawler 只回了文本、数据落在文件里，
     从而正确改写后续 code 步。
     """

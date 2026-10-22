@@ -24,10 +24,10 @@ class AgentState(TypedDict):
     snapshot_id: str | None  # 当前快照 ID
     memory_key: str  # 对话线程 ID
     hallucination_check: bool | None  # 幻觉检查标志
-    # 结构化执行计划（每步带 status；对应 demo 的 Plan.steps）
+    # 结构化执行计划（每步带 status；对应计划对象的 steps 字段）
     execution_plan: Optional[List[PlanStep]]
-    plan_goal: Optional[str]  # 计划目标；再规划时永不改变（对应 demo 的 plan.goal）
-    observations: List  # 每步 ToolMessage + 总结 AIMessage 累积，作为再规划上下文（对应 demo 的 state["observations"]）
+    plan_goal: Optional[str]  # 计划目标；再规划时永不改变（对应计划对象的 goal 字段）
+    observations: List  # 每步 ToolMessage + 总结 AIMessage 累积，作为再规划上下文（对应计划对象的 observations 字段）
     current_step: int
     artifacts: List[str]  # 每步落盘的产物文件路径（tmp/ 下），作为 agent 间 handoff 的可靠通道
     plan_summary: Optional[str]  # 已完成步的"要点清单"语义摘要（_summarize_observations 生成），作为下游 agent 的跨步上下文

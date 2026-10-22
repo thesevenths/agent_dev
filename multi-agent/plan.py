@@ -221,10 +221,10 @@ def _replan_evidence(state: dict, plan: list, current: int) -> tuple:
 def _replan_tail(state: dict, plan: list, current: int, summary_ctx: str | None = None):
     """调用 LLM 审视并改写剩余步骤。返回 (current_agent, new_plan, finish_reason|None)。
 
-    借鉴 single-agent demo 的 update_planner：
+    参考 LangGraph 单智能体示例的 update_planner 设计：
     - plan 为结构化步骤（含 status），只重写"未完成"的尾部（index > current），
       已完成步（index < current）保留并标记为 completed；
-    - plan_goal 永不改变（对应 demo "don't change the goal"）；
+    - plan_goal 永不改变（对应 "don't change the goal" 原则）；
     - 再规划上下文优先用跨步语义摘要 summary_ctx（_summarize_observations 提炼的要点清单，
       比原始 observations 更准更省 token）；摘要缺失时回落 _build_replan_context（原始 observations）。
 
