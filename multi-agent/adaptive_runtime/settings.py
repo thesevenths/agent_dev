@@ -135,6 +135,15 @@ class Settings:
     #: cand 计划步数 / base 计划步数 低于此比例，且 A 反而上升 → 判「靠削减计划提分」
     plan_undercut_ratio: float = field(default_factory=lambda: _env_float("ADAPTIVE_PLAN_UNDERCUT", 0.6, 0.0, 1.0))
 
+    # ---- 质量缺陷通道（诊断层的第二条信号来源）----
+    #: 证据率低于此值 → 产出 EVIDENCE_FAILURE。诊断层若只看「跑崩」，
+    #: 就永远发现不了「跑完了但每个数字都没来源」这类质量缺陷 —— 而后者往往是 Q 最大失分项。
+    evidence_floor: float = field(default_factory=lambda: _env_float("ADAPTIVE_EVIDENCE_FLOOR", 0.30, 0.0, 1.0))
+    #: 完整性低于此值 → 产出 COMPLETENESS_FAILURE。
+    completeness_floor: float = field(default_factory=lambda: _env_float("ADAPTIVE_COMPLETENESS_FLOOR", 0.70, 0.0, 1.0))
+    #: 关键数字总数低于此值时不判证据缺陷（样本太少，E 的方差不可信）。
+    evidence_min_claims: int = field(default_factory=lambda: _env_int("ADAPTIVE_EVIDENCE_MIN_CLAIMS", 8, 0, 100000))
+
     # ---- 统计 ----
     n_default: int = field(default_factory=lambda: _env_int("ADAPTIVE_N", 8, 1, 200))
     #: 做 t 检验所需的最少**不同任务**数。低于它只能判「证据不足」，不能判「有效」。

@@ -3,7 +3,7 @@
 > 本文回答两个问题：
 > (1) 三层演化能力（L1 / L2 / L3）为何按阶段启用，而非一次性全部打开；
 > (2) 依据什么判定该闭环确实提升了任务质量，而不只是把代码跑通。
-> 所有数字均来自本仓库实测；不可验证的部分在 §7 明确列出。
+> 所有数字均来自本仓库实测；不可验证的部分在 §8 明确列出。
 
 ---
 
@@ -101,7 +101,7 @@ python -m adaptive_runtime.run_adaptive benchmark --fake --case good --rounds 3 
 holdout 平稳（drift=+0.00），未 promote 期间无泄漏或漂移
 ```
 
-模拟模式仅用于验证管线连通性，其数值不构成有效性证据（见 §6）。
+模拟模式仅用于验证管线连通性，其数值不构成有效性证据（见 §7）。
 
 ### 3.4 第三层的真实成本（实测）
 
@@ -218,7 +218,65 @@ REJECT(incomplete_evidence) @ min_tasks     n_tasks=1, need=2
 
 ---
 
-## 6. 一次数据污染事件与修复
+---
+
+## 6. 诊断层的质量缺陷通道（缺陷修复记录）
+
+### 6.1 被发现的盲区
+
+诊断层原有信号只有硬失败：`kind=recursion / truncated / exception`，
+外加 gate 反复 reject 与 replan 空转。这带来一个结构性盲区：
+
+> 一次「每步都 PASS、正常收尾、报告已落盘」的 run，会被判成 `UNKNOWN / 无失败信号`。
+
+而 §5.1 的实测数据说明最大失分项恰恰在此：A 与 C 已接近满分，
+27 分差距全部落在 E（268 个关键数字仅 27 个带来源）。只看硬失败，
+闭环会认为这批 run 无改进空间，因此永远不会提出「给数字加来源」这类候选。
+
+修复方式：新增 `Taxonomy.QUALITY` 两类（以框架无关的通用字段判定，不绑定业务域）—
+
+| 类别 | 判定字段 | 含义 |
+|---|---|---|
+| `EVIDENCE_FAILURE` | `Score.E` < `evidence_floor` | 成品中的量化断言缺来源 |
+| `COMPLETENESS_FAILURE` | `Score.C` < `completeness_floor` | 计划产物缺失 / 截断 / 兜底 |
+
+`classify()` 增加可选 `score` 参数；不传时行为与首版完全一致，保证历史产物可复现。
+同时 `proposer` 中 `prompt.py::coder.require-sources` 改映射到 `EVIDENCE_FAILURE`
+——此前它挂在 `REVIEW_FAILURE` 下，而诊断永远不会因 E 低产出该类别，
+**这条补丁实际上从未被闭环自动触发过**。
+
+### 6.2 修复过程中踩到的两个坑
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | 复盘历史日志时报出「完整性 0.50」缺陷 | 日志还在、产物已被外部清理；E 按 live 语义记 0，被误当成「质量差」 | 统一前提：仅当 `detail["report"]` 存在（确实读到成品文本）时才判质量缺陷 |
+| 2 | 单元测试 18/18 全绿，功能实际却不生效 | 测试 helper 自行塞了 `evidence.available` 键，而 `evaluator.evidence_rate` 的真实产出里**没有**这个键，于是 `available is True` 恒为假 | 改用真实 `score_trace` 输出驱动诊断断言 |
+
+第 2 条值得单独记一笔：**测试通过与功能生效是两回事**。
+若断言所依赖的数据结构由测试自己构造，则实现与真实产出脱节时测试不会变红。
+此后凡断言「某类输入应产出某种 Finding」的用例，一律从 `score_trace`
+的真实输出出发（见 `TestEndToEndWithRealScorer`）。
+
+### 6.3 端到端实证
+
+同一份任务、全程无硬失败，唯一差别是报告里的数字是否带来源：
+
+| 场景 | Q | A | E | C | 关键数字 | 主导失败模式 |
+|---|---|---|---|---|---|---|
+| A 数字无来源 | 67.50 | 1.000 | 0.000 | 0.875 | 56 个，带来源 0 | `EVIDENCE_FAILURE` |
+| B 同一报告补来源 | 93.21 | 1.000 | 0.857 | 0.875 | 56 个，带来源 48 | `UNKNOWN`（无改进信号）|
+
+A 被自主定位后，提案器生成的首个候选为 `prompt.py::coder.require-sources →on`，
+假设原文为「真实 run 的 E 只有 0.10（268 个关键数字仅 27 个带来源），
+证据率是 Q 的最大失分项」。
+
+**这构成「agent 如何得知改进方向」的完整链路：
+确定性打分 → 质量缺陷归类 → 路由至对应候选。**
+全过程不依赖 LLM 自评，因此不会出现「模型学会自我证成」的退化路径。
+
+---
+
+## 7. 一次数据污染事件与修复
 
 执行模拟 benchmark 后，`status` 显示 **accepted 7 / 经验 7 条**，全部由模拟轨迹产生（ΔQ 恒为 +38.1）。后果是：真实轮次中 `Ledger.is_duplicate` 会将这些假设视为「已尝试」而**跳过**，经验库也会把无效结论检索进 Task Harness，系统将携带无效记忆继续运行且无任何提示。
 
@@ -228,7 +286,7 @@ REJECT(incomplete_evidence) @ min_tasks     n_tasks=1, need=2
 
 ---
 
-## 7. 证据边界
+## 8. 证据边界
 
 | 项目 | 现状 | 原因 |
 |---|---|---|
@@ -249,7 +307,7 @@ REJECT(incomplete_evidence) @ min_tasks     n_tasks=1, need=2
 
 ---
 
-## 8. 复现命令
+## 9. 复现命令
 
 ```bash
 python -m adaptive_runtime.run_adaptive selftest          # 9/9，含阴性 / 阳性对照
@@ -257,5 +315,5 @@ python -m adaptive_runtime.run_adaptive verify            # 生产文件零改�
 python -m adaptive_runtime.run_adaptive status            # 阈值 + Base + 台账 + 演化状态
 python -m adaptive_runtime.run_adaptive calibrate         # 噪声标定 → calibration.json
 python -m adaptive_runtime.run_adaptive benchmark --rounds 3 --n 4 --limit 12 --holdout 0.3
-python -m unittest discover -s adaptive_runtime/tests -t . # 165 tests
+python -m unittest discover -s adaptive_runtime/tests -t . # 184 tests
 ```

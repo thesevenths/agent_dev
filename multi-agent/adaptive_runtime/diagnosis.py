@@ -1,29 +1,58 @@
 """诊断层：把 trace 映射成失败模式（taxonomy 必须被「可判定字段」约束）。
 
-现状：历史日志里只有三类可判信号 —— ``kind=recursion / truncated / exception``
-（95 条 run 共 36 次 step-failure，其中 recursion 28 次占 78%）。
-因此首版只启用 5 类，其余一律 ``UNKNOWN`` 并统计占比：
-    UNKNOWN > 40% → 停止加类别，先补埋点。
+设计约束
+--------
+taxonomy 的每一类都必须能被**确定性字段**判定，不允许 LLM 自评。
+原因：如果「对不对」由模型自己说，那么闭环会退化成自我证成——
+模型学会的不是把任务做对，而是把自我描述写得像做对了。
+
+两条信号通道
+------------
+1. **硬失败通道**（run 没跑完）：``kind=recursion / truncated / exception``
+   —— 来自 ``[step-failure]`` 行，以及 gate 反复 reject / replan 空转。
+   历史基线：95 条 run 共 36 次 step-failure，其中 recursion 28 次占 78%。
+2. **质量缺陷通道**（run 跑完了，但产出不达标）：证据率、完整性。
+   这条通道是必需的，因为最大的失分项往往不在「崩没崩」——
+   实测一组成熟 run 的 A/C 已接近满分，27 分差距全部落在 E
+   （268 个关键数字仅 27 个带来源）。只看硬失败，闭环永远发现不了它。
+
+其余一律 ``UNKNOWN`` 并统计占比：UNKNOWN > 40% → 停止加类别，先补埋点。
 """
 from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, asdict, field
+from typing import TYPE_CHECKING
 
 from .settings import CFG, Settings
 from .trace_export import Trace
 
+if TYPE_CHECKING:  # 仅用于类型标注，避免与 evaluator 形成运行期依赖
+    from .evaluator import Score
+
 
 class Taxonomy:
+    # ---- 硬失败通道：执行没走完 ----
     COMPLETION_FAILURE = "COMPLETION_FAILURE"   # 预算耗尽/截断，但产物已落盘
     EXECUTION_FAILURE = "EXECUTION_FAILURE"     # 预算耗尽/截断，且无产物
     REVIEW_FAILURE = "REVIEW_FAILURE"           # gate 反复拒绝
     PLANNING_FAILURE = "PLANNING_FAILURE"       # replan 空转
     TOOL_USAGE_FAILURE = "TOOL_USAGE_FAILURE"   # 工具异常
+
+    # ---- 质量缺陷通道：执行走完了，但产出不达标 ----
+    #: 产物中的量化断言缺来源。跨项目通用：任何产出「报告 / 分析 / 结论」的
+    #: 任务都受此约束，与具体业务域无关。
+    EVIDENCE_FAILURE = "EVIDENCE_FAILURE"
+    #: 计划产物缺失、截断或兜底，导致 C 低于阈值。
+    COMPLETENESS_FAILURE = "COMPLETENESS_FAILURE"
+
     UNKNOWN = "UNKNOWN"
 
-    ALL = (COMPLETION_FAILURE, EXECUTION_FAILURE, REVIEW_FAILURE,
-           PLANNING_FAILURE, TOOL_USAGE_FAILURE, UNKNOWN)
+    HARD = (COMPLETION_FAILURE, EXECUTION_FAILURE, REVIEW_FAILURE,
+            PLANNING_FAILURE, TOOL_USAGE_FAILURE)
+    QUALITY = (EVIDENCE_FAILURE, COMPLETENESS_FAILURE)
+
+    ALL = HARD + QUALITY + (UNKNOWN,)
 
 
 @dataclass
@@ -44,7 +73,13 @@ class Finding:
         return d
 
 
-def classify(trace: Trace, cfg: Settings | None = None) -> list[Finding]:
+def classify(trace: Trace, cfg: Settings | None = None,
+             score: "Score | None" = None) -> list[Finding]:
+    """把一次 run 的 trace（可选地带上评分）映射为失败模式列表。
+
+    ``score`` 传入时启用质量缺陷通道。不传则行为与首版一致（仅硬失败），
+    以便历史产物可被复现。
+    """
     cfg = cfg or CFG
     out: list[Finding] = []
     has_deliverable = len(trace.deliverables()) > 0
@@ -85,9 +120,95 @@ def classify(trace: Trace, cfg: Settings | None = None) -> list[Finding]:
                            reason=f"replan 触发 {replans} 次",
                            evidence={"replan": replans, "total_steps": trace.total_steps}))
 
+    if score is not None:
+        out.extend(quality_findings(trace, score, cfg))
+
     if not out:
         out.append(Finding(Taxonomy.UNKNOWN, "-", 0, reason="无失败信号"))
     return out
+
+
+def quality_findings(trace: Trace, score: "Score", cfg: Settings) -> list[Finding]:
+    """质量缺陷通道：从评分里反推「这次跑完了，但哪里不达标」。
+
+    与硬失败通道的关键区别：这里**没有**崩栈、没有异常、每一步 gate 都 PASS。
+    若只看 ``step.failures``，这类 run 会被判成「无失败信号」，
+    于是闭环认为无改进空间 —— 而这恰恰是 Q 的最大失分区。
+
+    判定全部走确定性字段，证据里附上「未带来源的关键数字」样本，
+    保证每条 Finding 都能追溯到成品文本的具体位置。
+
+    判定前提（重要）
+    ----------------
+    **只有真的读到了成品文本，才允许判质量缺陷。**
+
+    ``E`` 在 live 语义下「没有报告」记 0 分 —— 这是对「没产出」的正确惩罚。
+    但复盘历史日志时，产物可能早已被外部清理，此时 0 分来自数据缺失而非 agent 做错。
+    若不加以区分，闭环会把「盘上文件没了」当成「报告质量差」，
+    进而提出针对不存在问题的补丁 —— 污染台账。
+
+    因此本函数只在 ``available is True``（证据分量确由文本算出）时才判定，
+    数据缺失一律不产出 Finding。
+    """
+    out: list[Finding] = []
+    detail = score.detail or {}
+
+    # 统一前提：E 与 C 的 structure 分量源自同一份 report_text，必须一起判定。
+    # 两者分开判会出现自相矛盾：E 判「读不到、不判缺陷」，C 却拿 structure=0 判「结构差」，
+    # 而 structure=0 恰恰来自同一份读不到的文本。
+    if not detail.get("report"):
+        return out
+
+    #: 注：``evidence`` 分量里没有 ``available`` 键（见 ``evaluator.evidence_rate``），
+    #: 判定是否真的读到文本只能看 ``detail["report"]`` 与抽取到的 claims 数。
+    ed = detail.get("evidence") or {}
+    claims = int(ed.get("claims") or 0)
+    supported = int(ed.get("supported") or 0)
+    if (score.E is not None and claims >= cfg.evidence_min_claims
+            and score.E < cfg.evidence_floor):
+        out.append(Finding(
+            Taxonomy.EVIDENCE_FAILURE,
+            agent=_last_producing_agent(trace),
+            step_no=0,
+            reason=(f"证据率 {score.E:.3f} 低于阈值 {cfg.evidence_floor:.2f}"
+                    f"（{supported}/{claims} 个量化断言带来源）"),
+            evidence={
+                "claims": claims,
+                "supported": supported,
+                "unsupported_samples": list(ed.get("unsupported_samples") or [])[:3],
+            },
+        ))
+
+    cdet = detail.get("completeness") or {}
+    # C 里的 structure 分量依赖 report_text；读不到文本时为 0，与「结构差」不可区分，
+    # 因此只在确实读到文本时才判完整性缺陷。
+    structure_bytes = int((cdet.get("structure") or {}).get("bytes") or 0)
+    if (cdet.get("available") is True and structure_bytes > 0
+            and score.C is not None and score.C < cfg.completeness_floor):
+        out.append(Finding(
+            Taxonomy.COMPLETENESS_FAILURE,
+            agent="-",
+            step_no=0,
+            reason=f"完整性 {score.C:.3f} 低于阈值 {cfg.completeness_floor:.2f}",
+            evidence={
+                "planned": score.planned,
+                "truncated": bool(cdet.get("truncated")),
+                "salvaged": bool(cdet.get("salvaged")),
+                "missing": cdet.get("missing", 0),
+            },
+        ))
+
+    return out
+
+
+def _last_producing_agent(trace: Trace) -> str:
+    """产出最终交付物的那一步由谁执行 —— 用于把质量缺陷归到具体 agent。
+
+    归不到就返回 ``-``，让 fingerprint 走 UNKNOWN 聚合，不猜测归属。
+    """
+    agents = [s.agent for s in sorted(trace.steps.values(), key=lambda s: s.step)
+              if s.agent]
+    return agents[-1] if agents else "-"
 
 
 def summarize(findings: list[Finding], cfg: Settings | None = None) -> dict:
@@ -108,6 +229,13 @@ def summarize(findings: list[Finding], cfg: Settings | None = None) -> dict:
     }
 
 
-def from_trace(trace: Trace, cfg: Settings | None = None) -> tuple[list[Finding], dict]:
-    f = classify(trace, cfg)
+def from_trace(trace: Trace, cfg: Settings | None = None,
+               score: "Score | None" = None) -> tuple[list[Finding], dict]:
+    f = classify(trace, cfg, score=score)
     return f, summarize(f, cfg)
+
+
+def from_score(score: "Score", cfg: Settings | None = None) -> list[Finding]:
+    """仅从评分产出质量缺陷（无 trace 场景，例如 replay 模式的批量复盘）。"""
+    cfg = cfg or CFG
+    return quality_findings(Trace(run_id=score.run_id), score, cfg)

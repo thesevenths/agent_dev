@@ -120,7 +120,7 @@ PROMPT_PATCHES: dict[str, dict] = {
     "prompt.py::coder.require-sources": {
         "level": 2,
         "values": ["on"],
-        "taxonomies": (Taxonomy.REVIEW_FAILURE,),
+        "taxonomies": (Taxonomy.EVIDENCE_FAILURE, Taxonomy.REVIEW_FAILURE),
         "anchor": "- When generating data analysis reports, follow these guidelines:",
         "insert": (
             "- SOURCE EVERY NUMBER: every quantitative claim in the report (size, growth rate,\n"

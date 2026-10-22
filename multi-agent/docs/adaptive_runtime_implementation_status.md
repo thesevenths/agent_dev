@@ -13,7 +13,7 @@
 |---|---|
 | 新增包 | `adaptive_runtime/`，27 个模块 |
 | 生产文件逻辑改动 | **0 处**（`run_adaptive verify` → `Frozen Core 完整`） |
-| 单元 / 集成测试 | **165 个，全部通过** |
+| 单元 / 集成测试 | **184 个，全部通过** |
 | P0 强制验收（自检） | **9/9 通过**（含 2 个阴性对照、1 个阳性对照、1 个敏感性对照） |
 | 真实 run 端到端 | 通过；token 计量 `estimated_ratio = 0.0`（全部为真实 usage） |
 | 方案章节覆盖 | §2–§18 全覆盖；§13.5 按方案要求实现**弱化版**并显式标注边界 |
@@ -117,9 +117,17 @@
 
 | 功能点 | 代码 |
 |---|---|
-| 5 类 + UNKNOWN | `diagnosis.Taxonomy` |
-| 仅由「可判定字段」触发 | `diagnosis.classify(trace)` |
+| 硬失败 5 类 + UNKNOWN | `diagnosis.Taxonomy.HARD` |
+| **质量缺陷 2 类** | `diagnosis.Taxonomy.QUALITY`（`EVIDENCE_FAILURE` / `COMPLETENESS_FAILURE`） |
+| 仅由「可判定字段」触发 | `diagnosis.classify(trace, score=...)` |
+| 质量判定前提：必须真的读到成品文本 | `quality_findings()` 以 `detail["report"]` 为统一前提 |
 | UNKNOWN > 40% 时告警而非增类 | `settings.unknown_max` + `diagnosis.summarize` 的 `hint` |
+
+质量通道的存在理由：只看硬失败时，「每一步都 PASS、正常收尾、报告已落盘」的 run
+会被判成「无失败信号」，闭环遂认为无改进空间。而实测一组 run 的 A/C 已接近满分、
+27 分差距全部落在 E（268 个关键数字仅 27 个带来源）—— 最大失分项恰恰无法被自检发现。
+阈值外置：`ADAPTIVE_EVIDENCE_FLOOR` / `ADAPTIVE_COMPLETENESS_FLOOR` /
+`ADAPTIVE_EVIDENCE_MIN_CLAIMS`。
 
 ### §13 经验层
 
@@ -190,7 +198,7 @@ python -m adaptive_runtime.run_adaptive regression init
 python -m adaptive_runtime.run_adaptive trajectory    # 成功 / 失败轨迹分布对比
 python -m adaptive_runtime.run_adaptive round --fake --case good   # 模拟轮次，全链路
 python -m adaptive_runtime.run_adaptive round --tasks-file experiments/tasks/replay.json  # 真实轮次
-python -m unittest discover -s adaptive_runtime/tests -t .          # 165 tests
+python -m unittest discover -s adaptive_runtime/tests -t .          # 184 tests
 ```
 
 > 注：`.env` 中的 `AGENT_*` 阈值一律不改；演化仅通过**子进程环境变量覆盖**生效，因此实验双臂共享同一份代码。

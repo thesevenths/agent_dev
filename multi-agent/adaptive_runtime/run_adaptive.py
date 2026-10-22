@@ -264,8 +264,15 @@ def cmd_round(args) -> int:
     if not log or not Path(log).exists():
         _say("找不到可用于诊断的日志（用 --trace 指定）")
         return 1
-    tr = export_from_log(log)
-    findings, dsum = diagnosis.from_trace(tr)
+    tr = export_from_log(log, root=PATHS.root)
+    # 先用确定性评分给这份 trace 打一次分，再交给诊断层。
+    # 顺序不能反：诊断的「质量缺陷通道」消费的是 E/C，而 E/C 只有打分后才有。
+    # 缺了这一步，诊断只认 kind=recursion/truncated/exception 这类硬失败，
+    # 于是「跑完了但每个数字都没来源」会被判成无失败信号。
+    diag_score = score_trace(tr, root=PATHS.root, mode="replay",
+                             task_id=args.task_label, arm="diag")
+    write_score(diag_score, out / "diagnosis_score")
+    findings, dsum = diagnosis.from_trace(tr, score=diag_score)
     write_trace(tr, out)
     write_json(out / "diagnosis.json", {"findings": [f.to_dict() for f in findings],
                                         "summary": dsum})

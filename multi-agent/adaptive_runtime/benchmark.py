@@ -29,7 +29,7 @@ from typing import Any
 from . import diagnosis, evolution, proposer, version
 from .comparator import summarize as cmp_summary
 from .diagnosis import Taxonomy
-from .evaluator import judge_version
+from .evaluator import judge_version, score_trace
 from .experience import Store
 from .gate import Decision, explain, gate_a, gate_b
 from .io_util import now_stamp, write_json
@@ -130,8 +130,11 @@ def run_benchmark(tasks: list[dict], *, rounds: int = 3, n: int = 4,
             rr.notes.append("没有可用于诊断的日志，跳过本轮")
             results.append(rr)
             continue
-        tr = export_from_log(log)
-        _findings, dsum = diagnosis.from_trace(tr)
+        tr = export_from_log(log, root=PATHS.root)
+        # 与 round 保持同一口径：先打分，再让诊断消费 E/C（质量缺陷通道）
+        _diag_score = score_trace(tr, root=PATHS.root, mode="replay",
+                                  task_id=task_label, arm="diag")
+        _findings, dsum = diagnosis.from_trace(tr, score=_diag_score)
         rr.dominant = dsum["dominant"]
         rr.unknown_ratio = float(dsum.get("unknown_ratio") or 0.0)
 
