@@ -1,7 +1,7 @@
 # Adaptive Runtime 实施对照与验收记录
 
 > 依据：`docs/adaptive_agent_runtime_final_plan.md`（V3 定稿）
-> 代码：`adaptive_runtime/`（新增包，27 个模块）
+> 代码：`adaptive_runtime/`（新增包，28 个模块）
 > 原则：**只新增，不改生产逻辑**（`agents.py` / `plan.py` / `planutil.py` / `llm.py` / `runlog.py` / `graph.py` 无逻辑改动，由 Frozen Core 双 hash 机器校验）
 > 说明：另有一轮全仓库措辞整理，仅涉及注释与文档串，不含任何逻辑变更；整理后 `verify` 仍为 `Frozen Core 完整`。
 
@@ -11,15 +11,17 @@
 
 | 项目 | 状态 |
 |---|---|
-| 新增包 | `adaptive_runtime/`，27 个模块 |
+| 新增包 | `adaptive_runtime/`，28 个模块 |
 | 生产文件逻辑改动 | **0 处**（`run_adaptive verify` → `Frozen Core 完整`） |
-| 单元 / 集成测试 | **184 个，全部通过** |
+| 单元 / 集成测试 | **200 个，全部通过** |
 | P0 强制验收（自检） | **9/9 通过**（含 2 个阴性对照、1 个阳性对照、1 个敏感性对照） |
 | 真实 run 端到端 | 通过；token 计量 `estimated_ratio = 0.0`（全部为真实 usage） |
 | 方案章节覆盖 | §2–§18 全覆盖；§13.5 按方案要求实现**弱化版**并显式标注边界 |
 | L2 提示层 | 已接通（`PROMPT_PATCHES` 4 条 + `apply_prompt_patch`），`ADAPTIVE_MAX_EDIT_LEVEL=2` 打开即产出 L2 候选 |
 | 反刷分 | 报告最小体积 + 结构分 + `plan_undercut`（禁止通过削减计划提分） |
 | 多轮 benchmark | `benchmark.py`；输出 ΔQ 序列 + holdout 平稳性 |
+| 任务集分层 | `bench_tasks.py`：evolve / ID held-out / OOD 三层，哈希划分，互斥且稳定 |
+| 外部分布外基准 | **未接入**（`external_status()` 全部 `available=False`），尚不可对外声称 |
 
 ---
 
@@ -198,7 +200,7 @@ python -m adaptive_runtime.run_adaptive regression init
 python -m adaptive_runtime.run_adaptive trajectory    # 成功 / 失败轨迹分布对比
 python -m adaptive_runtime.run_adaptive round --fake --case good   # 模拟轮次，全链路
 python -m adaptive_runtime.run_adaptive round --tasks-file experiments/tasks/replay.json  # 真实轮次
-python -m unittest discover -s adaptive_runtime/tests -t .          # 184 tests
+python -m unittest discover -s adaptive_runtime/tests -t .          # 200 tests
 ```
 
 > 注：`.env` 中的 `AGENT_*` 阈值一律不改；演化仅通过**子进程环境变量覆盖**生效，因此实验双臂共享同一份代码。

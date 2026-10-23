@@ -55,6 +55,31 @@ def null_diff_sd(groups: dict[str, list[float]]) -> float:
     return math.sqrt(var)
 
 
+def n_pairs(groups: dict[str, list[float]]) -> int:
+    """可用的配对差个数：每任务 C(k,2)，只算跑满 ≥2 次的任务。"""
+    return sum(len(v) * (len(v) - 1) // 2 for v in groups.values() if len(v) >= 2)
+
+
+def validity(groups: dict[str, list[float]], sd_null: float,
+             cfg: Settings | None = None) -> list[str]:
+    """标本报表能不能信 —— 返回「不能信」的原因列表（空 = 可信）。
+
+    为什么不能只看 ``sd_null < target``：sd=0 在数学上是「噪声为零」，在现实里几乎总是
+    **样本退化**（所有 run 都因为同一个基础设施故障拿到同一个地板分）。把那种报表
+    当标定，δ 会算成 0，于是「任何正数的 ΔQ 都显著」—— 那是把判分口径交还给噪声。
+    """
+    cfg = cfg or CFG
+    bad: list[str] = []
+    tasks_ge2 = sum(1 for v in groups.values() if len(v) >= 2)
+    if tasks_ge2 < cfg.min_calib_tasks:
+        bad.append(f"跑满 ≥2 次的任务只有 {tasks_ge2} 个，少于最低要求 {cfg.min_calib_tasks}")
+    if n_pairs(groups) < cfg.min_tasks_for_t:
+        bad.append(f"配对差只有 {n_pairs(groups)} 个，不足以估计 sd(Δ)")
+    if sd_null == 0.0:
+        bad.append("sd(Δ)=0：零方差不是低噪声，而是样本退化（多半是所有 run 都挂了或都是假跑）")
+    return bad
+
+
 def summarize(groups: dict[str, list[float]], cfg: Settings | None = None) -> dict:
     """从「每任务重复 k 次的 Q」得到一份标定报告。"""
     cfg = cfg or CFG
@@ -72,8 +97,10 @@ def summarize(groups: dict[str, list[float]], cfg: Settings | None = None) -> di
         "sd_diff_null": round(sd_null, 4),
         "sd_diff_theory": round(pooled["pooled_sd"] * math.sqrt(2), 4),
         "per_task": pooled["per_task"],
+        "n_pairs": n_pairs(groups),
         "target": cfg.sd_diff_target,
-        "passed": sd_null < cfg.sd_diff_target,
+        "validity": validity(groups, sd_null, cfg),
+        "passed": sd_null < cfg.sd_diff_target and not validity(groups, sd_null, cfg),
         "mde_at_default_n": {
             "n": cfg.n_default,
             "effect_80pct": round(mde(sd_null, cfg.n_default, cfg.power, cfg.alpha), 2),
@@ -89,6 +116,8 @@ def summarize(groups: dict[str, list[float]], cfg: Settings | None = None) -> di
 
 def passes(report: dict, cfg: Settings | None = None) -> bool:
     cfg = cfg or CFG
+    if report.get("validity"):
+        return False                    # 报表自己说了不可信，就不必再看 sd
     return bool(report.get("passed")) and float(report.get("sd_diff_null", 1e9)) < cfg.sd_diff_target
 
 

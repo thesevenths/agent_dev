@@ -135,7 +135,13 @@ PROMPT_PATCHES: dict[str, dict] = {
     },
 }
 
-#: 结构层的真实当前值（部分不在 .env 里，取代码默认值）
+#: 结构层的**代码默认值**，只当「现行值读不到」时的保底起点。
+#: 注意：它不是当前生效值。落地（landing）之后真实起点已经变了，而候选必须从
+#: **现行值**开始搜索，否则会出现两种错：
+#: (a) 生产已是 25 却反复提「15→25」⇒ cand 臂与基线完全一致，ΔQ 必然≈0，
+#:     台账把「已上线的改进」记成「无效假设」；
+#: (b) 改动被回滚后起点仍占位在落地值上 ⇒ 搜索方向反了。
+#: 因此搜索时必须走 ``current_value()``。
 CURRENT_DEFAULTS: dict[str, str] = {
     "AGENT_MAX_ITERATIONS_CODE": "60",
     "AGENT_MAX_ITERATIONS": "15",
@@ -261,6 +267,44 @@ def leakage_hits(text: str) -> list[str]:
     return hits
 
 
+def current_value(target: str) -> str:
+    """某参数的**现行生效值**：进程环境 > .env 托管块 > .env 用户区 > 代码默认。
+
+    读不到（不在搜索空间里 / 无落地层）时退回 ``CURRENT_DEFAULTS``。
+    这是「搜索空间跟着已落地的改动走」的唯一机制：不读现行值，闭环就会
+    在同一个参数上反复提已上线的那个值。
+    """
+    if target in PROMPT_PATCHES:
+        return "live" if prompt_is_live(target) else ""
+    try:
+        from . import landing
+        v = landing.live_value(target)
+    except Exception:
+        v = None
+    if v is None or str(v).strip() == "":
+        return str(CURRENT_DEFAULTS.get(target, ""))
+    return str(v).strip()
+
+
+def prompt_is_live(name: str, *, root: Path | None = None) -> bool:
+    """某 L2 补丁是否已经在生产文件里（正文逐字存在）。
+
+    必须查：已落地的补丁再提一次会在同一锚点前**插两遍**（锚点仍唯一，
+    apply_prompt_patch 不报错），于是候选实际改了两处而指纹只有一处。
+    """
+    spec = PROMPT_PATCHES.get(name)
+    if not spec:
+        return False
+    r = root or Path(__file__).resolve().parent.parent
+    p = r / str(name).split("::", 1)[0]
+    if not p.exists():
+        return False
+    try:
+        return str(spec.get("insert") or "") in p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
 def _adjacent(values: list[str], old: str) -> list[str]:
     """优先尝试相邻值（改动最小），再试远端值。"""
     try:
@@ -307,7 +351,9 @@ def propose(dominant: str, ledger: Ledger, cfg: Settings | None = None,
         spec = SEARCH_SPACE[target]
         if spec["level"] > cfg.max_edit_level:
             continue
-        old = CURRENT_DEFAULTS.get(target, "")
+        old = current_value(target)
+        if spec.get("is_prompt") and old == "live":
+            continue          # 已上线的补丁：再提就是插两遍，必须跳过而不是当新假设
         for new in _adjacent(list(spec["values"]), old):
             if new == old:
                 continue

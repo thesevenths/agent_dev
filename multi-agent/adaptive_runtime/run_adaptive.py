@@ -1,11 +1,12 @@
-"""统一入口：日 0 检查、标定、评分、单轮演化、自检、冻结、报告。
+"""统一入口：日 0 检查、标定、评分、单轮演化、自检、冻结、报告、无人值守闭环。
 
     python -m adaptive_runtime.run_adaptive selftest
     python -m adaptive_runtime.run_adaptive freeze
     python -m adaptive_runtime.run_adaptive verify
     python -m adaptive_runtime.run_adaptive day0
     python -m adaptive_runtime.run_adaptive tasks init --limit 24
-    python -m adaptive_runtime.run_adaptive calibrate --k 6 --limit 6        # 真实，很贵
+    python -m adaptive_runtime.run_adaptive tasks offline        # 本地数据任务集（不联网）
+    python -m adaptive_runtime.run_adaptive calibrate --offline --limit 8 --k 4 --yes --publish
     python -m adaptive_runtime.run_adaptive calibrate --fake                 # 自检用
     python -m adaptive_runtime.run_adaptive score --log log/xxx.log
     python -m adaptive_runtime.run_adaptive round --fake --case good
@@ -14,6 +15,15 @@
     python -m adaptive_runtime.run_adaptive evolve          # 探索/剪枝状态
     python -m adaptive_runtime.run_adaptive base show
     python -m adaptive_runtime.run_adaptive base promote --operator <name> --note <理由>
+    python -m adaptive_runtime.run_adaptive benchmark --fake
+    # 无人值守：自己换基线 + 自己落地 + 自己出具达成判据
+    python -m adaptive_runtime.run_adaptive auto --offline --rounds 3 --n 8 --parallel 4 --yes
+    python -m adaptive_runtime.run_adaptive auto --verify-only     # 只从产物重算判据（不跑模型）
+
+两个全局开关为什么放在子命令上而不是只靠环境变量：
+``--offline`` 是**不烧 Tavily 免费额度**与**降噪**的同一件事（联网内容逐日变化会把
+sd(Δ) 抬高到检不出真实改进）；``--parallel`` 是墙钟的唯一把手（单 run ≈ 18 分钟，
+而 token 成本不计）。两者都会写进每轮的测量口径，跨轮可比。
 """
 from __future__ import annotations
 
@@ -22,17 +32,19 @@ import json
 import sys
 from pathlib import Path
 
+from . import auto as auto_module
+from . import bench_tasks as bench_tasks_mod
 from . import calibrate as calib
-from . import (benchmark, diagnosis, evolution, frozen, harness, proposer,
-               quarantine, regression, trajectory, version)
+from . import (benchmark, diag_batch, diagnosis, evolution, frozen, harness, offline_tasks,
+               proposer, quarantine, regression, trajectory, version)
 from .budget import Budget
 from .comparator import summarize as cmp_summary
 from .evaluator import judge_version, score_trace, write_score
 from .experience import Store
-from .gate import Decision, Reason, explain, gate_a, gate_b
+from .gate import Decision, Reason, explain, gate_a, gate_b, ledger_status
 from .io_util import now_stamp, read_json, write_json, write_text
 from .ledger import Ledger
-from .probe import create_sandbox, probe_candidate, run_one
+from .probe import create_sandbox, probe_candidate, run_jobs, run_one, run_one_isolated
 from .settings import CFG, PATHS, validate
 from .trace_export import export_from_log, iter_logs, write_trace
 from . import selftest as selftest_module
@@ -56,6 +68,29 @@ def _load_tasks(path: str | Path | None, limit: int = 8) -> list[dict]:
     if not tasks:
         raise SystemExit(f"任务集为空：{p}")
     return tasks[:limit]
+
+
+def _apply_runtime_flags(args) -> None:
+    """把 ``--offline`` / ``--parallel`` 写回 CFG，并把离线任务集接上缺省路径。
+
+    为什么可以直改 CFG：CFG 是进程内唯一可变配置，且子进程的环境由
+    ``probe._env_for_run(cfg.offline)`` 统一注入 —— 不靠调用方自己传。
+    """
+    if getattr(args, "offline", False):
+        CFG.offline = True
+        if not getattr(args, "tasks_file", None):
+            p = PATHS.tasks / "offline_local.json"
+            if not p.exists():
+                _say("离线任务集不存在 → 正在生成本地数据与 offline_local.json")
+                _say(f"  写出：{offline_tasks.write_tasks_file()}")
+            args.tasks_file = str(p)
+    if getattr(args, "parallel", None) is not None:
+        CFG.max_parallel = max(1, int(args.parallel))
+    if getattr(args, "n", None):
+        # --n 必须写回 CFG，而不能只当调用参数传下去：``measure_mode()`` 记的是
+        # ``n_default``，而每轮 meta 要靠它核对「两次测的是不是同一把尺」。
+        # 不写回时落盘的口径会写着 n=8，而实际跑的是 n=3 —— 这条证据是假的。
+        CFG.n_default = max(1, int(args.n))
 
 
 def _newest_log() -> Path | None:
@@ -104,6 +139,17 @@ def cmd_tasks_init(args) -> int:
     for t in tasks:
         fams[t["family"]] = fams.get(t["family"], 0) + 1
     _say(f"任务族分布：{fams}")
+    return 0
+
+
+def cmd_tasks_offline(args) -> int:
+    """生成/刷新**离线**任务集（本地 CSV + 固定快照，全程不联网）。"""
+    PATHS.ensure()
+    out = offline_tasks.write_tasks_file(force_data=bool(args.force_data))
+    data = read_json(out, default=None) or {}
+    _say(f"已写出：{out}（{data.get('count')} 个任务，requires_web={data.get('requires_web')}）")
+    _say(f"任务族分布：{data.get('families')}")
+    _say("跟闭环：所有命令加 --offline（等价于 ADAPTIVE_OFFLINE=1，三个联网工具走本地语料）")
     return 0
 
 
@@ -208,12 +254,24 @@ def cmd_calibrate(args) -> int:
     sb = create_sandbox(root / "sandbox", "base", keep=bool(args.keep))
     groups: dict[str, list[float]] = {}
     budget = Budget.from_settings(CFG)
+    workers = max(1, int(CFG.max_parallel or 1))
+    _say(f"调度：并发度={workers}（ADAPTIVE_MAX_PARALLEL=1 时逐个串行）"
+         if workers > 1 else "调度：串行（并发度 1）；标定很慢时可设 ADAPTIVE_MAX_PARALLEL")
     try:
+        # 一次性把「全部任务 × k 次」交给调度器：标定是同一臂（base）同一份配置，
+        # 任务之间无依赖，串行跑纯属墙钟浪费。旧实现的双层 for 在 workers=1 时与下面等价。
+        jobs = [("%s#%d" % (task["task_id"], rep),
+                 (lambda tk=task, r=rep: run_one_isolated(
+                     sb, tk, r, "base", root / tk["task_id"] / f"r{r}",
+                     cfg=CFG, fake_profile="base" if args.fake else None)))
+                for task in tasks for rep in range(k)]
+        finished = run_jobs(jobs, workers)
         for task in tasks:
             vals: list[float] = []
             for rep in range(k):
-                ro = run_one(sb, task, rep, "base", root / task["task_id"] / f"r{rep}",
-                             cfg=CFG, fake_profile="base" if args.fake else None)
+                ro = finished.get("%s#%d" % (task["task_id"], rep))
+                if ro is None:
+                    continue
                 if ro.ok:
                     vals.append(ro.Q)
                     if ro.tokens:
@@ -260,24 +318,49 @@ def cmd_round(args) -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     # ---- 1. 诊断 ----
-    log = Path(args.trace) if args.trace else _newest_log()
-    if not log or not Path(log).exists():
-        _say("找不到可用于诊断的日志（用 --trace 指定）")
-        return 1
-    tr = export_from_log(log, root=PATHS.root)
-    # 先用确定性评分给这份 trace 打一次分，再交给诊断层。
-    # 顺序不能反：诊断的「质量缺陷通道」消费的是 E/C，而 E/C 只有打分后才有。
-    # 缺了这一步，诊断只认 kind=recursion/truncated/exception 这类硬失败，
-    # 于是「跑完了但每个数字都没来源」会被判成无失败信号。
-    diag_score = score_trace(tr, root=PATHS.root, mode="replay",
-                             task_id=args.task_label, arm="diag")
-    write_score(diag_score, out / "diagnosis_score")
-    findings, dsum = diagnosis.from_trace(tr, score=diag_score)
-    write_trace(tr, out)
+    # 默认只吃闭环自己跑出来的那批 run（``source=round_traces``）。
+    # 只有两种情况退回人工日志：显式 --trace，或闭环在本机还没产出过任何真实轨迹（首次使用）。
+    # 退回时必须在 diagnosis.json 里标成 manual_log：那份日志与本轮探针无因果关系，
+    # 报告要能看出这一轮的结论不是自洽产物。（旧实现无条件拿 mtime 最新日志当诊断，
+    # 于是「你在 Studio 里问一句」会静默改掉闭环的病口 —— 那不是闭环。）
+    dsum: dict = {}
+    if args.trace:
+        log = Path(args.trace)
+    else:
+        dirs = diag_batch.recent_trace_dirs()
+        if not dirs:
+            log = _newest_log()
+        else:
+            findings, dsum = diag_batch.from_run_dirs(dirs[0], arm="base", cfg=CFG)
+            log = None
+            usable, why = diag_batch.is_usable(dsum)
+            if not usable and not dsum.get("dominant"):
+                _say(f"闭环轨迹不可用：{why}（退回人工日志）")
+                findings, dsum, log = [], {}, _newest_log()
+    if log is not None:
+        if not Path(log).exists():
+            _say("找不到可用于诊断的日志（用 --trace 指定）")
+            return 1
+        tr = export_from_log(log, root=PATHS.root)
+        # 先用确定性评分给这份 trace 打一次分，再交给诊断层。
+        # 顺序不能反：诊断的「质量缺陷通道」消费的是 E/C，而 E/C 只有打分后才有。
+        # 缺了这一步，诊断只认 kind=recursion/truncated/exception 这类硬失败，
+        # 于是「跑完了但每个数字都没来源」会被判成无失败信号。
+        diag_score = score_trace(tr, root=PATHS.root, mode="replay",
+                                 task_id=args.task_label, arm="diag")
+        write_score(diag_score, out / "diagnosis_score")
+        findings, dsum = diagnosis.from_trace(tr, score=diag_score)
+        dsum["source"] = "manual_log"
+        dsum.setdefault("n_runs", 1)
+        write_trace(tr, out)
     write_json(out / "diagnosis.json", {"findings": [f.to_dict() for f in findings],
                                         "summary": dsum})
-    _say(f"[1/4] 诊断：dominant={dsum['dominant']} UNKNOWN={dsum['unknown_ratio']:.0%} "
+    _say(f"[1/4] 诊断（源={dsum.get('source','?')}，{dsum.get('n_runs',0)} 个 run）："
+         f"dominant={dsum['dominant']} UNKNOWN={dsum['unknown_ratio']:.0%} "
          f"({dsum['total']} 条信号)")
+    if dsum.get("source") == "manual_log":
+        _say("      ! 本轮诊断读的是人工日志，provenance 不自洽：结论仅供参考，"
+             "无人值守跑法请用 benchmark/auto（它只吃本轮轨迹）")
     if dsum["hint"]:
         _say(f"      ! {dsum['hint']}")
 
@@ -380,14 +463,21 @@ def cmd_round(args) -> int:
          f"δ={ev.paired().delta_crit:.2f} tokens={outcome.tokens:,}")
 
     # ---- 台账 / 经验 ----
-    status = {"ACCEPT": "accepted", "REJECT": "rejected"}.get(dec.decision, "inconclusive")
-    if dec.reason == Reason.WITHIN_NOISE.value:
-        status = "inconclusive"
-    ledger.update(cand.hyp_fingerprint, status,
-                  {"n": ev.paired().n, "dQ": round(ev.paired().mean, 4),
-                   "p": round(ev.paired().p_value, 6), "dC": round(ev.dC, 4),
-                   "reason": dec.reason}, tasks=[t["task_id"] for t in tasks])
-    if dec.accepted:
+    # 假跑（--fake）的轨迹是受控合成数据，**一条都不许进真实台账/经验库**：
+    # case=good 的 dQ=38.1 是写死的画像值，一旦落成 accepted，该假设就被
+    # ``is_duplicate`` 永久跳过（搜索空间凭空少一格），而经验库会把一条编造的
+    # 「已验证」注入后续真实任务的提示 —— 那是闭环最脏的假阳性：自己教会自己信一句假话。
+    # （benchmark 早就是这么防的，本轮才补上同样的守卫。）
+    status = ledger_status(dec, stopped=outcome.stopped)
+    if args.fake:
+        _say(f"      假跑（case={args.case}）：台账与经验库均不写入，状态={status}")
+    else:
+        ledger.update(cand.hyp_fingerprint, status,
+                      {"n": ev.paired().n, "dQ": round(ev.paired().mean, 4),
+                       "p": round(ev.paired().p_value, 6), "dC": round(ev.dC, 4),
+                       "reason": dec.reason, "stopped": outcome.stopped},
+                      tasks=[t["task_id"] for t in tasks])
+    if dec.accepted and not args.fake:
         Store().create(
             problem=f"{cand.taxonomy}|{getattr(cand, 'target', '-')}|0",
             claim=cand.hypothesis, component=f"L{cand.level}/{cand.target}",
@@ -569,6 +659,81 @@ def cmd_benchmark(args) -> int:
     return 0
 
 
+def cmd_auto(args) -> int:
+    """无人值守闭环：跑（或续跑）到 rounds 轮，自己换基线，自己出判据。"""
+    PATHS.ensure()
+    out = auto_module._dir(args.task_label, args.out_dir or None)
+
+    if args.verify_only:
+        state = auto_module.load_state(out)
+        if not state:
+            _say(f"没有可重算的状态：{out / auto_module.STATE_NAME}（先跑过 auto 才能出判据）")
+            return 1
+        v = auto_module.write_verdict(out, state)
+        _say(_verdict_text(v))
+        _say(f"产物：{out / auto_module.VERDICT_NAME}")
+        return 0 if v["achieved"] else 1
+
+    problems = validate()
+    if problems:
+        _say("配置提示：" + "；".join(problems))
+    tasks = _load_tasks(args.tasks_file, limit=args.limit)
+    fakes = {"base": "base", "cand": args.case} if args.fake else None
+
+    if not args.offline and not args.fake:
+        _say("[warn] 未开 --offline：会消耗 Tavily 免费额度，且联网内容逐日变化会抬高噪声。"
+             "无人值守跑法几乎总是应当 --offline。")
+    if not args.yes and not args.fake:
+        from .bench_tasks import profile_for
+        # 按口径选画像：离线单 run 实测 ~225 s（并发 4、31 个 run / 1752 s 反推），
+        # 拿在线的 1109 s 估会贵一个数量级，把本来能跑完的计划报成「30 小时不可行」——
+        # 那是用错的常数否掉了用户的方案。
+        prof = profile_for(offline=CFG.offline, task_profile=CFG.task_profile)
+        tr, ho = benchmark.split(tasks, args.holdout)
+        plan = bench_tasks_mod.plan_cost(len(tr), args.n, args.rounds, len(ho),
+                                         profile=prof)
+        # auto 比 benchmark 多两块：接受后的 holdout **配对**，以及换基线后的 holdout 重测
+        extra = len(ho) * CFG.holdout_reps * 2 * args.rounds
+        runs = plan.total_runs + extra
+        hours = runs * prof.seconds_per_run / 3600.0 / max(1, CFG.max_parallel)
+        _say(f"墙钟预估：~{runs} 个 run（train 两臂 {plan.evolve_runs} + holdout "
+             f"{runs - plan.evolve_runs}）× {prof.seconds_per_run:.0f}s ÷ 并发 {CFG.max_parallel}"
+             f" ≈ {hours:.1f} 小时（token 不计费，但这是真实时间成本）")
+        _say("确认要跑请加 --yes；先拿一个计时试点可用 --rounds 1 --limit 6 --n 2")
+        _say(f"另外：自动换基线要求已有实测标定（先跑 calibrate --offline --publish），"
+             f"否则机器判据会一直 BLOCK。标定文件："
+             f"{'已存在' if (PATHS.calibration.exists()) else '不存在'}")
+        return 2
+
+    rep = auto_module.run_auto(
+        tasks, rounds=args.rounds, n=args.n, holdout_ratio=args.holdout,
+        label=args.task_label, out_dir=args.out_dir or None,
+        resume=not args.no_resume, verify=not args.no_verify,
+        fake_profiles=fakes, keep_sandbox=args.keep,
+        on_progress=lambda m: _say(f"  · {m}"))
+    if rep.get("error"):
+        _say(f"无法开始：{rep['error']}")
+        return 1
+    report = rep.get("report") or {}
+    for line in report.get("verdict") or []:
+        _say(f"- {line}")
+    v = rep.get("verdict") or {}
+    _say("")
+    _say(_verdict_text(v))
+    _say(f"学习曲线：{out / auto_module.CURVE_NAME}")
+    _say(f"判据文档：{out / auto_module.VERDICT_NAME}")
+    return 0 if v.get("achieved") else 1
+
+
+def _verdict_text(v: dict) -> str:
+    lines = [f"RRSI 判据：{'已达成' if v.get('achieved') else '未达成'}"
+             f"（硬条件 {v.get('passed_blocking')}/{v.get('n_blocking')}）"]
+    for c in v.get("criteria") or []:
+        mark = "OK  " if c["passed"] else ("FAIL" if c["blocking"] else "warn")
+        lines.append(f"  [{mark}] {c['name']}")
+    return "\n".join(lines)
+
+
 def cmd_evolve(args) -> int:
     PATHS.ensure()
     rep = evolution.report(Ledger().rows)
@@ -654,6 +819,9 @@ def build_parser() -> argparse.ArgumentParser:
     pi = psub.add_parser("init", help="从历史 run 抽取可用于配对的任务")
     pi.add_argument("--limit", type=int, default=24, help="最多抽取的任务数")
     pi.set_defaults(func=cmd_tasks_init)
+    po = psub.add_parser("offline", help="生成本地数据任务集（全程不联网，不烧 Tavily 额度）")
+    po.add_argument("--force-data", action="store_true", help="重写本地 CSV 数据集")
+    po.set_defaults(func=cmd_tasks_offline)
 
     p = sub.add_parser("score", help="对单次 run 打分（replay 或 live）")
     p.add_argument("--log", default=None, help="run 日志路径")
@@ -666,11 +834,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tasks-file", default=None, help="任务清单路径")
     p.add_argument("--limit", type=int, default=6, help="参与标定的任务数")
     p.add_argument("--k", type=int, default=CFG.k_calib, help="每任务重复次数")
-    p.add_argument("--avg-tokens", type=int, default=600_000, help="单 run token 估算值（用于成本预估）")
+    p.add_argument("--avg-tokens", type=int, default=CFG.avg_tokens_default, help="单 run token 估算值（用于成本预估）")
     p.add_argument("--fake", action="store_true", help="使用受控模拟轨迹，不产生模型调用")
     p.add_argument("--yes", action="store_true", help="跳过成本确认")
     p.add_argument("--keep", action="store_true", help="保留沙箱目录")
     p.add_argument("--publish", action="store_true", help="将结果写入 calibration.json")
+    p.add_argument("--offline", action="store_true", help="离线模式（不联网，本地语料）")
+    p.add_argument("--parallel", type=int, default=None, help="并发 run 数（默认 1=串行）")
     p.set_defaults(func=cmd_calibrate)
 
     p = sub.add_parser("round", help="执行一轮完整闭环（诊断→提案→探测→判定）")
@@ -679,13 +849,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trace", default=None, help="直接指定 trace（跳过任务集）")
     p.add_argument("--task-label", default="round", help="任务标签（写入实验结果目录）")
     p.add_argument("--n", type=int, default=None, help="覆盖默认配对任务数")
-    p.add_argument("--avg-tokens", type=int, default=600_000, help="单 run token 估算值")
+    p.add_argument("--avg-tokens", type=int, default=CFG.avg_tokens_default, help="单 run token 估算值")
     p.add_argument("--fake", action="store_true", help="使用受控模拟轨迹，不产生模型调用")
     p.add_argument("--case", default="good", choices=("good", "zero", "worse"),
                    help="模拟轨迹类型：good=真实改进 / zero=零改动 / worse=故意变差")
     p.add_argument("--level", type=int, default=None, choices=(1, 2, 3),
                    help="只在该层选候选（配合 ADAPTIVE_MAX_EDIT_LEVEL 使用）")
     p.add_argument("--keep", action="store_true", help="保留沙箱目录")
+    p.add_argument("--offline", action="store_true", help="离线模式（不联网，用本地数据任务集）")
+    p.add_argument("--parallel", type=int, default=None, help="并发 run 数（默认 1=串行）")
     p.set_defaults(func=cmd_round)
 
     p = sub.add_parser("report", help="输出指定轮次的结论文档")
@@ -711,11 +883,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--level", type=int, default=None, choices=(1, 2, 3), help="限定候选层级")
     p.add_argument("--trace", default=None, help="直接指定 trace")
     p.add_argument("--task-label", default="bench", help="任务标签")
-    p.add_argument("--avg-tokens", type=int, default=600_000, help="单 run token 估算值")
+    p.add_argument("--avg-tokens", type=int, default=CFG.avg_tokens_default, help="单 run token 估算值")
     p.add_argument("--fake", action="store_true", help="使用受控模拟轨迹，不产生模型调用")
     p.add_argument("--case", default="good", choices=("good", "zero", "worse"), help="模拟轨迹类型")
     p.add_argument("--keep", action="store_true", help="保留沙箱目录")
+    p.add_argument("--offline", action="store_true", help="离线模式（不联网，用本地数据任务集）")
+    p.add_argument("--parallel", type=int, default=None, help="并发 run 数（默认 1=串行）")
     p.set_defaults(func=cmd_benchmark)
+
+    p = sub.add_parser("auto", help="无人值守闭环：自己换基线 + 自己落地 + 自己出达成判据")
+    p.add_argument("--tasks-file", default=None, help="任务清单路径（--offline 时默认取离线集）")
+    p.add_argument("--limit", type=int, default=18, help="可用任务总数上限")
+    p.add_argument("--rounds", type=int, default=3, help="目标总轮数（续跑时算的是累计值）")
+    p.add_argument("--n", type=int, default=None, help="每轮参与配对的任务数（默认取 ADAPTIVE_N）")
+    p.add_argument("--holdout", type=float, default=0.3, dest="holdout", help="holdout 比例")
+    p.add_argument("--task-label", default="auto", help="运行标签（同一 label 可续跑）")
+    p.add_argument("--out-dir", default=None, help="运行目录（默认 experiments/auto/<label>）")
+    p.add_argument("--offline", action="store_true",
+                   help="离线模式：不烧 Tavily 额度，且消除联网内容逐日变化带来的噪声")
+    p.add_argument("--parallel", type=int, default=None, help="并发 run 数（墙钟把手，默认 1）")
+    p.add_argument("--fake", action="store_true", help="受控模拟轨迹（只验管线，不会真 promote）")
+    p.add_argument("--case", default="good", choices=("good", "zero", "worse"), help="模拟轨迹类型")
+    p.add_argument("--no-resume", action="store_true", help="不续跑，重新开始一条曲线")
+    p.add_argument("--no-verify", action="store_true",
+                   help="跳过换基线后的 holdout 重测（不推荐：那就失去了「上线后是否仍更好」的观测）")
+    p.add_argument("--verify-only", action="store_true",
+                   help="不跑任何模型，只从磁盘产物重算达成判据")
+    p.add_argument("--yes", action="store_true", help="跳过墙钟预估确认")
+    p.add_argument("--keep", action="store_true", help="保留沙箱目录")
+    p.set_defaults(func=cmd_auto)
 
     p = sub.add_parser("regression", help="回归集管理（只否决不演化）")
     psub = p.add_subparsers(dest="reg_cmd", required=True)
@@ -731,6 +927,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
+    _apply_runtime_flags(args)
     try:
         return int(args.func(args) or 0)
     except SystemExit:

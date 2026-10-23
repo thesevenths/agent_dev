@@ -6,12 +6,14 @@ V2 里 ``Current Harness`` 和 ``Base Harness`` 同时出现却没定义关系�
 成了一个隐性变量：一旦拿「上一轮候选」当基线，Q 的微小正噪声会被逐轮累积成漂移，
 而任何一次偶然的负噪声又会被后续轮次当成新常态。本模块把关系钉死：
 
-- **Base**：``git tag base/vN`` + 冻结的 env 快照。**只经人工 promote 变化**。
+- **Base**：``git tag base/vN`` + 冻结的 env 快照。变化必须过**证据门**：要么人工
+  评审（``promote(require_operator=True)``），要么机器判据（``autopromote.evaluate`` +
+  ``require_operator=False``）。后者不拆门，只把「是不是人」换成「证据够不够」。
 - **Task**：``Base + 本轮检索到的 ≤3 条经验``，只读组装，落 ``task_harness.json``，单轮即弃。
 - **Incumbent**：本轮已被接受的候选，可多个串行比较，轮末丢弃。
 - **Candidate**：一次具体改动，由 proposer 产出。
 
-于是三条性质同时成立：不漂移（base 只在人工门下变）、改进能落地（不是只产建议）、
+于是三条性质同时成立：不漂移（base 只在证据门下变）、改进能落地（不是只产建议）、
 可归因（每个候选都对着同一个 base 比较）。
 
 实现上只读文件，不引入状态机：``base_state.json`` 存当前版本，``base_history.jsonl``
@@ -110,10 +112,13 @@ def ensure_initial(created_by: str = "system") -> BaseVersion:
 
 def promote(evidence: list[dict], operator: str, note: str = "",
             require_operator: bool = True) -> BaseVersion:
-    """人工 promote 门：把已跨任务验证的机制合并进 Base，版本号 +1。
+    """promote 门：把已跨任务验证的机制合并进 Base，版本号 +1。
 
-    ``operator`` 必填且不能是系统账户 —— 这条约束是「不漂移」的唯一保证，
-    自动化流程不该有能力给自己升基线。
+    ``require_operator=True``（默认）时 ``operator`` 必填且不能是系统账户 ——
+    这条约束是「不漂移」的保证。无人值守跑法走 ``require_operator=False``，
+    但**不是删掉门**：调用方必须先过 ``autopromote.evaluate``，那里的证据要求比
+    人工评审更硬（标定必须实测通过 + holdout 配对不退 + 可自动回滚）。
+    把「谁能升基线」从「是不是人」换成「证据够不够」，才是正则化而不是失控。
     """
     op = (operator or "").strip()
     if require_operator and (not op or op.lower() in
@@ -131,6 +136,43 @@ def promote(evidence: list[dict], operator: str, note: str = "",
 
 def history() -> list[dict]:
     return read_jsonl(_history_path())
+
+
+def refresh_snapshot(ver: BaseVersion | None = None,
+                     base_commit: str | None = None) -> BaseVersion | None:
+    """重新采集基线的 env 快照（**落地之后**必须调一次）。
+
+    为什么需要：``promote`` 在落地之前执行（这样落地记录才能写上 ``base/vN`` 标签），
+    于是 ``env_snapshot()`` 采到的是改动**前**的值。不重采就会出现「base/v2 的快照里
+    还写着旧值」—— 那正好丢掉了「这一版基线到底是什么配置」这个最关键的归属信息，
+    后续任何回放与对比都会对着错的 env 比。
+
+    ``base_commit`` 可传入「git HEAD + 落地内容指纹」的复合归属：自动落地默认不
+    commit（提交必须人工授权），若仍只记 git HEAD，base/v1 与 base/v2 的 commit 会相同。
+    """
+    cur = ver or current()
+    if cur is None:
+        return None
+    fresh = BaseVersion(version=cur.version, base_commit=base_commit or cur.base_commit or git_head(),
+                        env=env_snapshot(), created_at=cur.created_at,
+                        created_by=cur.created_by, note=cur.note, evidence=cur.evidence)
+    write_json(_state_path(), fresh.to_dict())
+    append_jsonl(_history_path(), [dict(fresh.to_dict(), event="re-snapshot")])
+    return fresh
+
+
+def restore(prev: "BaseVersion", note: str = "", operator: str = "auto:adaptive") -> BaseVersion:
+    """把 Base 退回指定版本（自动回滚用），并在历史里追加一条 demote 事件。
+
+    为什么不直接删历史：历史只追加。回退也是事实，必须留下「曾经升上去又退回来」的记录，
+    否则下次看台账会以为那个机制从没上过线。
+    """
+    cur = current()
+    write_json(_state_path(), prev.to_dict())
+    append_jsonl(_history_path(), [dict(prev.to_dict(), event="demote",
+                                        reverted_from=(cur.to_dict() if cur else None),
+                                        operator=operator, note=note)])
+    return prev
 
 
 def tag_hint() -> str:

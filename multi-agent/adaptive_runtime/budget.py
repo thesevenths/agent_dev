@@ -28,6 +28,11 @@ class Budget:
 
     @classmethod
     def from_settings(cls, cfg: Settings) -> "Budget":
+        # ``cost_governed=0``（自托管、token 不计费）时上限拉到无穷：否则一个正常偏贵的
+        # 轮会在 run 之间被 should_stop 打断，缺的 run 让整轮因 INCOMPLETE_EVIDENCE 作废。
+        # 那是「用一个不花钱的资源否掉一次真实测量」，比不过门更浪费。
+        if not getattr(cfg, "cost_governed", True):
+            return cls(cap_round=10 ** 12, cap_cand=10 ** 12)
         return cls(cap_round=cfg.cost_cap_round, cap_cand=cfg.cost_cap_cand)
 
     # ---- 查询 ----

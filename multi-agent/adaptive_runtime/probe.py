@@ -11,6 +11,17 @@ agent_dev 物化出来（含其它项目）。P0/P1 的候选只改 env（不改
 -----------
 Stage 1：4 个任务 × 2 次 = 8 对，只做**止损**（n=2 没有判定力，不录取）；
 Stage 2：对没被止损的候选补齐到 n。
+
+并发（``ADAPTIVE_MAX_PARALLEL``，默认 1）
+--------------------------------------
+一个 run 是**独立子进程 + 独立沙箱 DB**，串行时墙钟是硬伤（单 run ≈ 18 分钟）。
+并发只改调度，不改统计：
+
+- 配对键仍是 ``(task_id, rep)``，两臂仍走同一个 ``_env_for_run``（离线/假跑注入不变）；
+- ``outcome.base/cand`` 必须按**计划序** assembled，不能按完成序 append ——
+  否则 ``probe.json`` 在不同机器上会不一样，同一份证据无法逐字节复核；
+- 预算/止损语义不变：预算超了就不**再提交**新 run（已在飞的让它跑完），
+  因为强行中断只会得到一批 ``ok=False`` 的垃圾证据。
 """
 from __future__ import annotations
 
@@ -19,7 +30,9 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -115,8 +128,7 @@ def create_sandbox(dest: str | Path, arm: str, root: str | Path | None = None,
 
     for d in EMPTY_DIRS:
         (dest / d).mkdir(parents=True, exist_ok=True)
-    for d in ("adaptive_runtime",):
-        (dest / d).mkdir(parents=True, exist_ok=True)
+    (dest / "adaptive_runtime").mkdir(parents=True, exist_ok=True)
     return Sandbox(path=dest, arm=arm, keep=keep)
 
 
@@ -137,6 +149,9 @@ class RunOutcome:
     timeout: bool = False
     duration_s: float = 0.0
     out_dir: str = ""
+    #: 实际尝试次数（>1 表示这次 run 重跑过，见 ``run_one_isolated``）。
+    #: 落进 probe.json 的 failures/日志里，否则「一次就过」与「重试三次才过」看起来一样。
+    attempts: int = 1
 
     def to_score(self) -> dict:
         return {"task_id": self.task_id, "rep": self.rep, "arm": self.arm,
@@ -148,7 +163,8 @@ class RunOutcome:
 
 
 def _env_for_run(sandbox: Sandbox, overrides: dict[str, str], out_dir: Path,
-                 fake: bool) -> dict[str, str]:
+                 fake: bool, cfg: Settings | None = None) -> dict[str, str]:
+    cfg = cfg or CFG
     env = os.environ.copy()
     env.pop("ADAPTIVE_TOKEN_SINK", None)
     env.update({str(k): str(v) for k, v in (overrides or {}).items()})
@@ -158,9 +174,28 @@ def _env_for_run(sandbox: Sandbox, overrides: dict[str, str], out_dir: Path,
         "PYTHONPATH": str(sandbox.path) + os.pathsep + env.get("PYTHONPATH", ""),
         "PYTHONIOENCODING": "utf-8",
     })
+    # 离线模式：两臂必须同时生效（在 _env_for_run 里统一注入，而不是靠候选 overrides）。
+    # 否则「base 联网 / cand 离线」会直接造出一个与 harness 无关的 ΔQ。
+    if cfg.offline:
+        env["ADAPTIVE_OFFLINE"] = "1"
     if fake:
         env["ADAPTIVE_FAKE"] = "1"
     return env
+
+
+def _drop_stale(out: Path) -> None:
+    """重跑前清掉上一次的产物。
+
+    ``run_one`` 是在**子进程结束之后**才去读 ``result.json``/``score.json`` 的，所以同一个
+    out 目录里若留着上一次尝试的文件，一次失败的尝试就会「继承」上一次的 Q —— 那不是
+    测量，是插补（``ok`` 还有 ``rc == 0`` 把关，但 Q 已经假了）。加了 run 级重试后，
+    这条从「顺手的安全」变成「必须」。
+    """
+    for name in ("result.json", "score.json", "trace.json", "usage.json", "tokens.jsonl"):
+        try:
+            (out / name).unlink(missing_ok=True)
+        except OSError:          # Windows 上被占用：这次尝试自己会重写，失败就判失败
+            pass
 
 
 def run_one(sandbox: Sandbox, task: dict, rep: int, arm: str, out_dir: str | Path,
@@ -169,6 +204,7 @@ def run_one(sandbox: Sandbox, task: dict, rep: int, arm: str, out_dir: str | Pat
     cfg = cfg or CFG
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    _drop_stale(out)
     task_id = task["task_id"]
     cmd = [sys.executable, "-m", "adaptive_runtime.runner_once",
            "--query", task["query"], "--task-id", task_id, "--rep", str(rep),
@@ -178,7 +214,7 @@ def run_one(sandbox: Sandbox, task: dict, rep: int, arm: str, out_dir: str | Pat
     if task.get("thread_id"):
         cmd += ["--thread-id", task["thread_id"]]
 
-    env = _env_for_run(sandbox, overrides or {}, out, fake=bool(fake_profile))
+    env = _env_for_run(sandbox, overrides or {}, out, fake=bool(fake_profile), cfg=cfg)
     t0 = time.time()
     timed_out = False
     try:
@@ -226,6 +262,77 @@ def _sum_tokens(path: Path) -> int:
     return total
 
 
+# ---------------------------------------------------------------- 每 run 隔离副本
+
+def fork_sandbox(template: Sandbox, dest: str | Path) -> Sandbox:
+    """从臂模板复制一份**只给一个 run 用**的副本。
+
+    为什么并发时必须 fork：``runner_once`` 的头部注释就是答案 ——
+    「每次 run 需要独立的 AGENT_CHECKPOINT_DB / log / tmp / documents，否则两臂互相污染」。
+    同一个臂模板上并发跑两个 run，会共享 sqlite checkpoint DB 与 ``documents/``：
+    而 ``trace_export`` 是**按 mtime 扫描 ``documents/``/``tmp/`` 来归属本次 run 的产物**的，
+    并发下 A 的报告会落进 B 的证据里 —— 得到的是「看起来很大但完全假的 ΔQ」。
+    那不是噪声，那是自欺，所以宁可多付一份副本（整个沙箱 ≈ 2.6 MB，相对单 run 十几分钟可忽略）。
+
+    从模板 fork而不从上一个 run fork：模板只被打过 L2 补丁、不会被 run 写过，
+    于是碎片产物不可能顺着副本链背下去。
+    """
+    dest = Path(dest)
+    if dest.exists():
+        _rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    def _ignore(dirpath, names):
+        # 产物目录不复制（copytree 不跟符号链接、也不留空目录），下面统建
+        return [n for n in names if Path(dirpath, n).is_dir() and n in EMPTY_DIRS]
+
+    shutil.copytree(template.path, dest, ignore=_ignore, dirs_exist_ok=True)
+    for d in EMPTY_DIRS:
+        (dest / d).mkdir(parents=True, exist_ok=True)
+    return Sandbox(path=dest, arm=template.arm, keep=False)
+
+
+#: 并发安全入口的返回体与 run_one 一致（就是 RunOutcome）
+def run_one_isolated(sandbox: Sandbox, task: dict, rep: int, arm: str,
+                     out_dir: str | Path, overrides: dict[str, str] | None = None,
+                     cfg: Settings | None = None, fake_profile: str | None = None) -> RunOutcome:
+    """跑一个 run：并发时每 run 用自己那份沙箱副本，失败时按 ``probe_retry`` 重跑。
+
+    为什么默认串行还能保持原样：串行时旧代码本来就不会在同一时刻碰两个 run 的
+    ``documents/``，mtime 归属仍是唯一的。只有开并发才需要物理隔离。
+
+    为什么要重试：``gate_b`` 对 ``missing_runs + timeout_runs > 0`` 一律判
+    INCOMPLETE_EVIDENCE —— 一轮 78 个 run 里挂 1 个就整轮作废。实测离线单 run 失败率
+    ≈ 3%（标定 32 个 run 挂了 1 个超时），于是一轮「一个都不挂」的概率只有
+    0.97^78 ≈ 9%：不加重试，闭环九成以上的轮次是在白烧机时，而且（修好台账分类前）
+    还会把该轮的假设永久记成 rejected。重试补的是**测量事故**，不是数据：拿回来的
+    仍是同一个 (task, rep, arm) 真实跑出来的 Q，每次尝试都从统一起点重打一遍沙箱副本。
+    """
+    cfg = cfg or CFG
+    workers = max(1, int(getattr(cfg, "max_parallel", 1) or 1))
+    tries = 1 + max(0, int(getattr(cfg, "probe_retry", 0) or 0))
+    ro: RunOutcome | None = None
+    for attempt in range(tries):
+        if workers <= 1:
+            ro = run_one(sandbox, task, rep, arm, out_dir, overrides=overrides, cfg=cfg,
+                         fake_profile=fake_profile)
+        else:
+            out = Path(out_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            fork = fork_sandbox(sandbox, out / "_sandbox")
+            try:
+                ro = run_one(fork, task, rep, arm, out_dir, overrides=overrides, cfg=cfg,
+                             fake_profile=fake_profile)
+            finally:
+                fork.keep = False
+                fork.cleanup()
+        ro.attempts = attempt + 1
+        if ro.ok:
+            return ro
+    assert ro is not None
+    return ro
+
+
 # ---------------------------------------------------------------- 提示补丁
 
 class PatchError(RuntimeError):
@@ -264,6 +371,48 @@ def apply_prompt_patch(sandbox: Sandbox, patch: dict) -> dict:
             "diff": "\n".join(diff)}
 
 
+# ---------------------------------------------------------------- 调度
+
+def run_jobs(jobs: list[tuple[Any, Any]], workers: int, *, should_stop=None) -> dict:
+    """执行 ``[(key, 无参函数)]``，返回 ``{key: 结果}``。
+
+    ``workers <= 1`` 或 ``len(jobs) <= 1`` 时**严格串行**，且求值顺序与 jobs 一致 ——
+    这是默认路径，所以关掉并发开关后行为与本函数存在之前的旧代码逐字相同。
+
+    为什么不在超预算时中断已在飞的 run：强行杀进程得到的是 ``ok=False`` 的碎证据，
+    而 ``missing_runs`` 会把整轮推成 INCOMPLETE_EVIDENCE —— 不如让它跑完，只是不再提交。
+    """
+    workers = max(1, int(workers or 1))
+    if workers == 1 or len(jobs) <= 1:
+        res: dict = {}
+        for key, fn in jobs:
+            if should_stop is not None and should_stop():
+                break
+            res[key] = fn()
+        return res
+
+    from concurrent.futures import FIRST_COMPLETED, wait
+
+    res = {}
+    pending = list(jobs)
+    inflight: dict = {}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        while pending or inflight:
+            while pending and len(inflight) < workers:
+                if should_stop is not None and should_stop():
+                    pending.clear()
+                    break
+                key, fn = pending.pop(0)
+                inflight[ex.submit(fn)] = key
+            if not inflight:
+                break
+            done_set, inflight_set = wait(list(inflight), return_when=FIRST_COMPLETED)
+            for fut in done_set:
+                res[inflight.pop(fut)] = fut.result()
+            inflight = {f: k for f, k in inflight.items() if f in inflight_set}
+    return res
+
+
 # ---------------------------------------------------------------- 一轮 probe
 
 @dataclass
@@ -272,6 +421,10 @@ class ProbeOutcome:
     cand: list[dict] = field(default_factory=list)
     comparison: Comparison | None = None
     failures: list[dict] = field(default_factory=list)
+    #: 因失败而重跑的次数（跨两臂汇总）。「本轮挂了 3 次才凑齐 78 个 run」必须看得见，
+    #: 否则读者会以为一个零失败的轮次与一个满盘超时的轮次证据等级相同。
+    #: 注意：tokens 只累计最终那次尝试的用量（重跑的 sink 文件会被 ``_drop_stale`` 清掉）。
+    retries: int = 0
     stopped: str = ""
     n_planned: int = 0
     n_actual: int = 0
@@ -285,6 +438,7 @@ class ProbeOutcome:
         return {"base": self.base, "cand": self.cand,
                 "comparison": self.comparison.to_dict() if self.comparison else None,
                 "failures": self.failures, "stopped": self.stopped,
+                "retries": self.retries,
                 "n_planned": self.n_planned, "n_actual": self.n_actual,
                 "tokens": self.tokens, "out_dir": self.out_dir,
                 "patch_applied": self.patch_applied,
@@ -292,13 +446,25 @@ class ProbeOutcome:
 
 
 def _stop_loss(deltas: list[float], cfg: Settings) -> bool:
-    """Stage 1 只做止损：均值为负且幅度超过 1.5 个标准误。"""
+    """Stage 1 只做止损：均值为负且幅度超过 1.5 个标准误。
+
+    不计费时（``cost_governed=0``，即本项目现在的真实配置）必须更保守：止损只看
+    ``stage1_tasks`` 个任务，误触一次本轮就只剩 4 个任务 × 2 rep 的配对 ——
+    而 t 检验的自由度是按**任务数**算的，df=3 时 δ≈12 分，几乎任何改动都过不了门。
+    等于用一次噪声投票废掉整轮机时。所以这里要求两个条件同时成立：
+    幅度（|mean| ≥ ``stop_loss_points``）**且**显著（|mean| > t_crit·se）。
+    真正大幅变差的候选照样会被拦下，只是不再拿「1.5 个标准误的噪声」当依据。
+    """
     if len(deltas) < 2:
         return False
     mean = sum(deltas) / len(deltas)
     var = sum((d - mean) ** 2 for d in deltas) / (len(deltas) - 1)
     se = (var ** 0.5) / (len(deltas) ** 0.5)
-    return mean < 0 and abs(mean) > 1.5 * max(se, 1e-9)
+    if cfg.cost_governed:
+        return mean < 0 and abs(mean) > 1.5 * max(se, 1e-9)
+    from .stats import t_crit
+    thr = max(cfg.stop_loss_points, t_crit(len(deltas) - 1, cfg.alpha) * max(se, 1e-9))
+    return mean < 0 and abs(mean) > thr
 
 
 def probe_candidate(cand: Any, tasks: list[dict], out_dir: str | Path,
@@ -331,34 +497,60 @@ def probe_candidate(cand: Any, tasks: list[dict], out_dir: str | Path,
     def _profile(arm: str) -> str | None:
         return (fake_profiles or {}).get(arm)
 
-    def _one(arm: str, task: dict, rep: int) -> RunOutcome:
+    workers = max(1, int(getattr(cfg, "max_parallel", 1) or 1))
+    lock = threading.Lock()
+    #: 结果按 (task_id, arm, rep) 存，**不**按完成顺序入列表（见模块 docstring）
+    done: dict[tuple[str, str, int], RunOutcome] = {}
+
+    def _stop_reason() -> str:
+        return str(outcome.stopped or "")
+
+    def _job(arm: str, task: dict, rep: int) -> RunOutcome:
         sb = base_sb if arm == "base" else cand_sb
         ov = {} if arm == "base" else overrides
-        ro = run_one(sb, task, rep, arm, out / arm / f"{task['task_id']}-r{rep}",
-                     overrides=ov, cfg=cfg, fake_profile=_profile(arm))
-        outcome.tokens += ro.tokens
-        if ro.tokens:
-            try:
-                budget.spend(ro.tokens, getattr(cand, "candidate_id", None))
-            except BudgetExceeded as e:
-                outcome.stopped = f"budget: {e}"
-        if not ro.ok:
-            outcome.failures.append(ro.to_dict())
+        ro = run_one_isolated(sb, task, rep, arm, out / arm / f"{task['task_id']}-r{rep}",
+                              overrides=ov, cfg=cfg, fake_profile=_profile(arm))
+        with lock:                       # 共享计数：并发下必须上锁，否则 token/失败记录会竞态
+            outcome.tokens += ro.tokens
+            if ro.attempts > 1:
+                outcome.retries += ro.attempts - 1
+            if ro.tokens:
+                try:
+                    budget.spend(ro.tokens, getattr(cand, "candidate_id", None))
+                except BudgetExceeded as e:
+                    outcome.stopped = f"budget: {e}"
+            if not ro.ok:
+                outcome.failures.append(ro.to_dict())
         return ro
 
-    # ---- Stage 1 ----
-    s1 = tasks[:stage1_tasks]
-    for task in s1:
-        for rep in range(min(stage1_reps, n)):
-            b = _one("base", task, rep)
-            if outcome.stopped.startswith("budget"):
-                break
-            c = _one("cand", task, rep)
-            if outcome.stopped.startswith("budget"):
-                break
-            if b.ok and c.ok:
+    def _dispatch(pairs: list[tuple[str, int]]) -> None:
+        """把一批 (task_id, rep) 按两臂展开后交给调度器（串行时就是旧的 base→cand 逐个跑）。"""
+        by_id = {t["task_id"]: t for t in tasks}
+        jobs: list[tuple[Any, Any]] = []
+        for tid, rep in pairs:
+            task = by_id[tid]
+            for arm in ("base", "cand"):
+                key = (tid, arm, rep)
+                if key in done:
+                    continue
+                jobs.append((key, (lambda a=arm, tk=task, r=rep: _job(a, tk, r))))
+        finished = run_jobs(jobs, workers, should_stop=lambda: _stop_reason().startswith("budget"))
+        done.update(finished)
+
+    def _collect(pairs: list[tuple[str, int]]) -> None:
+        """按计划序收下两臂都成功的配对（与旧代码的 append 顺序一致）。"""
+        for tid, rep in pairs:
+            b = done.get((tid, "base", rep))
+            c = done.get((tid, "cand", rep))
+            if b is not None and c is not None and b.ok and c.ok:
                 outcome.base.append(b.to_score())
                 outcome.cand.append(c.to_score())
+
+    # ---- Stage 1 ----
+    s1_pairs = [(t["task_id"], rep) for t in tasks[:stage1_tasks]
+                for rep in range(min(stage1_reps, n))]
+    _dispatch(s1_pairs)
+    _collect(s1_pairs)
     if outcome.stopped.startswith("budget"):
         outcome.n_actual = len(outcome.base)
         outcome.comparison = _compare_with_failures(outcome, cfg)
@@ -374,22 +566,12 @@ def probe_candidate(cand: Any, tasks: list[dict], out_dir: str | Path,
         return outcome
 
     # ---- Stage 2：补齐到 n ----
+    s2_pairs: list[tuple[str, int]] = []
     for task in tasks:
         have = {s["rep"] for s in outcome.base if s["task_id"] == task["task_id"]}
-        for rep in range(n):
-            if rep in have:
-                continue
-            b = _one("base", task, rep)
-            if outcome.stopped.startswith("budget"):
-                break
-            c = _one("cand", task, rep)
-            if outcome.stopped.startswith("budget"):
-                break
-            if b.ok and c.ok:
-                outcome.base.append(b.to_score())
-                outcome.cand.append(c.to_score())
-        if outcome.stopped.startswith("budget"):
-            break
+        s2_pairs += [(task["task_id"], rep) for rep in range(n) if rep not in have]
+    _dispatch(s2_pairs)
+    _collect(s2_pairs)
 
     outcome.n_actual = len(outcome.base)
     outcome.comparison = _compare_with_failures(outcome, cfg)

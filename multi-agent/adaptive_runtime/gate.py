@@ -132,8 +132,12 @@ def gate_a(cand: Any, frozen_violations: list[Any] | None = None,
 
     est = int(getattr(cand, "est_cost", 0) or 0)
     cap = min(cfg.cost_cap_cand, cfg.cost_cap_round)
-    _trace(rows, "cost_cap", est <= cap, est_cost=est, cap=cap)
-    if est > cap:
+    # cost_governed=0（自托管、token 不计费）时这道直接让过：一个「估得贵但确实更好」
+    # 的候选不该因为不花钱的资源被拦在评分之前。trace 里仍然记下 est/cap，否则
+    # 事后读 gate_trace 会看不出「本来是会被拦的」。
+    ok_cap = (not cfg.cost_governed) or est <= cap
+    _trace(rows, "cost_cap", ok_cap, est_cost=est, cap=cap, governed=cfg.cost_governed)
+    if not ok_cap:
         return Decision("REJECT", Reason.COST_CAP.value, rows, {"est_cost": est, "cap": cap})
 
     level = int(getattr(cand, "level", 1) or 1)
@@ -227,7 +231,9 @@ def gate_b(ev: Evidence, cfg: Settings | None = None) -> Decision:
 
     if dQ <= thr:
         # 未过噪声门的三条例外（ΔB 不在其中）
-        if ev.dC < -cfg.c_save_min:
+        # 「更省就接受」只在 token 真花钱时才是一条额外的价值；成本不计费时，
+        # 它等于把 ΔQ=0 的「没有变好」记成一次改进 —— 所以下面用 governed 门控。
+        if cfg.cost_governed and ev.dC < -cfg.c_save_min:
             _trace(rows, "exception_cheaper", True, dC=round(ev.dC, 4))
             return Decision("ACCEPT", Accept.CHEAPER_EQUAL.value, rows,
                             {"dC": ev.dC, "mean_delta": dQ})
@@ -243,15 +249,57 @@ def gate_b(ev: Evidence, cfg: Settings | None = None) -> Decision:
 
     # ---- 6. 成本规则：ΔC ≤ β0 + β1·ΔQ ----
     allowance = cfg.beta0 + cfg.beta1 * dQ
-    ok_cost = ev.dC <= allowance
+    ok_cost = (not cfg.cost_governed) or ev.dC <= allowance
     _trace(rows, "cost_rule", ok_cost, dC=round(ev.dC, 4),
-           allowance=round(allowance, 4), dQ=round(dQ, 4))
+           allowance=round(allowance, 4), dQ=round(dQ, 4),
+           governed=cfg.cost_governed)
     if not ok_cost:
         return Decision("REJECT", Reason.COST_RULE.value, rows,
                         {"dC": ev.dC, "allowance": allowance, "dQ": dQ})
 
     return Decision("ACCEPT", Accept.VALIDATED.value, rows,
                     {"mean_delta": dQ, "delta_crit": thr, "n": pr.n, "dC": ev.dC})
+
+
+# ---------------------------------------------------------------- 台账状态
+
+#: 哪些拒绝属于**证伪**：这个改动本身被证明不成立/不该做，可以永久排除。
+REFUTING_REASONS = frozenset({
+    Reason.REGRESSION.value,            # 配对检验显著变差
+    Reason.CONTRACT_FLOOR.value,        # 踩了行为地板 / 靠削减计划提分
+    Reason.INERT_MECHANISM.value,       # 改了个不动行为的旋钮
+    Reason.BENCHMARK_LEAKAGE.value,     # 泄漏
+    Reason.FROZEN_CORE_VIOLATION.value,  # 越界
+    Reason.EDIT_BUDGET.value,           # 超出可审计的改动幅度
+})
+
+
+def ledger_status(dec: "Decision | None", *, stopped: str = "") -> str:
+    """判定 → 台账状态。**只有证伪才配得上 rejected**，其余一律 inconclusive。
+
+    为什么这是闭环能否收敛的关键：台账里一旦落成 ``rejected``，
+    ``Ledger.is_duplicate`` 就永远跳过这个假设，proposer 再也不会重提它 ——
+    而 ``rejected`` 原本只该表示「已证伪」。旧写法把两种完全不同的事件写成同一个状态：
+
+    - 一轮 78 个 run 里超时 1 个 → ``INCOMPLETE_EVIDENCE`` → 写成 rejected；
+      实测离线单 run 失败率 ≈ 3%（标定 32 个 run 挂了 1 个），于是一个假设的存活概率
+      只有 0.97^78 ≈ 9%，**几乎每轮都在用测量事故永久否决一个还没被检验过的改动**；
+    - Stage 1 止损只看了 4 个任务 × 2 rep（8 个 run-level delta，1.5 个标准误）就
+      提前收摊 → 也写成 rejected；那是「故意少花钱」的采样决定，不是结论；
+    - ``JUDGE_UNSTABLE`` 说的是**尺子**在抖，不是改动没用。
+
+    这些情况正确的状态是 ``inconclusive``（样本不足/判分不稳），它的语义正是「可重跑」；
+    台账本身还带着「连续 3 次 inconclusive 自动升级为 rejected」的兜底，所以不会陷入
+    无限重试。反过来，把真证伪写成 inconclusive 会让闭环反复撞同一堵墙，同样有害 ——
+    故此函数是白名单式的：只有 ``REFUTING_REASONS`` 落 rejected。
+    """
+    if stopped == "stop_loss":
+        return "inconclusive"
+    if dec is None:
+        return "inconclusive"
+    if dec.accepted:
+        return "accepted"
+    return "rejected" if dec.reason in REFUTING_REASONS else "inconclusive"
 
 
 # ---------------------------------------------------------------- 报告

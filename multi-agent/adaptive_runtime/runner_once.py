@@ -178,6 +178,31 @@ def _run_fake(args, out: Path) -> dict:
 
 # ---------------------------------------------------------------- 真实
 
+def _infra_error(usage: dict, score) -> str | None:
+    """这次 run 测的是「网络/服务」还是「harness」？基础设施故障绝不能当低分记账。
+
+    为什么必须在执行器就判掉：模型端点不可达时，agent 什么也没产出，判分会给出
+    Q=5.0（地板分）且 ``ok=True``。于是：
+
+    - 标定把「所有 run 都恰好 5.0」读成 sd=0 → 「噪声极低，标定通过」；
+    - 配对比较把两次网络故障读成「两臂持平」，于是真改进被当成噪声；
+    - 诊断层把这些 run 当成本轮症状，闭环给自己没跑过的失败开药。
+
+    三条都会让「自我改进」的结论建立在不存在的证据上，所以宁可丢掉一次 run（成本），
+    也不能让它进样本（污染）。判据用 token_probe 已经记录的**每次调用**的成功/失败：
+    它比 grep 日志字符串可靠 —— 日志文案会变，调用级 error 是框架自己写的。
+    """
+    calls = int(usage.get("calls") or 0)
+    errs = int(usage.get("errors") or 0)
+    if calls == 0:
+        return "本次 run 没有记录到任何一次 LLM 调用（探针未收到请求，或请求在发出前就崩了）"
+    if errs >= calls:
+        return f"全部 {calls} 次 LLM 调用都失败：测的是端点可达性，不是 harness"
+    if (errs / calls) >= 0.5 and float(getattr(score, "A", 1.0) or 0.0) == 0.0:
+        return f"{errs}/{calls} 次 LLM 调用失败且没有任何步骤达成：基础设施故障"
+    return None
+
+
 def _run_real(args, out: Path) -> dict:
     token_probe.install(sink=out / "tokens.jsonl")
     token_probe.clear()
@@ -199,9 +224,12 @@ def _run_real(args, out: Path) -> dict:
     write_json(out / "trace.json", trace.to_dict())
     write_score(score, out)
     write_json(out / "usage.json", usage)
-    return {"ok": True, "fake": False, "Q": score.Q, "A": score.A,
+    infra = _infra_error(usage, score)
+    return {"ok": infra is None, "fake": False, "Q": score.Q, "A": score.A,
             "tokens": usage["total"], "estimated_ratio": usage["estimated_ratio"],
-            "log": log_file, "finalized": bool((final_state or {}))}
+            "log": log_file, "finalized": bool((final_state or {})),
+            "calls": usage["calls"], "call_errors": usage["errors"],
+            **({"error": infra, "infra_error": True} if infra else {})}
 
 
 # ---------------------------------------------------------------- main

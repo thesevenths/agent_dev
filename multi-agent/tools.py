@@ -73,6 +73,11 @@ tavily_search = TavilySearch(
     max_results=5  # 返回前 5 个结果
 )
 
+# 离线检索层：ADAPTIVE_OFFLINE=1 时三个联网工具全部改为本地固定语料/快照，
+# 既不烧 Tavily 免费额度，也消除「同一 query 返回内容每天不同」注入的评分噪声。
+# 详见 offline_web.py 的模块说明。未设该变量时行为与改动前完全一致。
+import offline_web
+
 # 创建基类
 Base = declarative_base()
 # connect_timeout：PG 不可达时快速失败（默认会走 OS 级 TCP 超时，可达 100s+）。
@@ -121,6 +126,11 @@ def resilient_tavily_search(query: str) -> str:
 
     Returns: search results as a string.
     """
+    if offline_web.is_offline():
+        res = offline_web.search(query)
+        logger.info(f"[tavily][offline] query = {query!r} -> 本地语料（未联网）")
+        log_event(f"[tavily][offline] query = {query!r} -> 本地语料（未联网）")
+        return res
     norm = _norm_query(query)
     logger.info(f"[tavily] query = {query!r}")  # 便于在 langgraph dev 终端观察模型生成的 query
     log_event(f"[tavily] query = {query!r}")     # 持久化到本次运行的 log/ 时间戳文件
@@ -468,6 +478,10 @@ def get_nasdaq_top_gainers(top_n: int = 5) -> List[Dict]:
     Returns:
         List[Dict]: top n stock list，each include symbol, name, change_pct
     """
+    if offline_web.is_offline():
+        # 固定快照：结构（symbol/name/change_pct）与真实返回一致，避免下游解析分支变化
+        logger.info("[nasdaq][offline] 返回固定快照（未联网）")
+        return offline_web.nasdaq_top_gainers(top_n)
     url = "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved"
     
     # fetch more to ensure enough NASDAQ stocks
@@ -1088,6 +1102,12 @@ def get_crypto_sentiment_indicators():
       used in technical analysis [[1]][[5]]. If the API adds support (e.g., via new endpoints),
       they can be integrated by extending the endpoint list and parsing logic.
     """
+
+    if offline_web.is_offline():
+        # 走既有的「网络失败」降级路径（返回 None、不抛异常），不新增分支语义
+        offline_web.crypto_sentiment()
+        logger.info("[crypto][offline] 离线模式，跳过行情 API（返回 None，等同网络失败）")
+        return None
 
     try:
         # === Configuration ===

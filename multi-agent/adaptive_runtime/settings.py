@@ -36,12 +36,15 @@ class Paths:
     usage: Path = ROOT / "experiments" / "usage"
     #: Regression 集：只用于否决、永不参与演化的固定任务集（V3 §13.4）
     regression: Path = ROOT / "experiments" / "regression"
+    #: 落地台账：每条被写进生产的改动（.env 托管块 / prompt.py 补丁）与其回滚记录
+    landing: Path = ROOT / "experiments" / "landing"
+    landing_history: Path = ROOT / "experiments" / "landing" / "history.jsonl"
     log_dir: Path = ROOT / "log"
 
     def ensure(self) -> None:
         for p in (self.experiments, self.runs, self.tasks, self.worktrees,
                   self.quarantine, self.reports, self.ledger, self.experience,
-                  self.usage, self.regression):
+                  self.usage, self.regression, self.landing):
             p.mkdir(parents=True, exist_ok=True)
 
 
@@ -150,6 +153,10 @@ class Settings:
     #: 设为 2 是数学下限（df>=1）；实际有意义的检出能力要看 required_n()。
     min_tasks_for_t: int = field(default_factory=lambda: _env_int("ADAPTIVE_MIN_TASKS", 2, 2, 200))
     k_calib: int = field(default_factory=lambda: _env_int("ADAPTIVE_K_CALIB", 6, 2, 30))
+    #: 标定最少要几个「真的跑满 ≥2 次」的任务。少于它，sd(Δ) 是在退化样本上算的：
+    #: 两个全同的失败 run 就能给出 sd=0 → 「噪声极低，标定通过」，δ 于是归零，
+    #: 闭环会把任何噪声当成显著改进。宁缺勿假。
+    min_calib_tasks: int = field(default_factory=lambda: _env_int("ADAPTIVE_MIN_CALIB_TASKS", 4, 2, 64))
     alpha: float = field(default_factory=lambda: _env_float("ADAPTIVE_ALPHA", 0.05, 0.001, 0.4))
     power: float = field(default_factory=lambda: _env_float("ADAPTIVE_POWER", 0.80, 0.5, 0.99))
     #: 配对差值 sd 的目标上限（用于 calibrate 通过判据与 required_n 估算）。
@@ -164,6 +171,14 @@ class Settings:
     #: 单任务「显著变差」的判定阈值（Q 百分点）
     regression_min_points: float = field(
         default_factory=lambda: _env_float("ADAPTIVE_REGRESSION_MIN", 5.0, 0.1, 100.0))
+    #: 不计成本时（``cost_governed=0``）Stage 1 止损的**幅度**地板（Q 百分点）。
+    #: 止损只看 stage1_tasks 个任务，误触一次本轮就只剩 4 个任务级别的配对（df=3、δ≈12），
+    #: 几乎必然过不了门 —— 那是用一次噪声投票废掉整轮机时。所以此时额外要求
+    #: 「幅度 ≥ 本值 **且** 显著」才停（见 ``probe._stop_loss``）。
+    #: 取 10 分的依据：标定实测 sd_diff_null≈15 ⇒ 8 个 run 级配对的 se≈5.3、
+    #: t_crit(7)·se≈12.5，实际生效的是显著性那条；本值只是「不许用千分之几的下滑止损」的地板。
+    stop_loss_points: float = field(
+        default_factory=lambda: _env_float("ADAPTIVE_STOP_LOSS_POINTS", 10.0, 0.0, 100.0))
 
     # ---- 次要约束 ----
     r_max: float = field(default_factory=lambda: _env_float("ADAPTIVE_R_MAX", 0.15, 0.0, 1.0))
@@ -182,6 +197,16 @@ class Settings:
         default_factory=lambda: _env_int("ADAPTIVE_COST_CAP_ROUND", 15_000_000, 1, 10 ** 9))
     cost_cap_cand: int = field(
         default_factory=lambda: _env_int("ADAPTIVE_COST_CAP_CAND", 12_000_000, 1, 10 ** 9))
+    #: token 是否当作**受治理的稀缺资源**。默认 True = 保留三道成本裁决：
+    #: Gate A 的 COST_CAP、Gate B 的 COST_RULE（+5 分却 +50% 成本 → 否决）、
+    #: 以及「质量没变但更省 → 按 CHEAPER_EQUAL 接受」这条例外。
+    #:
+    #: 自托管 LLM（token 不计费）时置 0。理由是这三道在计费前提下才成立：
+    #: 它们会系统性拒绝「多花 token 换质量」的候选（例如把 ReAct 预算 15→25），
+    #: 于是优化目标与用户的真实约束相反；反向的「省 token 就接受」同样不该在
+    #: 免费时成立 —— 那会把一次「没有变好」记成一次改进，是最脏的假阳性。
+    #: 关掉后真正的资源手是墙钟：``run_timeout`` 与 C 分量里的截断/兜底惩罚。
+    cost_governed: bool = field(default_factory=lambda: _env_bool("ADAPTIVE_COST_GOVERNED", True))
 
     # ---- 演化 ----
     edit_budget_p0: int = field(default_factory=lambda: _env_int("ADAPTIVE_EDIT_BUDGET", 1, 1, 5))
@@ -212,8 +237,76 @@ class Settings:
         default_factory=lambda: _env_bool("ADAPTIVE_USE_GIT_WORKTREE", False))
     #: 单次真实 run 的软超时（秒）
     run_timeout: int = field(default_factory=lambda: _env_int("ADAPTIVE_RUN_TIMEOUT", 1800, 30, 86400))
+    #: 同一臂内并发跑的 run 数。默认 1 = 与旧的串行执行完全一致（零行为变化）。
+    #: 为什么必须有这一项：无人值守闭环的唯一硬约束是**墙钟**（单 run ≈ 18 分钟，
+    #: 一轮要 24–39 个 run ⇒ 数小时），而 token 成本不计。每个 run 是独立子进程 +
+    #: 独立沙箱 DB，天然可并发；瓶颈在 vLLM 侧的显存/吞吐，所以由使用者按机器定。
+    #: 并发不改变统计口径：配对键仍是 (task_id, rep)，两臂仍读同一份测量口径。
+    max_parallel: int = field(default_factory=lambda: _env_int("ADAPTIVE_MAX_PARALLEL", 1, 1, 32))
+    #: 单 run 失败（崩溃或超时）后的重跑次数。默认 1。
+    #: 为什么默认不是 0：``gate_b`` 对「缺任何一个 run」一律判 INCOMPLETE_EVIDENCE 并让
+    #: 整轮作废，而离线单 run 失败率实测 ≈ 3%（标定 32 个 run 挂了 1 个超时）⇒
+    #: 一轮 78 个 run 全干净的概率只有 0.97^78 ≈ 9%。不重试的话，闭环九成轮次在白烧墙钟。
+    #: 重试补的是**测量事故**而不是数据：拿回来的仍是同一个 (task, rep, arm) 真实跑出的 Q。
+    #: 上限 3：反复重跑同一个卡死的任务只会掩盖它 —— 超时本身是信息（C 分量会记它）。
+    probe_retry: int = field(default_factory=lambda: _env_int("ADAPTIVE_PROBE_RETRY", 1, 0, 3))
+
+    # ---- 任务画像（降本路径开关）----
+    #: 任务成本画像：``measured``（完整研报，单 run ≈ 65 万 token）
+    #: 或 ``lightweight``（轻量微任务，单 run ≈ 5 万 token）。
+    #: 切换画像不改变闭环逻辑，只改变单 run 成本估算与预算门限的对齐基准。
+    #: 这是「验证真正成立」的先决条件：把预算内可达的配对样本量 n
+    #: 与统计所需的 n 重新对齐。
+    task_profile: str = field(
+        default_factory=lambda: _env_str("ADAPTIVE_TASK_PROFILE", "measured").lower())
+
+    # ---- 离线模式（无人值守闭环的前提）----
+    #: 置 1 时三个联网工具（tavily / yahoo / cryptoracle）改为本地固定语料与快照。
+    #: 两个目的：(a) 不烧 Tavily 免费额度；(b) **降噪** —— 联网检索内容每天不同，
+    #: 会把 sd(Δ) 抬高到检不出真实改进的程度。省额度与降噪是同一件事。
+    offline: bool = field(default_factory=lambda: _env_bool("ADAPTIVE_OFFLINE", False))
+
+    # ---- 无人值守（自动换基线）----
+    #: 是否允许闭环自己 promote。默认 False = 保持人工门。
+    #: 打开后不是「无约束」，而是换成**比人工更严**的证据门（见 autopromote.policy）：
+    #: evolve 过配对门 + holdout 配对不退 + 回归集不命中 + 冻结完整 + 限次 + 可自动回滚。
+    #: 理由：人工门原本是「不漂移」的唯一保证；撤掉它必须用更强的锚定补上，
+    #: 否则闭环会追逐自己的噪声（拿上一轮候选当基线 = 无锚漂移）。
+    auto_promote: bool = field(default_factory=lambda: _env_bool("ADAPTIVE_AUTO_PROMOTE", False))
+    #: 单次 benchmark/auto 运行内允许的自动 promote 次数上限（跑飞保险）。
+    auto_promote_max: int = field(default_factory=lambda: _env_int("ADAPTIVE_AUTO_PROMOTE_MAX", 5, 0, 50))
+    #: 是否把被接受的改动真正落到生产代码/env（写 .env 托管块 / 打 prompt.py 补丁）。
+    #: False 时只记版本、不改生产文件 —— 于是「版本升了但 agent 行为没变」，
+    #: 这是自欺，因此 auto_promote 打开时应当同时打开本项才有意义。
+    land_changes: bool = field(default_factory=lambda: _env_bool("ADAPTIVE_LAND_CHANGES", True))
+    #: 是否在落地后自动 git commit。默认 False —— 提交/推送属于必须由人明确授权的动作。
+    #: 关闭时 BaseVersion 用内容 hash 而非 commit 做归属（见 landing.content_stamp）。
+    auto_commit: bool = field(default_factory=lambda: _env_bool("ADAPTIVE_AUTO_COMMIT", False))
+    #: holdout 的容忍带：自动 promote 要求 holdout 配对 mean(Δ) > -holdout_tol。
+    holdout_tol: float = field(
+        default_factory=lambda: _env_float("ADAPTIVE_HOLDOUT_TOL", 5.0, 0.0, 100.0))
+    #: holdout 每个任务的配对重复次数（算 holdout 配对证据用，比 evolve 少以控时间）。
+    holdout_reps: int = field(default_factory=lambda: _env_int("ADAPTIVE_HOLDOUT_REPS", 2, 1, 20))
 
     # ------------------------------------------------------------ 派生
+
+    @property
+    def avg_tokens_default(self) -> int:
+        """随任务画像返回单 run token 估算默认值（供 CLI ``--avg-tokens`` 兜底）。"""
+        if self.offline:
+            from .bench_tasks import OFFLINE_PROFILE
+            return OFFLINE_PROFILE.tokens_per_run
+        if self.task_profile == "lightweight":
+            from .bench_tasks import LIGHTWEIGHT_PROFILE
+            return LIGHTWEIGHT_PROFILE.tokens_per_run
+        from .bench_tasks import MEASURED_TOKENS_PER_RUN
+        return MEASURED_TOKENS_PER_RUN
+
+    @property
+    def seconds_per_run(self) -> float:
+        """当前口径下的单 run 墙钟实测值（预估用）。"""
+        from .bench_tasks import profile_for
+        return profile_for(offline=self.offline, task_profile=self.task_profile).seconds_per_run
 
     def normalized_weights(self) -> tuple[float, float, float]:
         total = self.w_a + self.w_e + self.w_c
@@ -223,6 +316,17 @@ class Settings:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def measure_mode(self) -> dict[str, Any]:
+        """本轮测量口径（写进每轮 meta，供跨轮核对「两次数是不是同一把尺」）。"""
+        return {"offline": self.offline, "task_profile": self.task_profile,
+                "stage": self.stage, "max_edit_level": self.max_edit_level,
+                "n": self.n_default, "alpha": self.alpha,
+                "auto_promote": self.auto_promote, "land_changes": self.land_changes,
+                "cost_governed": self.cost_governed,
+                # 权重也是尺子的一部分：改了 w_* 就换了 Q 的含义，跨轮对比时必须看得见
+                "weights": [round(x, 4) for x in self.normalized_weights()],
+                "max_parallel": self.max_parallel}
 
 
 CFG = Settings()
@@ -246,6 +350,23 @@ def validate() -> list[str]:
     if CFG.cost_cap_cand > CFG.cost_cap_round:
         problems.append("单候选预算大于单轮预算，按单轮预算截断")
         CFG.cost_cap_cand = CFG.cost_cap_round
+
+    # ---- 无人值守的安全提示（缺件时自动 promote 等于拿假设当证据）----
+    if CFG.auto_promote:
+        if not CFG.offline:
+            problems.append("auto_promote 已开但未开离线模式：联网检索内容会逐日变化，"
+                            "sd(Δ) 虚高使 δ 失真；无人值守跑法应当 ADAPTIVE_OFFLINE=1")
+        if not (PATHS.calibration.exists()):
+            problems.append("auto_promote 已开但未标定：δ 用的是假设值 sd_diff_target="
+                            f"{CFG.sd_diff_target}，自动换基线的门槛因此不成可信；先跑 calibrate")
+        if not CFG.land_changes:
+            problems.append("auto_promote 已开但 land_changes=0：版本会升而生产行为不变，"
+                            "得到的「改进」无法在后续真实任务上生效")
+
+    # ---- 并发：本身不改变数，但会改变失败形态，必须在报告里可见 ----
+    if CFG.max_parallel > 1:
+        problems.append(f"并发度={CFG.max_parallel}：单 run 超时会因排队/显存争用而上升，"
+                        "若出现 timeout 或 run 失败率升高，请调低 ADAPTIVE_MAX_PARALLEL")
 
     # ---- 检出能力提示：n 过小时，δ 会大到任何真实改进都无法过门 ----
     # 该情形不属于配置错误，而是本轮不具备检出能力；须在执行前明确告知，避免数小时无效运行。

@@ -286,7 +286,165 @@ A 被自主定位后，提案器生成的首个候选为 `prompt.py::coder.requi
 
 ---
 
-## 8. 证据边界
+## 8. 基准数据集选择与样本量规划
+
+### 8.1 关于 RRSI 论文的事实核查
+
+拟用于对外材料前，已对原始出处逐项核对，结论如下：
+
+| 待核查项 | 核查结果 |
+|---|---|
+| 论文是否真实存在 | **属实**。`RRSI: Regularized Recursive Self-Improvement of Agent Harnesses`，arXiv:2609.24972，2026-09-21 提交，v2 修订于 09-23 |
+| 作者与机构 | Peng Xia、Rujun Han、Zifeng Wang 等，Google Cloud AI Research，合作方含 Stanford、Washington University in St. Louis |
+| 代码是否开源 | **属实**。github.com/google-research/rrsi，Apache-2.0 |
+| 是否使用 "workbuddy benchmark" | **否。8 个基准中无此名称。** |
+| "效果提升 11%" | **原文查无此数。** |
+
+论文实际评测的 8 个基准（3 个领域）：
+
+| 领域 | Evolve 集（参与优化） | Held-out（留出） |
+|---|---|---|
+| Coding | Terminal-Bench 2.1 | SWE-bench Verified（OOD） |
+| Agentic workspace | Harvey LAB | JobBench、GDPval、APEX-Agents（均 OOD） |
+| Engineering design | EngDesign | Frontier-Eng（OOD） |
+
+论文原文报告的量级（arXiv v3）：
+
+- evolve split **最高 +6.0 分**（Terminal-Bench 2.1：74.2% → 80.2%）
+- 5 个 OOD 基准 **最高 +4.3 分**
+- 相对平均先验基线 **最多 +12.5%**（`"outperforming the average prior baseline by up to 12.5%"`）
+- 策略 token 较无正则化演化 **减少 30%**（2.42M vs 3.80M / trial）
+
+**两点必须提醒，否则会在尽调环节被问倒：**
+
+1. 部分二手报道引用的数字是 **+14.1 / +4.7**，与 arXiv v3 原文的 **+6.0 / +4.3** 不一致。
+   差异可能源于版本修订（报道基于 v1）。**对外材料须直接引用 arXiv 原文并标注版本号**，
+   不要转引二手报道。
+2. "提升 11%" 无法在任何一版原文中定位。若确实需要引用提升幅度，
+   应使用原文明确写出的 **"up to 12.5%"（相对平均先验基线）**，并注明其口径。
+
+### 8.2 任务集必须分层，否则无法区分提升与记忆
+
+现有 `experiments/tasks/replay.json` 有 **20 个真实任务**（由历史日志反推而来）。
+但历史日志同时是诊断层的输入——若这批任务既用于诊断、又用于 probe、
+又用于经验写入，则等同于用作业当考卷，测得的提升无法与记忆效应区分。
+
+因此引入三层划分（`adaptive_runtime/bench_tasks.py`）：
+
+| 层 | 是否参与演化 | 回答的问题 |
+|---|---|---|
+| Evolve | 是 | 该候选在当前任务上是否更优 |
+| ID held-out | 否 | 同分布任务上是否泛化 |
+| OOD | 否 | 跨任务族 / 跨环境是否泛化 |
+
+划分依据为 **task_id 的稳定哈希**而非列表下标，保证：
+同一任务在任何一次运行中落到同一层（跨轮可比）；
+新增任务不打乱已有分层（历史结论可复现）。
+
+按 `evolve 50% / id 20% / ood 30%` 划分现有 20 个任务的结果：
+
+```
+evolve     13   REP-002/003/004/008/009/010/011/013/015/017/018/019/020
+id_heldout  3   REP-005, REP-007, REP-012
+ood         4   REP-001, REP-006, REP-014, REP-016
+```
+
+已验证：乱序输入后分层结果完全一致，无跨层泄漏。
+
+**注意**：这三层是同一分布内的切分，因此 `ood` 层**不等于**论文意义上的跨环境 OOD。
+要声称跨环境泛化，仍需接入真正的外部基准。
+
+### 8.3 外部基准：最匹配的是 APEX-Agents，但尚未接入
+
+RRSI 论文 8 个基准中，与本仓库「专业交付物生成」定位最匹配、
+且公开可下载的是 **APEX-Agents**（HuggingFace `mercor/apex-agents`，CC-BY 4.0）：
+
+- 480 任务 / 33 worlds，覆盖投资银行、管理咨询、法律
+- 每 world 约 166 个文件（财报、SEC 文件、合同、slides 模板）
+- rubric 判定：共 1948 条二元标准，平均每任务 4.06 条
+- 与本项目 `E`（证据率）指标天然契合——rubric 大量涉及「数字是否有出处」
+
+接入需要两项独立工作，本模块**只定义接口、未实现**：
+
+1. **adapter**：把基准任务映射为本仓库的 `query` + `family`；
+2. **grader**：把本仓库产物映射回基准 rubric 的二元判定。
+
+在这两项完成前，**不得声称已在外部基准上验证**。
+`bench_tasks.external_status()` 会把接入状态显式输出，任何越界声称都可被机器证伪。
+
+### 8.4 硬约束：噪声与成本的乘积
+
+样本量按配对 t 检验近似式 `n ≈ (z_{1-α/2} + z_power)² · sd² / effect²`：
+
+| 配对差值 sd | 检出 ΔQ=5 | ΔQ=10 | ΔQ=15 | ΔQ=20 | ΔQ=30 |
+|---|---|---|---|---|---|
+| 6.0（原配置假设） | 12 | 3 | 2 | 1 | 1 |
+| 15.0（现配置） | 74 | 19 | 9 | 5 | 3 |
+| **24.5（实测）** | **189** | **48** | **21** | **12** | **6** |
+
+换算为墙钟（单次 run 65 万 token / 1109 秒，每个配对 2 个 run）：
+
+| n | run 数 | token | 墙钟 |
+|---|---|---|---|
+| 12 | 24 | 1560 万 | 7.4 小时 |
+| 48 | 96 | 6240 万 | 29.6 小时 |
+| 189 | 378 | 24570 万 | 116 小时 |
+
+**这条约束是决定性的**：在当前单次 run 成本下，体系只可能对 **≥20 分** 的大改进敏感。
+论文量级的 OOD 提升（约 +4 分，相对提升 7%~13%）在此噪声水平下**无法被检出**，
+需要 n≈1200 配对，不具备可行性。
+
+因此验证策略不应是「硬跑完整 benchmark」，而是二选一：
+
+| 路径 | 做法 | 适用 |
+|---|---|---|
+| **A. 降本**（推荐） | 设计轻量任务集，把单次 run 从 65 万 token 降到 5 万量级 | 想真正测出小改进 |
+| **B. 降噪** | 提高温度以外的确定性（固定工具返回、缓存检索结果） | 想在当前任务集上测 |
+
+在两条路径完成前，对外只能声称「机制已接通且自检可信」，
+**不能声称「已验证 agent 自动变强」**。
+
+### 8.5 降本路径已落地（A 路径实现）
+
+§8.4 的 A 路径已在本仓库实现为**任务成本画像（RunProfile）切换**，不改动闭环任何逻辑。
+
+**实现位置**
+
+| 组件 | 文件 / 符号 | 作用 |
+|---|---|---|
+| 画像定义 | `adaptive_runtime/bench_tasks.py`：`RunProfile` / `MEASURED_PROFILE` / `LIGHTWEIGHT_PROFILE` | 单 run token/秒画像；轻量画像为 5 万 token / 120 秒（实测的 ≈1/13） |
+| 任务生成 | `bench_tasks.py`：`generate_lightweight_tasks(n, seed)` | 确定性生成窄口径定量简报，刻意留 C/E 余量（强制覆盖子问题 + 必须引源） |
+| 成本计划 | `bench_tasks.py`：`plan_cost(..., profile=...)`、`lightweight_cost_plan(...)` | 预算估算随画像切换 |
+| 可行性证据 | `bench_tasks.py`：`cost_vs_detectability()` | 产出「效果 × 噪声 × 画像」成本对照表 |
+| 开关 | `adaptive_runtime/settings.py`：`task_profile`（env `ADAPTIVE_TASK_PROFILE=measured\|lightweight`） | 默认单 run token 估算随之切换；`run_adaptive.py` 的 `--avg-tokens` 默认值已接到 `CFG.avg_tokens_default` |
+
+**为什么留余量**：轻量任务要求「必须覆盖 (a)(b)(c)…」且「至少 N 个来源」——基线 agent 常漏答子问题（C 低）或断言无出处（E 低）。RRSI 闭环若在 evolve 轮吃到这类惩罚，就能在 ID/OOD 上体现真实提升，而非靠任务记忆刷分。
+
+**落地产物**
+
+- `experiments/tasks/lightweight.json`：60 个确定性轻量任务（seed=0），已按既有稳定哈希三层切分（evolve 36 / id_heldout 9 / ood 15，零跨层重叠）。
+- `experiments/reports/cost_vs_detectability.json`：成本对照表机器可读版本。
+
+**核心结论（来自 `cost_vs_detectability()`，cap=15M）**
+
+| sd | ΔQ | n | measured 成本 | lightweight 成本 | 落预算？ |
+|---|---|---|---|---|---|
+| 24.5（实测） | 10 | 48 | 62.4M ✗ | **4.8M ✓** | 轻量可行 |
+| 24.5（实测） | 4 | 295 | 383.5M ✗ | 29.5M ✗ | 仍超预算 |
+| 15.0（降噪目标） | 4 | 111 | 144.3M ✗ | **11.1M ✓** | 轻量可行 |
+| 15.0（降噪目标） | 10 | 18 | 23.4M ✗ | 1.8M ✓ | 轻量可行 |
+
+**含义**：
+
+1. **降本使 ΔQ≥10 的验证在实测噪声下也落预算**（4.8M ≤ 15M）——「验证」从经济上不可行变为可行。一个典型轻量闭环（evolve 8 任务 ×2 reps ×3 轮 + holdout 8×3 轮）= 120 run / 6.0M token / ≈4 小时墙钟。
+2. **论文量级的 ΔQ≈4 仍需降噪（B 路径）**：把 sd 从 24.5 压到 ~15 后，轻量画像下 11.1M 才落预算；不降噪时 29.5M 仍超 2 倍。即**降本为必要前提、降噪为加速器**。
+3. 实测画像下**任何**效果量级都超预算（全 ✗），这正解释了此前「验证」为何不成立。
+
+**对外口径（未变）**：可声称「降本路径已落地、ΔQ≥10 的验证在预算内可行、机制与判定器自检可信」；在真实多轮 benchmark 跑出过门 ΔQ 序列 + holdout 同步上升之前，**仍不能声称「已验证 agent 自动变强」**。
+
+---
+
+## 9. 证据边界
 
 | 项目 | 现状 | 原因 |
 |---|---|---|
@@ -307,7 +465,7 @@ A 被自主定位后，提案器生成的首个候选为 `prompt.py::coder.requi
 
 ---
 
-## 9. 复现命令
+## 10. 复现命令
 
 ```bash
 python -m adaptive_runtime.run_adaptive selftest          # 9/9，含阴性 / 阳性对照

@@ -124,5 +124,40 @@ class TestGateB(unittest.TestCase):
         self.assertIn("REJECT(within_noise)", explain(d))
 
 
+class TestCostNotGoverned(unittest.TestCase):
+    """``ADAPTIVE_COST_GOVERNED=0``（自托管 LLM、token 不计费）下的三道成本裁决。
+
+    它们是一个前提的三个面：token 是稀缺资源。前提不成立时，既不因贵而拒，
+    也不因省而收 —— 后者会把「没变好」记成「改进」。
+    """
+
+    def setUp(self):
+        self.cfg = Settings(cost_governed=False)
+
+    def test_cost_cap_skipped_but_traced(self):
+        d = gate_a(cand(est_cost=10 ** 9), [], [], self.cfg)
+        self.assertTrue(d.accepted, d.to_dict())
+        row = next(r for r in d.gate_trace if r["check"] == "cost_cap")
+        self.assertTrue(row["pass"])
+        self.assertFalse(row["governed"])
+        self.assertEqual(row["est_cost"], 10 ** 9, "trace 里要能看出本来是会被拦的")
+
+    def test_expensive_but_better_is_accepted(self):
+        d = gate_b(ev(deltas=[5] * 8, dC=0.5), self.cfg)
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.reason, Accept.VALIDATED.value)
+
+    def test_within_noise_not_flipped_by_savings(self):
+        d = gate_b(ev(deltas=[0, 0, 0], dC=-0.10), self.cfg)
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.reason, Reason.WITHIN_NOISE.value)
+
+    def test_default_still_governs(self):
+        """零回归：默认（计费口径）下三道照旧生效。"""
+        self.assertTrue(Settings().cost_governed)
+        self.assertEqual(gate_b(ev(deltas=[5] * 8, dC=0.5), Settings()).reason,
+                         Reason.COST_RULE.value)
+
+
 if __name__ == "__main__":
     unittest.main()

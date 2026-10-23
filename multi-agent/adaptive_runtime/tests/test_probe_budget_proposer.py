@@ -74,6 +74,21 @@ class TestBudget(unittest.TestCase):
     def test_estimate(self):
         self.assertEqual(estimate_round_tokens(1000, 8, overhead=0), 16000)
 
+    def test_from_settings_unbounded_when_cost_not_governed(self):
+        """token 不计费时，预算不得拦腰截断 run 序列（缺 run 会让整轮证据作废）。"""
+        b = Budget.from_settings(Settings(cost_governed=False))
+        self.assertGreaterEqual(b.cap_round, 10 ** 11)
+        b.spend(10 ** 10, "c1")               # 不该抛 BudgetExceeded
+        self.assertTrue(b.can_spend(10 ** 10, "c1"))
+
+    def test_from_settings_keeps_caps_when_governed(self):
+        cfg = Settings(cost_governed=True, cost_cap_round=5_000_000,
+                       cost_cap_cand=4_000_000)
+        b = Budget.from_settings(cfg)
+        self.assertEqual((b.cap_round, b.cap_cand), (5_000_000, 4_000_000))
+        with self.assertRaises(BudgetExceeded):
+            b.spend(4_000_001, "c1")
+
     def test_degraded_n(self):
         cfg = Settings(cost_cap_round=1_000_000)
         self.assertGreaterEqual(degraded_n(200_000, cfg), 0)

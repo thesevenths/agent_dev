@@ -45,6 +45,12 @@ FROZEN_ENV: tuple[str, ...] = (
     "AGENT_CRITIC_MIN_LEN", "AGENT_ACTION_PROBES", "AGENT_CRITIC_RETRIES",
     "AGENT_STEP_FAILURES_MAX", "AGENT_TRUNCATED_SALVAGE", "AGENT_SALVAGE_EXTS",
     "AGENT_FINAL_ADJUDICATE", "AGENT_CRITIC_LLM",
+    # ---- 测量口径的一部分（2026-10-23 加入）----
+    # 离线开关与任务画像不改变「怎么打分」的符号，但它改变了「agent 能看到什么数据」
+    # 与「任务有多重」——于是它改变了分数本身。若候选可以随手切换它，
+    # 「base 臂联网、cand 臂离线」就能造出一个纯 artifactual 的 ΔQ。
+    # 副作用：build_manifest 会把它们写进 env 快照，promote 记录因此可回溯「在哪种口径下测的」。
+    "ADAPTIVE_OFFLINE", "ADAPTIVE_TASK_PROFILE",
 )
 
 
