@@ -169,7 +169,8 @@ def run_benchmark(tasks: list[dict], *, rounds: int = 3, n: int = 4,
                   task_label: str = "bench", fake_profiles: dict[str, str] | None = None,
                   keep_sandbox: bool = False,
                   cfg: Settings | None = None,
-                  on_accept=None) -> dict:
+                  on_accept=None,
+                  ledger_path: str | Path | None = None) -> dict:
     """跑 rounds 轮闭环，返回曲线与结论。
 
     ``on_accept(cand, rr, ctx)``：每轮 ACCEPT 后的回调（``auto.py`` 用它做自动换基线）。
@@ -183,7 +184,10 @@ def run_benchmark(tasks: list[dict], *, rounds: int = 3, n: int = 4,
     out = Path(out_dir) if out_dir else (PATHS.experiments / "benchmark" /
                                          f"{task_label}-{now_stamp()}")
     out.mkdir(parents=True, exist_ok=True)
-    ledger = Ledger()
+    #: ledger_path 不传时退回全局默认（向后兼容：selftest / 单测仍走全局文件）。
+    #: 传则按实验隔离（experiments/auto/<label>/ledger.jsonl），避免跨实验污染，
+    #: 且能随 --no-resume 重置 —— 全局 ledger 做不到这两点。
+    ledger = Ledger(ledger_path) if ledger_path else Ledger()
     store = Store()
     results: list[RoundResult] = []
     base_before = version.current()

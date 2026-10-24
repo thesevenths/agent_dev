@@ -62,6 +62,116 @@ SEARCH_SPACE: dict[str, dict] = {
         "taxonomies": (Taxonomy.PLANNING_FAILURE,),
         "rationale": "计划增长上限，改它等于改控制流", "expectation": "structure",
     },
+    # ---- L3 结构层：代码级补丁（kind=code）----
+    # 为什么是「代码」而不是「参数/提示」：PLANNING_FAILURE 的根因在控制流里
+    # （计划缺校验、replan 空转），调参数/L2 提示改不到结构。这些候选由 landing.land_code
+    # 把带哨兵的代码块插入 supervisor.py 的锚点之前，可落地、可回滚（逐字删除哨兵块）。
+    # 每条都是「可证伪」假设：某个真实规划失败模式由某段控制流缺失导致。
+    # 跨项目通用：校验「每步可验收 / 无重复步骤 / 绑定执行体 / replan 熔断」是任何多步
+    # 计划代理都应具备的健壮性，与具体业务域无关。
+    "supervisor.B1_plan_validator": {
+        "kind": "code", "level": 3, "file": "supervisor.py",
+        "anchor": "            if plan:",
+        "values": ["on"],
+        "taxonomies": (Taxonomy.PLANNING_FAILURE,),
+        "rationale": "计划每步须具备标题与可执行描述，否则视为不可靠而回退单轮路由",
+        "expectation": "improve",
+        "insert": (
+            "            if plan is not None:\n"
+            "                try:\n"
+            "                    _steps = plan if isinstance(plan, list) else []\n"
+            "                    _bad = 0\n"
+            "                    for _s in _steps:\n"
+            "                        if not (isinstance(_s, dict)\n"
+            "                                and str(_s.get(\"title\", \"\")).strip()\n"
+            "                                and str(_s.get(\"description\", \"\")).strip()):\n"
+            "                            _bad += 1\n"
+            "                    if not _steps or _bad:\n"
+            "                        logger.warning(\n"
+            "                            \"[rrsi:B1] plan structurally invalid (%d/%d steps malformed); \"\n"
+            "                            \"falling back to direct routing\" % (_bad, len(_steps))\n"
+            "                        )\n"
+            "                        plan = None\n"
+            "                except Exception as _b1e:\n"
+            "                    logger.debug(\"[rrsi:B1] validator skipped: %s\" % _b1e)\n"
+        ),
+    },
+    "supervisor.B2_plan_dedup": {
+        "kind": "code", "level": 3, "file": "supervisor.py",
+        "anchor": "                logger.info(f\"Supervisor created execution plan (goal={goal!r}):",
+        "values": ["on"],
+        "taxonomies": (Taxonomy.PLANNING_FAILURE,),
+        "rationale": "计划自审：去除重复步骤标题，避免冗余执行",
+        "expectation": "improve",
+        "insert": (
+            "                try:\n"
+            "                    _seen = set()\n"
+            "                    _deduped = []\n"
+            "                    for _s in (plan or []):\n"
+            "                        _t = str(_s.get(\"title\", \"\")).strip()\n"
+            "                        if _t and _t in _seen:\n"
+            "                            continue\n"
+            "                        _seen.add(_t)\n"
+            "                        _deduped.append(_s)\n"
+            "                    if len(_deduped) < len(plan or []):\n"
+            "                        logger.warning(\n"
+            "                            \"[rrsi:B2] removed %d duplicate step(s) from plan\"\n"
+            "                            % (len(plan or []) - len(_deduped))\n"
+            "                        )\n"
+            "                        plan = _deduped\n"
+            "                except Exception as _b2e:\n"
+            "                    logger.debug(\"[rrsi:B2] self-review skipped: %s\" % _b2e)\n"
+        ),
+    },
+    "supervisor.B3_tool_aware_planning": {
+        "kind": "code", "level": 3, "file": "supervisor.py",
+        "anchor": "            plan = _normalize_plan(response.get(\"execution_plan\"))",
+        "values": ["on"],
+        "taxonomies": (Taxonomy.PLANNING_FAILURE,),
+        "rationale": "计划每步必须绑定具体执行 agent，缺失补默认路由，避免空转",
+        "expectation": "improve",
+        "insert": (
+            "            try:\n"
+            "                _raw_plan = response.get(\"execution_plan\") or []\n"
+            "                if isinstance(_raw_plan, list):\n"
+            "                    for _step in _raw_plan:\n"
+            "                        if isinstance(_step, dict) and not str(_step.get(\"agent\", \"\")).strip():\n"
+            "                            _step[\"agent\"] = \"context_engineer_agent\"\n"
+            "                    response[\"execution_plan\"] = _raw_plan\n"
+            "            except Exception as _b3e:\n"
+            "                logger.debug(\"[rrsi:B3] tool-aware check skipped: %s\" % _b3e)\n"
+        ),
+    },
+    "supervisor.B4_replan_breaker": {
+        "kind": "code", "level": 3, "file": "supervisor.py",
+        "anchor": "                if finish_reason is not None:",
+        "values": ["on"],
+        "taxonomies": (Taxonomy.PLANNING_FAILURE,),
+        "rationale": "replan 连续 ≥3 次无变化后强制收尾，打破空转死循环",
+        "expectation": "improve",
+        "insert": (
+            "                try:\n"
+            "                    if streak >= 3:\n"
+            "                        logger.warning(\n"
+            "                            \"[rrsi:B4] replan no-op streak=%d >= 3; forcing finish to break replan spin\" % streak\n"
+            "                        )\n"
+            "                        final_plan = _mark_progress(plan, len(plan))\n"
+            "                        flush_timing_summary()\n"
+            "                        return {\n"
+            "                            \"next\": \"FINISH\",\n"
+            "                            \"reason\": \"Replan spin breaker after %d no-op replans\" % streak,\n"
+            "                            \"current_step\": len(final_plan),\n"
+            "                            \"execution_plan\": final_plan,\n"
+            "                            \"plan_goal\": state.get(\"plan_goal\"),\n"
+            "                            \"run_started_at\": state.get(\"run_started_at\"),\n"
+            "                            \"plan_summary\": summary_ctx,\n"
+            "                            \"summary_obs_seen\": _obs_total(state),\n"
+            "                            \"replan_noop_streak\": streak,\n"
+            "                        }\n"
+            "                except Exception as _b4e:\n"
+            "                    logger.debug(\"[rrsi:B4] breaker skipped: %s\" % _b4e)\n"
+        ),
+    },
 }
 
 #: ---- L2 提示层补丁（P1，由 ``ADAPTIVE_MAX_EDIT_LEVEL`` 打开）----
@@ -408,6 +518,8 @@ def propose(dominant: str, ledger: Ledger, cfg: Settings | None = None,
         old = current_value(target)
         if spec.get("is_prompt") and old == "live":
             continue          # 已上线的补丁：再提就是插两遍，必须跳过而不是当新假设
+        if spec.get("kind") == "code" and old == "live":
+            continue          # 已落地的代码补丁：再提就是插两遍哨兵块，必须跳过
         for new in _adjacent(list(spec["values"]), old):
             if new == old:
                 continue

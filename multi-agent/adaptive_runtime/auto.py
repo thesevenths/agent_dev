@@ -224,6 +224,11 @@ def run_auto(tasks: list[dict], *, rounds: int = 3, n: int | None = None,
     state = load_state(out) if resume else {}
     if state and state.get("task_hash") != th:
         state = {}                      # 任务集换了 ⇒ 旧曲线不可续
+    #: 每实验隔离的假设台账：续跑载入已有记忆；全新跑（--no-resume）或任务集变更时清空，
+    #: 避免跨实验污染，也保证「全新曲线」不带旧假设记忆（全局 ledger 这两点都做不到）。
+    ledger_path = out / "ledger.jsonl"
+    if (not resume or not state) and ledger_path.exists():
+        ledger_path.unlink()
     done = int(state.get("rounds_done") or 0)
     if done >= rounds:
         _say = on_progress or (lambda m: None)
@@ -257,7 +262,8 @@ def run_auto(tasks: list[dict], *, rounds: int = 3, n: int | None = None,
         keep_sandbox=keep_sandbox, cfg=cfg,
         on_accept=make_on_accept(tally, cfg, verify=verify,
                                  fake_profiles=fake_profiles,
-                                 keep_sandbox=keep_sandbox))
+                                 keep_sandbox=keep_sandbox),
+        ledger_path=ledger_path)
     if "error" in report:
         return {"error": report["error"], "state": state}
 

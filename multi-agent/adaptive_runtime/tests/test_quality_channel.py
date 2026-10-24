@@ -199,6 +199,32 @@ class TestProposerRouting(unittest.TestCase):
         self.assertIn(Taxonomy.COMPLETENESS_FAILURE, Taxonomy.QUALITY)
         self.assertTrue(set(Taxonomy.ALL) >= set(Taxonomy.HARD) | set(Taxonomy.QUALITY))
 
+    def test_summarize_prioritizes_quality_over_planning_noise(self):
+        """诊断细化（V3 §诊断）：只要出现质量缺陷，dominant 必为质量通道。
+
+        否则闭环会被更高频的 PLANNING_FAILURE（replan≥2 的粗粒度噪声）主导，
+        反复拧 replan 旋钮而忽略真正拉低 Q 的证据率缺陷。
+        """
+        findings = [
+            diagnosis.Finding(Taxonomy.PLANNING_FAILURE, "supervisor", 0, reason="replan 3 次"),
+            diagnosis.Finding(Taxonomy.PLANNING_FAILURE, "supervisor", 0, reason="replan 4 次"),
+            diagnosis.Finding(Taxonomy.PLANNING_FAILURE, "supervisor", 0, reason="replan 5 次"),
+            diagnosis.Finding(Taxonomy.EVIDENCE_FAILURE, "DataAgent", 0, reason="证据率 0.10"),
+        ]
+        dsum = diagnosis.summarize(findings, Settings())
+        self.assertEqual(dsum["dominant"], Taxonomy.EVIDENCE_FAILURE,
+                         "质量缺陷必须优先于更高频的 PLANNING_FAILURE")
+
+    def test_summarize_falls_back_to_frequency_without_quality(self):
+        """无质量缺陷时回落到硬失败频率主导（向后兼容）。"""
+        findings = [
+            diagnosis.Finding(Taxonomy.PLANNING_FAILURE, "supervisor", 0, reason="replan"),
+            diagnosis.Finding(Taxonomy.PLANNING_FAILURE, "supervisor", 0, reason="replan"),
+            diagnosis.Finding(Taxonomy.EXECUTION_FAILURE, "CodeAgent", 1, reason="x"),
+        ]
+        dsum = diagnosis.summarize(findings, Settings())
+        self.assertEqual(dsum["dominant"], Taxonomy.PLANNING_FAILURE)
+
 
 def _report_text(with_sources: bool) -> str:
     """生成一份体积达标的报告；``with_sources=True`` 时每段补上来源标记。"""

@@ -219,13 +219,24 @@ def summarize(findings: list[Finding], cfg: Settings | None = None) -> dict:
     hint = ""
     if unknown_ratio > cfg.unknown_max:
         hint = ("UNKNOWN 占比超过阈值：taxonomy 已超前于埋点，应先补字段而不是增加类别")
+
+    # 质量缺陷通道优先（V3 §诊断细化）：只要出现 EVIDENCE/COMPLETENESS_FAILURE，
+    # 它就是真正拉低 Q 的根因 —— 而 PLANNING_FAILURE 只是「replan≥2」的粗粒度噪声。
+    # 让闭环优先攻击质量缺陷（例如 require-sources 提示补丁），而不是反复拧 replan 旋钮。
+    # 仅当 run 根本没产出报告（quality_findings 不触发）时，才回落到硬失败频率主导。
+    quality_counts = Counter(f.taxonomy for f in findings if f.taxonomy in Taxonomy.QUALITY)
+    if quality_counts:
+        dominant = quality_counts.most_common(1)[0][0]
+    else:
+        dominant = counts.most_common(1)[0][0] if counts else Taxonomy.UNKNOWN
+
     return {
         "counts": dict(counts),
         "total": sum(counts.values()),
         "unknown_ratio": round(unknown_ratio, 4),
         "unknown_max": cfg.unknown_max,
         "hint": hint,
-        "dominant": counts.most_common(1)[0][0] if counts else Taxonomy.UNKNOWN,
+        "dominant": dominant,
     }
 
 
