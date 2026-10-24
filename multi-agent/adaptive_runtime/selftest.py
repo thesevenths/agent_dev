@@ -17,7 +17,7 @@ from .evaluator import score_trace
 from .gate import Reason, gate_b
 from .io_util import now_stamp, write_json
 from .probe import cleanup, probe_candidate
-from .proposer import falsification_candidate, zero_change_candidate
+from .proposer import falsification_candidate, zero_change_candidate, Candidate
 from .settings import CFG, PATHS
 from .trace_export import export_from_log
 
@@ -47,6 +47,171 @@ def _run_case(name: str, base_profile: str, cand_profile: str,
             "delta_crit": round(ev.paired().delta_crit, 4),
             "decision": decision.decision, "reason": decision.reason,
             "gate_trace": decision.gate_trace}
+
+
+def positive_path(verbose: bool = True) -> dict:
+    """正向路径自检：ACCEPT → PROMOTE → LAND → HOLDOUT PASS，以及 REJECT → 不晋升 → 回滚。
+
+    零模型成本：用 fake 的 ``version`` 模块避免真实写 ``base_state`` / 动 git；落地全部打到
+    临时 root，绝不碰生产 ``.env`` / ``supervisor.py``。这补上了 ``auto --fake`` 故意跳过
+    promote/land 那段盲区 —— 真实 6 轮跑从没晋升过，所以「晋升→落地→换基线重测」这条链
+    从未被验证过。证明的是**引擎的正向闭环真的能走通**，不是证明某次改进有效。
+    """
+    from types import SimpleNamespace
+    from . import autopromote, landing
+    from .landing import wrap_code_patch, CODE_PATCHES, land_code, revert_code
+    from .io_util import sha256_text
+
+    checks: list[dict] = []
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        checks.append({"check": name, "pass": bool(ok), "detail": detail})
+        if verbose:
+            print(f"  [{'PASS' if ok else 'FAIL'}] {name}{(' — ' + detail) if detail else ''}")
+
+    # 临时 root：把生产关键文件拷过去，落地只发生在 tmp，生产纹丝不动。
+    # 必须带上冻结校验对象（agents/planutil/runlog/graph），否则 frozen.verify(tmp)
+    # 会因文件缺失误报 symbol_missing。
+    tmp = PATHS.experiments / "selftest_pp" / now_stamp()
+    tmp.mkdir(parents=True, exist_ok=True)
+    for _f in (".env", "prompt.py", "agents.py", "planutil.py", "runlog.py",
+               "graph.py", "supervisor.py"):
+        _src = PATHS.root / _f
+        if _src.exists():
+            (tmp / _f).write_text(_src.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+
+    # fake version：promote / restore 只记内存，不碰真实状态 / git
+    class FakeVersion:
+        def __init__(self):
+            self.cur = SimpleNamespace(version=1, tag="base/v1")
+            self.promoted: list[str] = []
+            self.restored: list[str] = []
+
+        def current(self):
+            return self.cur
+
+        def promote(self, evidence, operator, note="", require_operator=False):
+            nxt = self.cur.version + 1
+            self.cur = SimpleNamespace(version=nxt, tag=f"base/v{nxt}")
+            self.promoted.append(self.cur.tag)
+            return self.cur
+
+        def restore(self, prev, note="", operator="auto:adaptive"):
+            self.cur = prev
+            self.restored.append(prev.tag)
+            return prev
+
+        def refresh_snapshot(self, ver=None, base_commit=None):
+            return ver or self.cur
+
+        def git_head(self):
+            return "fakehead"
+
+    fv = FakeVersion()
+    real_version = autopromote.version
+    autopromote.version = fv
+    try:
+        cfg = CFG
+
+        # ---- 1. 好候选：gate 接受 + holdout 正增益 → 判定允许晋升 ----
+        good = Candidate(candidate_id="pp-good", target="AGENT_PARSE_TRIES", level=1,
+                         old="3", new="5", hypothesis="正向路径自检：好候选",
+                         taxonomy="PLANNING_FAILURE",
+                         patch={"kind": "env", "key": "AGENT_PARSE_TRIES", "old": "3", "new": "5"})
+        _pairs = [SimpleNamespace(delta=10.0), SimpleNamespace(delta=8.0), SimpleNamespace(delta=12.0)]
+        _per = {"T1": 10.0, "T2": 8.0, "T3": 12.0}
+        _holdout = SimpleNamespace(pairs=_pairs, per_task=_per)
+        pol = autopromote.evaluate(cand=good, dec_b_accepted=True, stopped="",
+                                   holdout_cmp=_holdout, regression=None,
+                                   frozen_violations=[], promotes_done=0, cfg=cfg)
+        check("pp_good_policy_allowed", pol.allowed, f"blocking={pol.blocking}")
+        check("pp_good_holdout_evidence",
+              any(c.name == "holdout_evidence" and c.passed for c in pol.checks))
+
+        # ---- 2. PROMOTE → LAND（打到 tmp）：验证生产内容真的会变 ----
+        prev_base = fv.current()  # base/v1，晋升前的基线
+        rec = autopromote.promote_and_land(good, policy=pol, holdout_summary={"mean_delta": 10.0},
+                                          cfg=cfg, root=tmp)
+        _env = (tmp / ".env").read_text(encoding="utf-8", errors="replace")
+        check("pp_land_wrote_env", "AGENT_PARSE_TRIES=5" in _env, "托管块未写入临时 .env")
+        check("pp_version_promoted", fv.promoted == ["base/v2"], f"promoted={fv.promoted}")
+
+        # ---- 3. 换基线后 holdout 重测：真的更好 → 不回滚 ----
+        chk = autopromote.verify_after_promote(
+            holdout_prev_mean=70.0, holdout_new_mean=80.0, tol=cfg.holdout_tol,
+            prev_tag="base/v1", prev_by_task={"T1": 70, "T2": 70, "T3": 70},
+            new_by_task={"T1": 80, "T2": 80, "T3": 80}, cfg=cfg)
+        check("pp_holdout_pass", bool(chk.get("ok")), f"drift={chk.get('drift')}")
+        check("pp_no_rollback_on_pass",
+              "AGENT_PARSE_TRIES=5" in (tmp / ".env").read_text(encoding="utf-8", errors="replace"))
+
+        # ---- 4. 坏候选：holdout 负增益 → 判定不允许晋升（REJECT 阻断 promote）----
+        worse = Candidate(candidate_id="pp-worse", target="AGENT_PARSE_TRIES", level=1,
+                          old="3", new="2", hypothesis="正向路径自检：坏候选",
+                          taxonomy="PLANNING_FAILURE",
+                          patch={"kind": "env", "key": "AGENT_PARSE_TRIES", "old": "3", "new": "2"})
+        _hb = SimpleNamespace(pairs=[SimpleNamespace(delta=-10.0)] * 3,
+                              per_task={"T1": -10.0, "T2": -10.0, "T3": -10.0})
+        pol_bad = autopromote.evaluate(cand=worse, dec_b_accepted=True, stopped="",
+                                       holdout_cmp=_hb, regression=None,
+                                       frozen_violations=[], promotes_done=0, cfg=cfg)
+        check("pp_worse_policy_blocked", not pol_bad.allowed, f"blocking={pol_bad.blocking}")
+        _raised = False
+        try:
+            autopromote.promote_and_land(worse, policy=pol_bad, holdout_summary={}, cfg=cfg, root=tmp)
+        except RuntimeError:
+            _raised = True
+        check("pp_rejected_blocks_promote", _raised, "被拒候选不应进入 promote")
+
+        # ---- 5. 晋升后换基线退步 → 自动回滚（rollback）----
+        chk2 = autopromote.verify_after_promote(
+            holdout_prev_mean=70.0, holdout_new_mean=50.0, tol=cfg.holdout_tol,
+            prev_tag="base/v1", prev_by_task={"T1": 70, "T2": 70, "T3": 70},
+            new_by_task={"T1": 50, "T2": 50, "T3": 50}, cfg=cfg)
+        check("pp_holdout_regress_detected", not chk2.get("ok"), f"drift={chk2.get('drift')}")
+        autopromote.rollback(prev_base, reason="自检：换基线后退步", cfg=cfg, root=tmp)
+        _env_after = (tmp / ".env").read_text(encoding="utf-8", errors="replace")
+        check("pp_rollback_removed_landing", "AGENT_PARSE_TRIES=5" not in _env_after,
+              "回滚后托管块仍在")
+        check("pp_version_restored", fv.restored == ["base/v1"], f"restored={fv.restored}")
+
+        # ---- 6. 代码级候选也能 land + rollback（结构性编辑空间可用性）----
+        _name = "selftest_demo_guard"
+        _insert = ("def _rrsi_selftest_demo():  # 自检 fixture，不构成行为变更\n"
+                   "    return None")
+        CODE_PATCHES[_name] = {"file": "supervisor.py",
+                               "anchor": "def supervisor(state: AgentState) -> Dict[str, Any]:",
+                               "insert": _insert}
+        _wrapped = wrap_code_patch(_name, _insert)
+        _ph = sha256_text(_wrapped)[:16]
+        _sup = PATHS.root / "supervisor.py"
+        if _sup.exists():
+            (tmp / "supervisor.py").write_text(
+                _sup.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+            land_code(_name, "supervisor.py",
+                      "def supervisor(state: AgentState) -> Dict[str, Any]:", _insert,
+                      version_tag="base/v2", patch_hash=_ph, root=tmp)
+            _sup_after = (tmp / "supervisor.py").read_text(encoding="utf-8", errors="replace")
+            check("pp_code_landed", _wrapped in _sup_after, "代码块未插入临时 supervisor.py")
+            _ok_rev = revert_code("supervisor.py", _wrapped, root=tmp)
+            check("pp_code_rolled_back",
+                  _ok_rev and _wrapped not in (tmp / "supervisor.py").read_text(
+                      encoding="utf-8", errors="replace"))
+            # rollback_to 也能按 hash 反查并拆掉代码块
+            landing.rollback_to("base/v1", root=tmp)
+            check("pp_code_rollback_to", _wrapped not in (tmp / "supervisor.py").read_text(
+                encoding="utf-8", errors="replace"))
+        else:
+            check("pp_code_landed", False, "supervisor.py 不存在，跳过")
+        # 清理 fixture 注册，避免污染 landing.CODE_PATCHES
+        CODE_PATCHES.pop(_name, None)
+    finally:
+        autopromote.version = real_version
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    passed = all(c["pass"] for c in checks)
+    return {"passed": passed, "checks": checks, "stage": CFG.stage}
 
 
 def selftest(verbose: bool = True) -> dict:
@@ -117,6 +282,13 @@ def selftest(verbose: bool = True) -> dict:
     check("zero_candidate_has_no_env", z.env_overrides() == {}, str(z.env_overrides()))
     f = falsification_candidate()
     check("falsification_lowers_budget", f.new == "12" and f.old == "60")
+
+    # ---- 正向路径：ACCEPT → PROMOTE → LAND → HOLDOUT PASS，以及 REJECT → 不晋升 → 回滚 ----
+    # 真实 6 轮跑从没晋升过（0 次 promote），而 ``auto --fake`` 又故意跳过 promote/land，
+    # 所以晋升→落地→换基线重测这条链从未被验证。这里用 fake version + 临时 root 零成本补上。
+    pp = positive_path(verbose=verbose)
+    for c in pp["checks"]:
+        checks.append(c)
 
     passed = all(c["pass"] for c in checks)
     report = {"passed": passed, "checks": checks, "cases": results,

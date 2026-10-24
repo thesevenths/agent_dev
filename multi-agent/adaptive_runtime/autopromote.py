@@ -35,6 +35,22 @@ from .io_util import now_iso, write_json
 from .settings import CFG, PATHS, Settings
 
 
+def _to_dict_safe(obj: Any) -> "dict | None":
+    """把 version 对象安全转 dict 用于留痕。
+
+    ``version.restore`` 在生产返回 ``BaseVersion``（含 ``to_dict``）；自检里会被换成
+    只记录内存的 ``SimpleNamespace`` 桩对象，它没有 ``to_dict``。这里对两种形状都稳健，
+    避免日志记录依赖具体类型，也不掩盖生产行为（生产依然走 ``BaseVersion.to_dict``）。
+    """
+    if obj is None:
+        return None
+    if hasattr(obj, "to_dict"):
+        return obj.to_dict()
+    if hasattr(obj, "__dict__"):
+        return dict(vars(obj))
+    return None
+
+
 @dataclass
 class Check:
     name: str
@@ -141,7 +157,8 @@ def evaluate(*, cand: Any, dec_b_accepted: bool, stopped: str = "",
 
 
 def promote_and_land(cand: Any, *, policy: Policy, holdout_summary: dict,
-                     note: str = "", cfg: Settings | None = None) -> dict:
+                     note: str = "", cfg: Settings | None = None,
+                     root: "Path | None" = None) -> dict:
     """升基线 + 落地到生产 + 落地后自检；任何越界立刻整体回滚。
 
     顺序是刻意的：**先升版本再落地**，因为落地记录需要写上 ``base/vN`` 标签；
@@ -159,10 +176,10 @@ def promote_and_land(cand: Any, *, policy: Policy, holdout_summary: dict,
                           require_operator=False)
     landed: dict = {}
     if cfg.land_changes:
-        landed = landing.land(cand, version_tag=new.tag)
-        integrity = landing.check_integrity()
+        landed = landing.land(cand, version_tag=new.tag, root=root)
+        integrity = landing.check_integrity(root=root)
         if integrity:
-            landing.rollback_to(prev.tag if prev else "base/v0")
+            landing.rollback_to(prev.tag if prev else "base/v0", root=root)
             version.restore(prev, note=f"落地后 Frozen/锚点越界，自动回滚：{integrity[:5]}"
                             if prev else "落地后越界，回退至无基线")
             write_json(PATHS.experiments / "landing" / f"aborted_{new.tag.replace('/', '_')}.json",
@@ -226,15 +243,16 @@ def verify_after_promote(*, holdout_prev_mean: float, holdout_new_mean: float,
     return out
 
 
-def rollback(base_prev: Any, *, reason: str, cfg: Settings | None = None) -> dict:
+def rollback(base_prev: Any, *, reason: str, cfg: Settings | None = None,
+             root: "Path | None" = None) -> dict:
     """整体回滚：撤销落地改动 + Base 退回上一版本。"""
     cfg = cfg or CFG
     prev_tag = base_prev.tag if base_prev is not None else "base/v0"
-    dropped = landing.rollback_to(prev_tag)
+    dropped = landing.rollback_to(prev_tag, root=root)
     restored = version.restore(base_prev, note=f"自动回滚：{reason}") if base_prev else None
     out = {"ts": now_iso(), "event": "auto_demote", "to_version": prev_tag,
            "reason": reason, "landing": dropped,
-           "restored": restored.to_dict() if restored else None}
+           "restored": _to_dict_safe(restored)}
     write_json(PATHS.experiments / "landing" / f"demote_{now_iso()[:19].replace(':', '')}.json", out)
     return out
 

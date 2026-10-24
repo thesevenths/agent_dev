@@ -41,6 +41,20 @@ BLOCK_END = "# <<< adaptive_runtime overlay <<<"
 #: 块注释里允许出现的说明行前缀
 _NOTE = "# 由 adaptive_runtime 自动维护：删除本块即完全回滚，你手工写的行永不被改动。"
 
+#: 代码级补丁（kind=code）注册表：name -> {file, anchor, insert}。
+#: 落地时用 ``wrap_code_patch`` 把 insert 包成带唯一哨兵的块，回滚靠逐字删除该块。
+#: 生产里当前为空；结构性候选（plan_validator / replan_on_failure 等）未来在此登记后，
+#: proposer 即可生成代码级候选，landing 也能落地 / 回滚。自检测试会临时登记一个 fixture
+#: 验证整条链路，不污染生产搜索空间。
+CODE_PATCHES: dict[str, dict] = {}
+CODE_WRAP_OPEN = "# >>> rrsi-code-patch {name} >>>"
+CODE_WRAP_CLOSE = "# <<< rrsi-code-patch <<<"
+
+
+def wrap_code_patch(name: str, insert: str) -> str:
+    """把代码补丁正文包成带唯一哨兵的块，保证落地 / 回滚都是逐字可逆的。"""
+    return f"\n{CODE_WRAP_OPEN.format(name=name)}\n{insert}\n{CODE_WRAP_CLOSE}\n"
+
 
 def env_path(root: Path | None = None) -> Path:
     return (root or ROOT) / ".env"
@@ -224,6 +238,46 @@ def revert_prompt(file: str, insert: str, root: Path | None = None) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- 代码级补丁落地
+
+def land_code(name: str, file: str, anchor: str, insert: str, *,
+              version_tag: str = "", patch_hash: str = "", root: Path | None = None) -> dict:
+    """在生产运行时文件的锚点**前**插入带哨兵的代码块（与 L2 prompt 补丁同构，但目标是任意文件）。
+
+    约束与 prompt 补丁一致：锚点必须恰好出现一次；正文不得已存在（防重复落地）。
+    回滚 = 逐字删除哨兵块，因此要求块内容唯一（name 即唯一性来源）。
+    """
+    r = root or ROOT
+    p = r / file
+    if not p.exists():
+        raise RuntimeError(f"代码补丁目标文件不存在：{p}")
+    text = p.read_text(encoding="utf-8", errors="replace")
+    n = text.count(anchor)
+    if n != 1:
+        raise RuntimeError(f"代码补丁锚点在 {file} 出现 {n} 次（必须恰好 1 次），拒绝落地：{anchor!r}")
+    wrapped = wrap_code_patch(name, insert)
+    if text.count(wrapped) != 0:
+        raise RuntimeError(f"代码补丁正文已存在于 {file}，拒绝重复落地")
+    p.write_text(text.replace(anchor, wrapped + anchor, 1), encoding="utf-8")
+    append_jsonl(PATHS.landing_history, [{"ts": now_iso(), "kind": "code", "file": file,
+                                          "version_tag": version_tag, "patch_hash": patch_hash,
+                                          "name": name, "chars": len(insert)}])
+    return {"action": "land_code", "file": file, "version_tag": version_tag,
+            "patch_hash": patch_hash, "chars": len(insert)}
+
+
+def revert_code(file: str, wrapped: str, root: Path | None = None) -> bool:
+    """逐字删除已落地的代码块。返回是否真的删掉了。"""
+    p = (root or ROOT) / file
+    if not p.exists():
+        return False
+    text = p.read_text(encoding="utf-8", errors="replace")
+    if text.count(wrapped) != 1:
+        return False
+    p.write_text(text.replace(wrapped, "", 1), encoding="utf-8")
+    return True
+
+
 # ---------------------------------------------------------------- 候选级 API
 
 def land(cand, *, version_tag: str = "", root: Path | None = None,
@@ -243,6 +297,11 @@ def land(cand, *, version_tag: str = "", root: Path | None = None,
         res = land_prompt(str(patch.get("file") or ""), str(patch.get("anchor") or ""),
                           str(patch.get("insert") or ""), version_tag=version_tag,
                           patch_hash=patch_hash, root=root)
+    elif getattr(cand, "patch", {}).get("kind") == "code":
+        patch = cand.patch or {}
+        res = land_code(str(patch.get("name") or ""), str(patch.get("file") or ""),
+                        str(patch.get("anchor") or ""), str(patch.get("insert") or ""),
+                        version_tag=version_tag, patch_hash=patch_hash, root=root)
     else:
         raise RuntimeError(f"无法落地的候选类型：patch.kind={getattr(cand, 'patch', {}).get('kind')}")
     res["target"] = getattr(cand, "target", "")
@@ -253,42 +312,52 @@ def land(cand, *, version_tag: str = "", root: Path | None = None,
 
 
 def check_integrity(root: Path | None = None) -> list[str]:
-    """落地后的自检：冻结符号/env 是否仍完整 + L2 锚点是否仍唯一。"""
+    """落地后的自检：冻结符号/env 是否仍完整 + L2/L3 锚点是否仍唯一。"""
     from . import frozen, proposer
     out = [f"{v.kind}:{v.target}" for v in frozen.verify(root=root)]
     if root is None:
         out += [f"patch_anchor:{x}" for x in proposer._check_prompt_patches()]
+        out += [f"code_anchor:{x}" for x in proposer._check_code_patches()]
     return out
 
 
 def rollback_to(version_tag: str, root: Path | None = None) -> dict:
-    """撤销所有比 ``version_tag`` 新的落地改动（env 块条目 + 已落地提示补丁）。"""
+    """撤销所有比 ``version_tag`` 新的落地改动（env 块条目 + 已落地提示/代码补丁）。"""
     hist = read_jsonl(PATHS.landing_history)
     entries = read_block(root)
     keep = [e for e in entries if _le(e.version_tag, version_tag)]
     drop_keys = [e.key for e in entries if not _le(e.version_tag, version_tag)]
     removed = drop_entries(drop_keys, root)
     reverted_prompts: list[str] = []
+    reverted_code: list[str] = []
     for h in reversed(hist):
-        if h.get("kind") != "prompt":
+        kind = h.get("kind")
+        if kind not in ("prompt", "code"):
             continue
         if _le(str(h.get("version_tag") or ""), version_tag):
             break
         f = str(h.get("file") or "")
         # history 不存正文（避免大字段），改用 patch_hash 对应的模板文本回滚
         tmpl = _patch_text_by_hash(h.get("patch_hash"))
-        if tmpl and revert_prompt(f, tmpl, root):
-            reverted_prompts.append(f)
+        if not tmpl:
+            continue
+        if kind == "prompt":
+            if revert_prompt(f, tmpl, root):
+                reverted_prompts.append(f)
+        else:  # code
+            if revert_code(f, tmpl, root):
+                reverted_code.append(f)
     append_jsonl(PATHS.landing_history, [{"ts": now_iso(), "kind": "rollback",
                                           "to_version": version_tag,
                                           "removed_env": removed,
-                                          "reverted_prompt_files": reverted_prompts}])
+                                          "reverted_prompt_files": reverted_prompts,
+                                          "reverted_code_files": reverted_code}])
     return {"removed_env": removed, "reverted_prompt_files": reverted_prompts,
-            "kept_env": [e.key for e in keep]}
+            "reverted_code_files": reverted_code, "kept_env": [e.key for e in keep]}
 
 
 def _patch_text_by_hash(patch_hash: str) -> str | None:
-    """由 patch_hash 反查提示补丁正文。
+    """由 patch_hash 反查补丁正文（提示补丁或代码补丁）。
 
     必须与 ``Candidate.diff_text()`` 的格式逐字一致 —— 否则 hash 对不上，
     回滚会「静默找不到正文」，于是生产里留着一段没人能拆的补丁。
@@ -300,6 +369,10 @@ def _patch_text_by_hash(patch_hash: str) -> str | None:
         head = f"{fname} @ {spec.get('anchor')!r}\n"
         if sha256_text(head + str(spec.get("insert") or ""))[:16] == patch_hash:
             return str(spec.get("insert") or "")
+    for name, spec in CODE_PATCHES.items():
+        wrapped = spec.get("wrapped") or wrap_code_patch(name, str(spec.get("insert") or ""))
+        if sha256_text(wrapped)[:16] == patch_hash:
+            return wrapped
     return None
 
 

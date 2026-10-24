@@ -194,7 +194,57 @@ def _check_prompt_patches() -> list[str]:
     return problems
 
 
+def _code_entries() -> dict:
+    """SEARCH_SPACE 里所有 kind=code 的候选（结构性代码补丁）。"""
+    return {k: v for k, v in SEARCH_SPACE.items() if v.get("kind") == "code"}
+
+
+def code_is_live(name: str, *, root: Path | None = None) -> bool:
+    """某代码级补丁是否已经在生产文件里（哨兵块逐字存在）。"""
+    spec = SEARCH_SPACE.get(name)
+    if not spec or spec.get("kind") != "code":
+        return False
+    r = root or Path(__file__).resolve().parent.parent
+    p = r / str(spec.get("file") or "")
+    if not p.exists():
+        return False
+    from .landing import wrap_code_patch
+    wrapped = wrap_code_patch(name, str(spec.get("insert") or ""))
+    return wrapped in p.read_text(encoding="utf-8", errors="replace")
+
+
+def _check_code_patches() -> list[str]:
+    """导入期自检：代码补丁锚点必须恰好出现一次（否则落地/回滚会误伤）。"""
+    problems: list[str] = []
+    root = Path(__file__).resolve().parent.parent
+    for name, spec in _code_entries().items():
+        if not spec.get("file") or not spec.get("anchor") or not spec.get("insert"):
+            problems.append(f"SEARCH_SPACE[{name!r}] 缺少 file/anchor/insert")
+            continue
+        p = root / str(spec["file"])
+        if not p.exists():
+            problems.append(f"{name}: 目标文件 {spec['file']} 不存在")
+            continue
+        n = p.read_text(encoding="utf-8", errors="replace").count(spec["anchor"])
+        if n != 1:
+            problems.append(f"{name}: 锚点出现 {n} 次（必须恰好 1 次）")
+    return problems
+
+
 PROMPT_PATCH_PROBLEMS = _check_prompt_patches()
+CODE_PATCH_PROBLEMS = _check_code_patches()
+
+#: 把结构性 code 候选登记到 landing 的 CODE_PATCHES，供 land / rollback 反查哨兵块正文。
+#: 当前 SEARCH_SPACE 没有 code 项 → 注册空；未来在 SEARCH_SPACE 加入 code 候选即自动生效。
+try:
+    from . import landing
+    for _n, _s in _code_entries().items():
+        landing.CODE_PATCHES[_n] = {
+            "file": _s["file"], "anchor": _s["anchor"], "insert": _s["insert"],
+            "wrapped": landing.wrap_code_patch(_n, _s["insert"]),
+        }
+except Exception:
+    pass
 
 #: 泄漏检测：候选文本里出现这些就不许进 probe
 _LEAK_PATTERNS = (
@@ -248,6 +298,8 @@ class Candidate:
         if self.is_prompt:
             head = f"{self.patch.get('file')} @ {self.patch.get('anchor')!r}\n"
             return head + str(self.patch.get("insert") or "")
+        if self.patch.get("kind") == "code":
+            return str(self.patch.get("insert") or "")
         return str(self.patch.get("diff") or self.patch.get("new") or "")
 
     def to_dict(self) -> dict:
@@ -276,6 +328,8 @@ def current_value(target: str) -> str:
     """
     if target in PROMPT_PATCHES:
         return "live" if prompt_is_live(target) else ""
+    if SEARCH_SPACE.get(target, {}).get("kind") == "code":
+        return "live" if code_is_live(target) else ""
     try:
         from . import landing
         v = landing.live_value(target)
@@ -372,6 +426,13 @@ def propose(dominant: str, ledger: Ledger, cfg: Settings | None = None,
                 patch = {"kind": "prompt", "file": target.split("::", 1)[0],
                          "anchor": spec["anchor"], "insert": spec["insert"],
                          "old": "", "new": new}
+            elif spec.get("kind") == "code":
+                from .landing import wrap_code_patch
+                wrapped = wrap_code_patch(target, str(spec["insert"]))
+                patch = {"kind": "code", "name": target,
+                         "file": str(spec.get("file") or ""),
+                         "anchor": str(spec.get("anchor") or ""),
+                         "insert": wrapped, "old": "", "new": wrapped}
             else:
                 patch = {"kind": "env", "key": target, "old": old, "new": new}
             cand = Candidate(
