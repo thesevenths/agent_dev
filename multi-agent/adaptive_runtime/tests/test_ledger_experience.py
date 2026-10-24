@@ -83,13 +83,42 @@ class TestLedger(unittest.TestCase):
         self.assertTrue(dup)
         self.assertEqual(prev["status"], "rejected")
 
-    def test_inconclusive_streak_promotes(self):
+    def test_inconclusive_streak_annotates_but_does_not_reject(self):
+        """连轮 3 次拿不出结论：只记注并停止重提，**不写成 rejected**。"""
         fp = self.ledger.create("A", "1", "2", "T", "c").fingerprint
-        for _ in range(3):
-            self.ledger.update(fp, "inconclusive")
+        for i in range(3):
+            self.ledger.update(fp, "inconclusive", {"reason": "incomplete_evidence"})
         self.assertEqual(self.ledger.inconclusive_streak(fp), 3)
+        self.assertEqual(self.ledger.latest(fp)["status"], "inconclusive",
+                         "基建故障连轮三轮就把无辜的旋钮永久烧掉，正是 ledger_status 要避免的事")
         row = self.ledger.update(fp, "rejected", notes="样本不足")
-        self.assertIn("inconclusive", row["notes"])
+        self.assertIn("exhausted", row["notes"])
+
+    def test_exhausted_skips_a_decisive_wash(self):
+        """测完了的平局：状态仍为 inconclusive（诚实），但不再花机时。"""
+        fp = self.ledger.create("A", "1", "2", "T", "c").fingerprint
+        self.ledger.update(fp, "inconclusive", {"reason": "within_noise", "n": 13})
+        ex, row = self.ledger.exhausted(fp)
+        self.assertTrue(ex)
+        self.assertEqual(row["status"], "inconclusive")
+        self.assertFalse(self.ledger.is_duplicate(fp)[0],
+                         "平局不是证伪：历史里必须还看得见它没被否掉")
+
+    def test_not_exhausted_when_measurement_failed(self):
+        """「没测成」值得重测；连试 3 次才放弃。"""
+        fp = self.ledger.create("A", "1", "2", "T", "c").fingerprint
+        self.ledger.update(fp, "inconclusive", {"reason": "incomplete_evidence"})
+        self.assertFalse(self.ledger.exhausted(fp)[0])
+        self.ledger.update(fp, "inconclusive", {"reason": "judge_unstable"})
+        self.assertFalse(self.ledger.exhausted(fp)[0])
+        self.ledger.update(fp, "inconclusive", {"reason": "incomplete_evidence"})
+        self.assertTrue(self.ledger.exhausted(fp)[0])
+
+    def test_exhausted_false_for_unknown(self):
+        self.assertEqual(self.ledger.exhausted("NOPE|1->2|T"), (False, None))
+        fp = self.ledger.create("A", "1", "2", "T", "c").fingerprint
+        self.ledger.update(fp, "rejected")
+        self.assertFalse(self.ledger.exhausted(fp)[0])     # 靠 is_duplicate 拦
 
     def test_rejected_context(self):
         fp = self.ledger.create("A", "1", "2", "T", "c").fingerprint

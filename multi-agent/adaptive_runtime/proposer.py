@@ -361,6 +361,12 @@ def propose(dominant: str, ledger: Ledger, cfg: Settings | None = None,
             dup, prev = ledger.is_duplicate(fp)
             if dup:
                 continue
+            # 平局不重提：is_duplicate 故意放行 inconclusive（它的字面意思是「还没结论」），
+            # 但「测完了且与噪声不可区分」再跑一轮只会得到同一个答案。不筛掉它，闭环就会
+            # 每轮重提同一个旋钮（_adjacent 是确定性的）而永不前进。见 Ledger.exhausted。
+            done, _prev2 = ledger.exhausted(fp)
+            if done:
+                continue
             is_prompt = bool(spec.get("is_prompt"))
             if is_prompt:
                 patch = {"kind": "prompt", "file": target.split("::", 1)[0],

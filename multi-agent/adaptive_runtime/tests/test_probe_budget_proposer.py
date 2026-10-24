@@ -50,6 +50,31 @@ class TestCompare(unittest.TestCase):
         self.assertAlmostEqual(cmp.stats["regression_rate"], 0.2)
         self.assertEqual(cmp.evidence().n_tasks, 5)
 
+    def test_crash_requires_consistency_across_reps(self):
+        """均值跌破阈值但只有一些重复崩 → 不计入回归率（噪声伪装不了一致性）。
+
+        rrsi2 round1 就是把 OFF-QUA-03（重复间跌幅 -47.5/-39.9/+21.4，均值 -22）当成
+        「任务崩了」，配合另一个噪声任务一起顶穿了 r_max=0.15。
+        """
+        base = scores("base", {**{f"T{i}": [60, 60, 60] for i in range(4)}, "T4": [80, 80, 80]})
+        cand = scores("cand", {**{f"T{i}": [61, 61, 61] for i in range(4)},
+                               "T4": [10, 80, 82]})
+        cmp = compare(base, cand)
+        self.assertLess(cmp.per_task["T4"]["mean_delta"], -CFG.regression_min_points)
+        self.assertEqual(cmp.stats["crashed_tasks"], [])
+        self.assertEqual(cmp.stats["regression_rate"], 0.0)
+        self.assertEqual(cmp.evidence().crashed_tasks, [])
+
+    def test_stats_and_evidence_share_regression_definition(self):
+        """报告里的回归率必须就是闸门用的那个数（单一真源）。"""
+        base = scores("base", {f"T{i}": [60, 60] for i in range(4)})
+        cand = scores("cand", {"T0": [40, 40], "T1": [60, 60],
+                               "T2": [60, 60], "T3": [60, 60]})
+        cmp = compare(base, cand)
+        self.assertAlmostEqual(cmp.stats["regression_rate"], 0.25)
+        self.assertAlmostEqual(cmp.evidence().regression_rate, cmp.stats["regression_rate"])
+        self.assertEqual(cmp.evidence().crashed_tasks, ["T0"])
+
     def test_A_comes_from_A_field_not_Q(self):
         base = scores("base", {"T1": [50]}, A=0.6)
         cand = scores("cand", {"T1": [50]}, A=0.9)
@@ -120,6 +145,24 @@ class TestProposer(unittest.TestCase):
         self.ledger.update(c.hyp_fingerprint, "rejected")
         again = propose("COMPLETION_FAILURE", self.ledger, limit=1)
         self.assertNotEqual(again[0].hyp_fingerprint if again else None, c.hyp_fingerprint)
+
+    def test_decisive_wash_is_not_re_proposed(self):
+        """测完了的平局不重提（否则闭环每轮重跑同一个旋钮、永不前进）。"""
+        c = propose("COMPLETION_FAILURE", self.ledger, limit=1)[0]
+        self.ledger.create(c.target, c.old, c.new, c.taxonomy, "wash")
+        self.ledger.update(c.hyp_fingerprint, "inconclusive",
+                           {"reason": "within_noise", "n": 13, "dQ": -3.19})
+        again = propose("COMPLETION_FAILURE", self.ledger, limit=3)
+        self.assertNotIn(c.hyp_fingerprint, [x.hyp_fingerprint for x in again])
+
+    def test_measurement_failure_is_re_proposable(self):
+        """「没测成」与「测完是平局」必须区分：前者值得再试一次。"""
+        c = propose("COMPLETION_FAILURE", self.ledger, limit=1)[0]
+        self.ledger.create(c.target, c.old, c.new, c.taxonomy, "aborted")
+        self.ledger.update(c.hyp_fingerprint, "inconclusive",
+                           {"reason": "incomplete_evidence", "stopped": "stop_loss"})
+        again = propose("COMPLETION_FAILURE", self.ledger, limit=1)
+        self.assertEqual(again[0].hyp_fingerprint, c.hyp_fingerprint)
 
     def test_env_override_shape(self):
         c = propose("COMPLETION_FAILURE", self.ledger, limit=1)[0]

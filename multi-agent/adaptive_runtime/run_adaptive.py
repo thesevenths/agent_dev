@@ -45,7 +45,7 @@ from .gate import Decision, Reason, explain, gate_a, gate_b, ledger_status
 from .io_util import now_stamp, read_json, write_json, write_text
 from .ledger import Ledger
 from .probe import create_sandbox, probe_candidate, run_jobs, run_one, run_one_isolated
-from .settings import CFG, PATHS, validate
+from .settings import CFG, PATHS, detectability, validate
 from .trace_export import export_from_log, iter_logs, write_trace
 from . import selftest as selftest_module
 
@@ -674,11 +674,20 @@ def cmd_auto(args) -> int:
         _say(f"产物：{out / auto_module.VERDICT_NAME}")
         return 0 if v["achieved"] else 1
 
-    problems = validate()
-    if problems:
-        _say("配置提示：" + "；".join(problems))
     tasks = _load_tasks(args.tasks_file, limit=args.limit)
     fakes = {"base": "base", "cand": args.case} if args.fake else None
+
+    # δ 的口径必须与真实跑法一致：自由度是 **train 任务数**，不是 ADAPTIVE_N。
+    # 所以 validate() 排在 split() 之后 —— 旧顺序只能拿 n 猜配对数，于是报出
+    # 「n=3 ⇒ δ≈37 分，10 分的改进检不出」这种根本不存在的门限。
+    tr, ho = benchmark.split(tasks, args.holdout)
+    problems = validate(n_tasks=len(tr), n_reps=args.n)
+    if problems:
+        _say("配置提示：" + "；".join(problems))
+    if not args.fake:
+        # 这行不受 --yes 影响：它是「本轮能不能得出显著结论」唯一的事前提示，
+        # 而无人值守跑法恰恰总是带 --yes。
+        _say(detectability(len(tr), args.n)["text"])
 
     if not args.offline and not args.fake:
         _say("[warn] 未开 --offline：会消耗 Tavily 免费额度，且联网内容逐日变化会抬高噪声。"
@@ -686,10 +695,9 @@ def cmd_auto(args) -> int:
     if not args.yes and not args.fake:
         from .bench_tasks import profile_for
         # 按口径选画像：离线单 run 实测 ~225 s（并发 4、31 个 run / 1752 s 反推），
-        # 拿在线的 1109 s 估会贵一个数量级，把本来能跑完的计划报成「30 小时不可行」——
+        # 拿在线的 1109 s 估会贵一个数量级，把本来能跑完的计划报成“30 小时不可行”——
         # 那是用错的常数否掉了用户的方案。
         prof = profile_for(offline=CFG.offline, task_profile=CFG.task_profile)
-        tr, ho = benchmark.split(tasks, args.holdout)
         plan = bench_tasks_mod.plan_cost(len(tr), args.n, args.rounds, len(ho),
                                          profile=prof)
         # auto 比 benchmark 多两块：接受后的 holdout **配对**，以及换基线后的 holdout 重测

@@ -1,9 +1,11 @@
 import unittest
 
 from adaptive_runtime.gate import (Accept, Evidence, INERT_TARGETS, Reason, explain,
-                                   gate_a, gate_b)
+                                   gate_a, gate_b,
+                                   ledger_status as gate_ledger_status)
 from adaptive_runtime.proposer import Candidate
 from adaptive_runtime.settings import Settings
+from adaptive_runtime.stats import paired_stats
 
 
 def cand(**kw):
@@ -100,6 +102,29 @@ class TestGateB(unittest.TestCase):
         # 只有 2 个任务时「回归率」没有意义，不应据此否决
         d = gate_b(ev(deltas=[20, 20], regression_rate=0.5, n_tasks=2), self.cfg)
         self.assertTrue(d.accepted)
+
+    def test_negative_wash_is_not_regression(self):
+        """均值为负但不显著 + 高回归率 ⇒ 必须是 within_noise，不是 regression。
+
+        这是 rrsi2 round1 的真实形态（dQ=-3.19、p=0.16、2/13 个任务「均值跌 5 分」）。
+        regression 属于**证伪**（gate.ledger_status → rejected），拿它记一次噪声测量
+        就是永久删掉一个旋钮；闭环会在几轮内把搜索空间烧完。
+        """
+        d = gate_b(ev(deltas=[-8, -2, -1, 0, 2, 1, -1, 0], regression_rate=0.3), self.cfg)
+        pr = paired_stats([-8, -2, -1, 0, 2, 1, -1, 0], alpha=self.cfg.alpha)
+        self.assertGreater(pr.delta_crit, abs(pr.mean))     # 前提：确实不显著
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.reason, Reason.WITHIN_NOISE.value)
+        self.assertEqual(gate_ledger_status(d), "inconclusive")
+
+    def test_positive_wash_with_stable_crash_is_rejected(self):
+        """均值为正（哪怕不显著）但稳定崩掉足够多任务 → 仍然必须否决。"""
+        d = gate_b(ev(deltas=[5, -4, 5, -4, 5, -4, 5, -4], regression_rate=0.4), self.cfg)
+        pr = paired_stats([5, -4, 5, -4, 5, -4, 5, -4], alpha=self.cfg.alpha)
+        self.assertGreater(pr.mean, 0.0)
+        self.assertLessEqual(pr.mean, pr.delta_crit)        # 不是靠配对门过的
+        self.assertEqual(d.reason, Reason.REGRESSION.value)
+        self.assertIn("regression_rate", [r["check"] for r in d.gate_trace])
 
     def test_cost_rule(self):
         # +5 分却 +50% 成本：allowance = 0.05 + 0.015*5 = 0.125 < 0.5

@@ -236,8 +236,14 @@ def run_auto(tasks: list[dict], *, rounds: int = 3, n: int | None = None,
     #: 每一批续跑单独一个目录：benchmark 的轮次目录叫 round1..roundN，同一批里续跑会
     #: **覆盖上一轮的 diagnosis.json**，于是「哪一轮诊断吃了哪些 run」这份证据就丢了。
     bench_dir = out / "bench" / f"batch{done + 1}-{done + to_run}"
+    # 续跑时必须把旧批的记账**带进来**：promotes/demotes 早就是带着的（限次保险要看累计值），
+    # verifies/blocked 同样不能漏 —— 判据 8（post_promote_stable）读的是 state["verifies"]，
+    # 若第 2 批没发生 promote 就把列表置空，那第 1 批「换基线后已复查通过」这份证据会被
+    # 抹掉，判据 8 由绿转红。那是记账错误，不是实验结果。
     tally = PromoteTally(promotes=int(state.get("promotes", 0) or 0),
-                         demotes=int(state.get("demotes", 0) or 0))
+                         demotes=int(state.get("demotes", 0) or 0),
+                         verifies=list(state.get("verifies") or []),
+                         blocked=list(state.get("blocked") or []))
     content_before = str(state.get("content_stamp_before") or landing.content_stamp())
     started_at = state.get("started_at") or now_iso()
     if not state:

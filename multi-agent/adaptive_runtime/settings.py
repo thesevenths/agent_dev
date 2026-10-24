@@ -335,8 +335,12 @@ CFG = Settings()
 _WEIGHT_WARNED = False
 
 
-def validate() -> list[str]:
-    """返回配置问题列表（空列表表示通过）。CLI 启动时调用。"""
+def validate(n_tasks: int | None = None, n_reps: int | None = None) -> list[str]:
+    """返回配置问题列表（空列表表示通过）。CLI 启动时调用。
+
+    ``n_tasks``：本轮**train 侧任务数**（``benchmark.split`` 的结果）。给了它才能用真实
+    口径算 δ；不给则只讲规则不报数字（拿 ``ADAPTIVE_N`` 当配对数报 δ 是假的，见下）。
+    """
     global _WEIGHT_WARNED
     problems: list[str] = []
     total = CFG.w_a + CFG.w_e + CFG.w_c
@@ -368,24 +372,82 @@ def validate() -> list[str]:
         problems.append(f"并发度={CFG.max_parallel}：单 run 超时会因排队/显存争用而上升，"
                         "若出现 timeout 或 run 失败率升高，请调低 ADAPTIVE_MAX_PARALLEL")
 
-    # ---- 检出能力提示：n 过小时，δ 会大到任何真实改进都无法过门 ----
+    # ---- 检出能力提示：任务太少 / 重复太少时，δ 会大到任何真实改进都无法过门 ----
     # 该情形不属于配置错误，而是本轮不具备检出能力；须在执行前明确告知，避免数小时无效运行。
+    #
+    # 口径修正（自由度来自任务数，不是重复次数）：旧实现写的是
+    #   δ = t_crit(ADAPTIVE_N-1) · sd / sqrt(ADAPTIVE_N)
+    # 把 n=3 报成 δ≈37 分，等于宣布「10 分的改进检不出」；而真实跑法是 13 个 train
+    # 任务 × 3 次重复 ⇒ δ≈5.2 分。用一个不存在的门限去否决用户的方案，和低估噪声
+    # 一样是配置层的自我欺骗，所以这里改接 stats.delta_crit(T, n, sd)。
     try:
-        from .stats import t_crit
-        import math as _math
-        sd = CFG.sd_diff_target
-        if CFG.n_default >= 2 and sd > 0:
-            delta_crit = t_crit(CFG.n_default - 1, CFG.alpha) * sd / _math.sqrt(CFG.n_default)
-            if delta_crit > 20.0:
-                problems.append(
-                    f"ADAPTIVE_N={CFG.n_default} 时噪声门限 δ≈{delta_crit:.1f} 分"
-                    f"（sd 取 {sd:.1f}）—— 小于该值的改进无法检出；"
-                    f"要检出 ΔQ≈10 分建议 n≥{_required_n_hint(sd, 10.0)}")
+        if n_tasks is None:
+            if CFG.n_default < 2:
+                problems.append("ADAPTIVE_N<2，无法做配对检验")
         else:
-            problems.append("ADAPTIVE_N<2，无法做配对检验")
+            d = detectability(n_tasks, CFG.n_default if n_reps is None else n_reps)
+            if d["delta"] is None:
+                problems.append(f"train 任务数={d['n_tasks']}<2，配对检验没有自由度（df=T-1），"
+                                "本轮不具备检出能力；请加大 --limit 或降低 --holdout")
+            elif d["delta"] > 20.0:
+                problems.append(
+                    f"噪声门限 δ≈{d['delta']:.1f} 分（{d['n_tasks']} 个 train 任务 × "
+                    f"n={d['n_reps']}，sd(Δ)={d['sd']:.1f}／{d['sd_source']}）—— "
+                    f"小于该值的改进无法检出；要检出 ΔQ≈10 分需 任务数×重复 ≥ "
+                    f"{_required_n_hint(d['sd'], 10.0)}，且**加任务比加重复有效**"
+                    "（自由度只跟着任务数走）")
     except Exception:
         pass
     return problems
+
+
+def diff_sd(cfg: Settings | None = None) -> tuple[float, str]:
+    """事前估算检出能力用的 sd(Δ)，以及它来自哪里。
+
+    优先用 **实测标定值**（``calibration.json`` 的 ``sd_diff_null``）；只有报表自己
+    可信时才采纳：``passed`` 且 ``sd_diff_null`` 非 0/空 且 ``validity`` 为空。后者那条
+    判据与 ``autopromote.calibration_ok`` 同口径（那里不 import 本模块，所以不复用函数
+    而是保持两处一致）：样本退化时 sd=0 会把 δ 拉成 0，于是「任何正数的 ΔQ 都显著」。
+
+    不拿 ``calibrate.passes()`` 当门槛：它回答的是「噪声够不够小」，而这里要回答的是
+    「真实噪声到底多大」。实测 sd=18（高于假设值 15）时，诚实的 δ 预估必须用 18。
+    """
+    cfg = cfg or CFG
+    cal: dict[str, Any] = {}
+    try:
+        if PATHS.calibration.exists():
+            import json
+            cal = json.loads(PATHS.calibration.read_text(encoding="utf-8")) or {}
+    except Exception:
+        cal = {}
+    if (cal.get("passed") and cal.get("sd_diff_null") not in (None, 0)
+            and not cal.get("validity")):
+        return float(cal["sd_diff_null"]), "实测标定"
+    return cfg.sd_diff_target, "假设值（未标定）"
+
+
+def detectability(n_tasks: int, n_reps: int, alpha: float | None = None) -> dict[str, Any]:
+    """按**真实跑法**算检出门限 δ，供 CLI 在执行前无条件打印一行。
+
+    δ = t_crit(T-1, α) · sd(Δ) / sqrt(T · n)。与 ``Evidence.paired()`` 同一式子：
+    闸门里 sd 取本轮实测差值（事后），这里取标定 sd（事前预估）。
+    """
+    from .stats import delta_crit
+    sd, src = diff_sd()
+    a = CFG.alpha if alpha is None else float(alpha)
+    T, n = int(n_tasks), max(1, int(n_reps))
+    if T < 2:
+        return {"n_tasks": T, "n_reps": n, "sd": round(sd, 2), "sd_source": src,
+                "delta": None,
+                "text": f"train 只有 {T} 个任务，配对检验没有自由度（需 ≥2），"
+                        "本轮不具备检出能力"}
+    import math as _math
+    thr = delta_crit(T, n, sd, a)
+    warn = "" if thr <= 20.0 else "；⚠ 高于 20 分，常规改进无法过门（加任务数最有效）"
+    return {"n_tasks": T, "n_reps": n, "sd": round(sd, 2), "sd_source": src,
+            "delta": (None if _math.isinf(thr) else round(thr, 2)),
+            "text": (f"检出门限：train {T} 个任务 × n={n} ⇒ δ≈{thr:.1f} 分"
+                     f"（sd(Δ)={sd:.1f}，{src}）；小于此值的改进在统计上与噪声不可区分{warn}")}
 
 
 def _required_n_hint(sd: float, effect: float) -> int:

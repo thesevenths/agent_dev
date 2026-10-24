@@ -263,5 +263,60 @@ class TestVerdictArtifact(AssessBase):
         self.assertIn("noise_calibrated", md.split("## 未达成时缺什么")[1])
 
 
+class TestResumeAccounting(AssessBase):
+    """续跑记账必须**累计**：判据是跨批读的，不能被下一批的空 tally 抹掉。
+
+    真实跑法就是一批一轮地续跑（单批 6 小时，中途断供就会把已跑轮次全丢），而
+    ``state.json`` 只在整批跑完后写。于是「一轮一批」是唯一能存活的跑法，而它要求
+    ``run_auto`` 把上一批的 verifies/promotes 带回来 —— 旧实现只带了 promotes。
+    """
+
+    def _batch2(self, prior: dict, *, hist: list[dict], new_round: dict) -> dict:
+        tasks = [{"task_id": "T1"}, {"task_id": "T2"}]
+        # 上一批跑完 1 轮：state 里的 rounds_done 是续跑编号的根，缺它就会被当成从头开始
+        prior = dict({"rounds_done": 1}, **prior, task_hash=auto._task_hash(tasks),
+                     label="RUN-1")
+        auto.save_state(self.out, prior)
+        bench = SimpleNamespace(
+            run_benchmark=lambda *a, **kw: {
+                "curve": [new_round], "holdout_ids": ["H1"], "train_ids": ["T1", "T2"],
+                "base_version": 4,
+                "delta_series": [], "holdout_delta_series": [], "holdout_drift": 0.0,
+                "diag_sources": ["round_traces"], "accepted": 0, "rejected": 1,
+                "skipped": 0},
+            base_sweep=lambda *a, **kw: None)
+        verse = SimpleNamespace(history=lambda: hist,
+                               current=lambda: SimpleNamespace(version=4))
+        with mock.patch.object(auto, "benchmark", bench), \
+                mock.patch.object(auto, "version", verse):
+            rep = auto.run_auto(tasks, rounds=2, label="RUN-1",
+                                out_dir=self.out.parent)
+        self.assertNotIn("error", rep)
+        return rep["state"]
+
+    def _no_gain_round(self) -> dict:
+        return _round(round_no=1, decision="REJECT", reason="within_noise",
+                      holdout_pairs=0, holdout_mean_delta=0.0)
+
+    def test_verifies_survive_a_batch_without_promote(self):
+        st = self._batch2(self._state(), hist=[_promote()], new_round=self._no_gain_round())
+        self.assertEqual(len(st["verifies"]), 1,
+                         "第 2 批没 promote，不能把第 1 批的落地后复查记成没发生过")
+        self.assertTrue(st["verifies"][0]["ok"])
+        v = self._assess([_promote()], st)
+        self.assertTrue([c for c in v["criteria"]
+                         if c["name"] == "post_promote_stable"][0]["passed"],
+                        "判据 8 不得因续跑记账而由绿转红")
+
+    def test_promote_count_is_cumulative_across_batches(self):
+        """限次保险看的是累计值：每批重置就等于允许无限次换基线。"""
+        st = self._batch2(dict(self._state(), promotes=1, demotes=0),
+                          hist=[_promote()], new_round=self._no_gain_round())
+        self.assertEqual(st["promotes"], 1)
+        self.assertEqual(st["rounds_done"], 2)
+        self.assertEqual([r["round_no"] for r in st["curve"]], [1, 2],
+                         "学习曲线得接着往后排，不能两个 round 1")
+
+
 if __name__ == "__main__":
     unittest.main()

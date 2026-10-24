@@ -48,11 +48,6 @@ class Comparison:
         cfg = cfg or CFG
         deltas = [p.delta for p in self.pairs]
         dC = ((self.cost_cand - self.cost_base) / self.cost_base) if self.cost_base > 0 else 0.0
-        regression = 0.0
-        if self.per_task:
-            bad = sum(1 for v in self.per_task.values()
-                      if v.get("mean_delta", 0.0) < -cfg.regression_min_points)
-            regression = bad / len(self.per_task)
         A_base = _mean([p.base_A for p in self.pairs]) if self.pairs else 0.0
         A_cand = _mean([p.cand_A for p in self.pairs]) if self.pairs else 0.0
         # 任务级聚合：同任务多 rep 先取均值，避免用 rep 数虚增自由度
@@ -60,6 +55,10 @@ class Comparison:
         for p in self.pairs:
             _by_task.setdefault(p.task_id, []).append(p.delta)
         task_deltas = [_mean(v) for v in _by_task.values()]
+        # 「稳定崩」= 每一次重复都明显变差。定义在 crashed_tasks() 里（与 stats 单一真源）。
+        crashed = crashed_tasks(_by_task, cfg)
+        n_denom = len(self.per_task) or len(_by_task)
+        regression = (len(crashed) / n_denom) if n_denom else 0.0
         # 反刷分：A 的分母是「计划步数」，所以「把计划砍短」本身就能抬高 A。
         # 只统计「计划明显变短 **且** A 反而变高」的配对 —— 单看计划变短会误伤
         # 「因为效率提升真的不需要那么多步」的合法改进。
@@ -77,6 +76,7 @@ class Comparison:
             plan_undercut_rate=(undercut / n_with_plan) if n_with_plan else 0.0,
             A_base=A_base, A_cand=A_cand,
             dC=dC, regression_rate=regression, n_tasks=len(self.per_task),
+            crashed_tasks=crashed,
             add_novel_component=self.add_novel_component,
             hard_failure_removed=self.hard_failure_removed,
             missing_runs=self.missing_runs, timeout_runs=self.timeout_runs,
@@ -93,6 +93,22 @@ class Comparison:
 def _mean(xs: Iterable[float]) -> float:
     xs = list(xs)
     return sum(xs) / len(xs) if xs else 0.0
+
+
+def crashed_tasks(by_task: dict[str, list[float]], cfg: Settings) -> list[str]:
+    """「稳定崩」的任务：这个任务上**每一次**重复都明显变差（跌幅 > regression_min_points）。
+
+    单一真源：``Comparison.evidence()``（喂 gate）与 ``compare()`` 写进 ``stats``（喂报告）
+    必须用同一个定义，否则 benchmark.md 里的回归率与闸门实际用的不是同一个数。
+
+    为什么不用「任务级均值 < -阈值」：3 次重复的均值自带约 12 分噪声（标定
+    sd(Δ)≈15 ⇒ 15·√2/√3 ≈ 12），一个**空改动**也会有近一半任务「均值下跌 5 分以上」，
+    r_max=0.15 于是被噪声顶穿（rrsi2 round1：dQ=-3.19、p=0.16 被判 regression）。
+    独立重复之间伪装不出一致性，所以一致性才是这个判据真正要拦的东西。
+    只有 1 次重复时不下结论（没有一致性可验）。
+    """
+    return sorted(t for t, v in by_task.items()
+                  if len(v) >= 2 and all(d < -cfg.regression_min_points for d in v))
 
 
 def compare(base_scores: list[dict], cand_scores: list[dict],
@@ -130,10 +146,13 @@ def compare(base_scores: list[dict], cand_scores: list[dict],
 
     pr_all = paired_stats([p.delta for p in cmp.pairs], alpha=cfg.alpha)
     cmp.stats = pr_all.to_dict()
-    cmp.stats["regression_rate"] = round(
-        sum(1 for v in cmp.per_task.values()
-            if v["mean_delta"] < -cfg.regression_min_points) / len(cmp.per_task), 4
-    ) if cmp.per_task else 0.0
+    # 与 evidence() 同一个定义（见 crashed_tasks）：报告里的回归率必须就是闸门用的那个数
+    _by = {}
+    for p in cmp.pairs:
+        _by.setdefault(p.task_id, []).append(p.delta)
+    crashed = crashed_tasks(_by, cfg)
+    cmp.stats["regression_rate"] = round(len(crashed) / len(cmp.per_task), 4) if cmp.per_task else 0.0
+    cmp.stats["crashed_tasks"] = crashed
     cmp.stats["dC"] = round(((cmp.cost_cand - cmp.cost_base) / cmp.cost_base), 4) if cmp.cost_base else 0.0
     return cmp
 

@@ -88,6 +88,9 @@ class Evidence:
     #: 「计划明显变短 且 A 反而上升」的配对占比。A 的分母是计划步数，
     #: 所以这条路能让 Q 上升而不产生任何真实产出 —— 必须单独拦。
     plan_undercut_rate: float = 0.0
+    #: 「每一次重复都明显变差」的任务 id（稳定崩）。由 comparator 算好，闸门只负责否决，
+    #: 这样报告里能直接看见是**哪些**任务把候选按住的，而不是只有一个百分比。
+    crashed_tasks: list[str] = field(default_factory=list)
     cost_base: int = 0
     cost_cand: int = 0
 
@@ -209,16 +212,7 @@ def gate_b(ev: Evidence, cfg: Settings | None = None) -> Decision:
                         {"plan_undercut_rate": ev.plan_undercut_rate,
                          "note": "A 的上升来自削减计划步数，而非执行质量提升"})
 
-    # ---- 4. 局部崩溃（平均涨但个别任务崩）----    # 任务数 < 4 时「回归率」没有意义（1 个任务变差就是 100%），此时只看均值。
-    if ev.n_tasks >= 4:
-        ok_reg = ev.regression_rate <= cfg.r_max
-        _trace(rows, "regression_rate", ok_reg, rate=ev.regression_rate,
-               max=cfg.r_max, n_tasks=ev.n_tasks)
-        if not ok_reg:
-            return Decision("REJECT", Reason.REGRESSION.value, rows,
-                            {"regression_rate": ev.regression_rate, "max": cfg.r_max})
-
-    # ---- 5. 主目标：配对 t 的 δ ----
+    # ---- 4. 主目标：配对 t 的 δ ----    # 必须排在「局部崩溃」之前：那条否决要用这条的方向（见 4b）。
     pr = ev.paired(cfg.alpha)
     dQ, thr = pr.mean, pr.delta_crit
     _trace(rows, "primary_gain", dQ > thr, n=pr.n, mean=round(dQ, 4),
@@ -228,6 +222,28 @@ def gate_b(ev: Evidence, cfg: Settings | None = None) -> Decision:
         _trace(rows, "not_worse", False, mean=round(dQ, 4), delta_crit=round(thr, 4))
         return Decision("REJECT", Reason.REGRESSION.value, rows,
                         {"mean_delta": dQ, "delta_crit": thr, "n": pr.n})
+
+    # ---- 4b. 局部崩溃：本条防的是「平均涨但个别任务**稳定**崩」 ----
+    # 两处改错都来自一次真实误判（rrsi2 round1：dQ=-3.19、p=0.16 的「什么都没变」
+    # 被判成 regression，于是台账写成 rejected、这个旋钮被永久删除）：
+    # ① 原来它排在配对检验前面，连「均值为负且不显著」（本该 WITHIN_NOISE → 台账
+    #    inconclusive → 下轮还能重测）也被打成 REGRESSION。而 REGRESSION 属于证伪，
+    #    等于让噪声每轮烧掉一个旋钮，搜索空间必然在几轮内被清空，闭环停摆。
+    #    现在只在 dQ > 0（真的平均涨）时才用它否决「涨的方向掩盖了局部灾难」。
+    # ② 「崩」的定义原来是任务级均值 < -regression_min_points。3 次重复的任务级均值
+    #    自带约 12 分噪声（标定 sd≈15 ⇒ 15·√2/√3 ≈ 12），所以**空改动**也会有近一半
+    #    任务「崩」，13 个任务里出 2 个就顶穿 r_max=0.15。稳定性由 comparator 用
+    #    「每一次重复都明显变差」来判定：独立重复之间伪装不出一致性。
+    # 任务数 < 4 时「回归率」没有意义（1 个任务变差就是 100%），此时只看均值。
+    if ev.n_tasks >= 4 and dQ > 0:
+        ok_reg = ev.regression_rate <= cfg.r_max
+        _trace(rows, "regression_rate", ok_reg, rate=ev.regression_rate,
+               max=cfg.r_max, n_tasks=ev.n_tasks, crashed=ev.crashed_tasks[:8])
+        if not ok_reg:
+            return Decision("REJECT", Reason.REGRESSION.value, rows,
+                            {"regression_rate": ev.regression_rate, "max": cfg.r_max,
+                             "crashed_tasks": ev.crashed_tasks, "mean_delta": dQ,
+                             "note": "平均为正，但在这些任务上每次重复都明显变差"})
 
     if dQ <= thr:
         # 未过噪声门的三条例外（ΔB 不在其中）

@@ -188,6 +188,28 @@ def paired_stats(deltas: Sequence[float], alpha: float = 0.05) -> PairedResult:
     return PairedResult(n, mean, sd, se, df, t_stat, p, delta_crit, mean > delta_crit)
 
 
+def delta_crit(n_tasks: int, n_reps: int, sd: float, alpha: float = 0.05) -> float:
+    """配对 t 的检出门限 δ（Q 百分点）。**口径必须与 ``Evidence.paired()`` 一致**。
+
+        δ = t_crit(T-1, α) · sd / sqrt(T · n)
+
+    T = **不同任务数**，它才是自由度：rep 不是独立样本（同任务同代码的波动远小于
+    跳任务波动，而且我们要回答的是「跳一个新任务还成立吗」）。
+    n = 每个任务的重复次数，它只把**单个任务均值**的噪声按 1/n 收缩（n 条 run 取均值），
+    不增加自由度。
+
+    为什么专门写这个函数：旧版 validate() 把 ADAPTIVE_N 当成配对数算 δ（n=3 时
+    报出 δ≈37 分），而实际跑法是 13 个 train 任务 × 3 次重复 ⇒ δ≈5.2 分。预告了不存
+    在的门限会把能检出的改进报成检不出，是配置层面的自我欺骗。
+    """
+    T, n = max(1, int(n_tasks)), max(1, int(n_reps))
+    if sd <= 0:
+        return 0.0
+    if T < 2:
+        return math.inf        # 一个任务无法区分「普遍有效」与「恰好这一题」
+    return t_crit(T - 1, alpha) * float(sd) / math.sqrt(T * n)
+
+
 def required_n(sd: float, effect: float, power: float = 0.80, alpha: float = 0.05) -> int:
     """检出 ``effect`` 且达到给定把握所需的配对数。
 
