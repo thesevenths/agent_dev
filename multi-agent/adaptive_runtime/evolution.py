@@ -31,6 +31,10 @@ COLD_MIN = 5
 PRUNE_STREAK = 10
 DORMANT_DAYS = 30
 
+#: RC3（停滞触发 L3 强制探索）：连续多少轮 0 accept 即强制把搜索推到结构层。
+#: 本仓库每轮只产 1 个候选（candidates_per_round=1），故「连续非 accept 行」≈「连续 0 accept 轮」。
+FORCE_AFTER_NO_ACCEPT = 2
+
 
 # ---------------------------------------------------------------- 台账行归类
 
@@ -235,6 +239,42 @@ def report(rows: list[dict], cfg: Settings | None = None) -> dict:
     }
 
 
+# ---------------------------------------------------------------- RC3 停滞触发
+
+def _consecutive_no_accept(rows: Iterable[dict], n: int = FORCE_AFTER_NO_ACCEPT) -> bool:
+    """从最新台账行往前数，连续「非 accept」行是否已达 ``n``。
+
+    本仓库每轮只产 1 个候选（``candidates_per_round=1``），故「连续非 accept 行」
+    即「连续 0 accept 轮」。达到阈值说明闭环在原地打转，需要跳出 L1 旋钮去试结构层。
+    """
+    if n <= 0:
+        return False
+    count = 0
+    for r in reversed(rows):
+        if outcome_of(r) == "accepted":
+            break
+        count += 1
+        if count >= n:
+            return True
+    return False
+
+
+def _dominant_l1_exhausted(rows: Iterable[dict], dominant: str,
+                           search_space: dict[str, dict] | None = None) -> bool:
+    """dominant 失败模式下，其全部 L1 旋钮都已被试过且无一被接受 → 视为穷举。
+
+    此时继续在 L1 旋钮上做相邻值搜索是浪费，应把搜索推到 L3 结构候选（B1–B4）。
+    """
+    ss = search_space or SEARCH_SPACE
+    l1 = [k for k, v in ss.items()
+          if int(v["level"]) == 1 and dominant in v.get("taxonomies", ())]
+    if not l1:
+        return False
+    tried = {_target_of(r, ss) for r in rows
+             if _target_of(r, ss) in l1 and outcome_of(r) != "accepted"}
+    return len(tried) == len(l1)
+
+
 def evolve_plan(rows: list[dict], dominant: str, cfg: Settings | None = None) -> dict:
     """给一轮演化用的决策：跳过哪些 target、是否强制探索、强制到哪个组合。"""
     cfg = cfg or CFG
@@ -245,5 +285,15 @@ def evolve_plan(rows: list[dict], dominant: str, cfg: Settings | None = None) ->
         pairs = exploration_pairs(rows, cfg)
         if pairs:
             forced = pairs[0]
-    return {"exclude_targets": sorted(dormant), "explore": hit,
+    else:
+        # RC3：冷落机制（should_explore）依赖「被接受次数」，低 accept 区永远不触发，
+        # 导致 L3 结构候选（B1–B4）被 L1 旋钮饿死。这里用「连续 0 accept」或
+        # 「dominant 的 L1 旋钮已穷举」两个停滞信号，直接强制 (dominant, 3)，
+        # 把结构候选顶到 propose 的 ordered 首位（propose 内部再把 code 级顶到最前）。
+        if _consecutive_no_accept(rows) or _dominant_l1_exhausted(rows, dominant):
+            forced = (dominant, 3)
+            why = {"reason": "rc3_stall_forced_l3",
+                   "consecutive_no_accept": _consecutive_no_accept(rows),
+                   "dominant_l1_exhausted": _dominant_l1_exhausted(rows, dominant)}
+    return {"exclude_targets": sorted(dormant), "explore": hit or forced is not None,
             "explore_reason": why, "forced_pair": forced, "dominant": dominant}

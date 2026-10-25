@@ -507,6 +507,9 @@ def propose(dominant: str, ledger: Ledger, cfg: Settings | None = None,
         tax, lv = prefer_pair
         forced = [k for k in keys
                   if SEARCH_SPACE[k]["level"] == lv and tax in SEARCH_SPACE[k]["taxonomies"]]
+        # RC3：强制探索时把 code 级结构候选顶到首位，让 B1–B4 先于 L3 env 旋钮
+        # （NOOP_MAX / OBS_WINDOW / PLAN_GROW_MAX）被提出，否则它们仍排在其后而永不可达。
+        forced.sort(key=lambda k: (0 if SEARCH_SPACE[k].get("kind") == "code" else 1,))
     ordered = forced + [k for k in keys
                         if k not in forced and dominant in SEARCH_SPACE[k]["taxonomies"]]
     ordered += [k for k in keys if k not in ordered]

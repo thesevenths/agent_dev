@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from adaptive_runtime import evolution, version
+from adaptive_runtime.diagnosis import Taxonomy
 from adaptive_runtime.io_util import read_json
 from adaptive_runtime.proposer import SEARCH_SPACE
 
@@ -154,6 +155,45 @@ class TestVersionModel(unittest.TestCase):
                                    "decision": "ACCEPT", "reason": "VALIDATED"}])
         self.assertEqual(rows[0]["candidate_id"], "c1")
         self.assertEqual(rows[0]["decision"], "ACCEPT")
+
+
+class TestRC3StallForcedL3(unittest.TestCase):
+    """RC3：低 accept 区 / dominant L1 穷举时，强制把结构候选顶进竞技场。"""
+
+    def _cfg(self, max_level=3):
+        class C:
+            max_edit_level = max_level
+            candidates_per_round = 1
+            n_default = 6
+        return C()
+
+    def test_fresh_does_not_force(self):
+        # 空台账：既无连续 0 accept，dominant 的 L1 也未穷举 → 不强制
+        plan = evolution.evolve_plan([], Taxonomy.PLANNING_FAILURE)
+        self.assertIsNone(plan["forced_pair"])
+
+    def test_consecutive_no_accept_forces_l3(self):
+        rows = [_row("AGENT_REPLAN_ARTIFACT_MAX", "inconclusive", "within_noise")
+                for _ in range(2)]
+        plan = evolution.evolve_plan(rows, Taxonomy.PLANNING_FAILURE)
+        self.assertEqual(plan["forced_pair"], (Taxonomy.PLANNING_FAILURE, 3))
+        self.assertEqual(plan["explore_reason"]["reason"], "rc3_stall_forced_l3")
+
+    def test_dominant_l1_exhausted_forces_l3(self):
+        # dominant(PLANNING_FAILURE) 的唯一 L1 旋钮 ARTIFACT_MAX 已被试过且未接受
+        rows = [_row("AGENT_REPLAN_ARTIFACT_MAX", "inconclusive", "within_noise")]
+        plan = evolution.evolve_plan(rows, Taxonomy.PLANNING_FAILURE)
+        self.assertEqual(plan["forced_pair"], (Taxonomy.PLANNING_FAILURE, 3))
+
+    def test_propose_orders_code_first_when_forced(self):
+        from adaptive_runtime.proposer import propose
+        from adaptive_runtime.ledger import Ledger
+        cands = propose(Taxonomy.PLANNING_FAILURE, Ledger(), cfg=self._cfg(3),
+                        prefer_pair=(Taxonomy.PLANNING_FAILURE, 3))
+        self.assertTrue(cands, "强制 L3 应至少产出一个候选")
+        self.assertEqual(cands[0].patch["kind"], "code")
+        self.assertTrue(cands[0].target.startswith("supervisor.B"),
+                        "code 级结构候选应排在 L3 env 旋钮之前")
 
 
 if __name__ == "__main__":
