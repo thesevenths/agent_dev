@@ -1,0 +1,31 @@
+# flink 上的 systemd 单元：本地 embedding 服务（OpenAI 兼容），开机自启 + 崩溃自动重启。
+#
+# 安装（CentOS 7 上 systemd 已存在，无需额外装东西）：
+#   cp embed-server.service /etc/systemd/system/embed-server.service
+#   systemctl daemon-reload
+#   systemctl enable --now embed-server
+#   systemctl status embed-server
+#   curl http://127.0.0.1:8100/health
+#
+# 日志：journalctl -u embed-server -f       （或 journalctl -u embed-server -o cat 只看业务行）
+# 换成手动跑（不开机自启）：
+#   EMBED_MAX_RESTART=0 bash /root/model/Qwen3-Embedding-0.6B/start_embed_server.sh
+[Unit]
+Description=Local Qwen3-Embedding-0.6B embedding server (OpenAI-compatible)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/model/Qwen3-Embedding-0.6B
+Environment="OMP_NUM_THREADS=4"
+# 用 conda base 的绝对路径 python（systemd 不加载 conda 的 activate）
+ExecStart=/root/miniconda3/bin/python /root/model/Qwen3-Embedding-0.6B/embed_server_light.py \
+          --model-path /root/model/Qwen3-Embedding-0.6B \
+          --host 0.0.0.0 --port 8100
+Restart=always
+RestartSec=3
+StandardOutput=append:/root/embed_server.log
+StandardError=append:/root/embed_server.log
+
+[Install]
+WantedBy=multi-user.target
