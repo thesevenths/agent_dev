@@ -1,26 +1,25 @@
 # Benchmark 报告
 
 - 判分口径：`1ef704c6ebac`
-- 轮数：1（ACCEPT 1 / REJECT 0 / SKIP 0）
-- ΔQ 序列：[3.7526]
-- holdout Q 序列：[82.4]（drift +0.00）
+- 轮数：1（ACCEPT 0 / REJECT 1 / SKIP 0）
+- ΔQ 序列：[0.8362]
+- holdout Q 序列：[85.73]（drift +0.00）
 
 ## 结论
 
-- 跑完 1 轮：ACCEPT 1 / REJECT 0 / SKIP 0
-- ΔQ 序列（evolve 集）：['+3.8']
-- ΔQ 序列（holdout 配对）：['-2.9']
+- 跑完 1 轮：ACCEPT 0 / REJECT 1 / SKIP 0
+- ΔQ 序列（evolve 集）：['+0.8']
 - 诊断输入来源：`round_traces`
-- 至少有一个改动真正过了噪声门 —— 闭环能产出有效结论
-- base 版本 1→2（自动 promote），此时 holdout 上升才算泛化证据
+- 没有任何改动过门：要么搜索空间已穷举，要么诊断信号不足（看 UNKNOWN 占比）
+- holdout 平稳（drift=+0.00），未 promote 期间没有泄漏或漂移
 
 ## 逐轮
 
 | 轮 | dominant | 候选 | L | 决策 | n | ΔQ | δ | p | holdout ΔQ | 诊断源 | tokens |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | EVIDENCE_FAILURE | `AGENT_MAX_ITERATIONS_CODE` | 1 | ACCEPT/VALIDATED | 13 | +3.75 | 3.06 | 0.020 | -2.85/10 | round_traces(4) | 27,999,207 |
+| 1 | PLANNING_FAILURE | `AGENT_REPLAN_ARTIFACT_MAX` | 1 | REJECT/within_noise | 13 | +0.84 | 4.46 | 0.690 | - | round_traces(4) | 24,719,964 |
 
-- 第 1 轮备注：第 1 轮：用 base 臂 bootstrap 扫描作为诊断输入（不读人工日志）; 已自动换基线并落地：base/v2
+- 第 1 轮备注：第 1 轮：用 base 臂 bootstrap 扫描作为诊断输入（不读人工日志）
 
 ## 怎么读这份报告
 

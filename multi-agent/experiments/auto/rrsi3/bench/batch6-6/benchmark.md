@@ -2,8 +2,8 @@
 
 - 判分口径：`1ef704c6ebac`
 - 轮数：1（ACCEPT 0 / REJECT 1 / SKIP 0）
-- ΔQ 序列：[1.3072]
-- holdout Q 序列：[81.97]（drift +0.00）
+- ΔQ 序列：[1.2791]
+- holdout Q 序列：[88.44]（drift +0.00）
 
 ## 结论
 
@@ -17,9 +17,9 @@
 
 | 轮 | dominant | 候选 | L | 决策 | n | ΔQ | δ | p | holdout ΔQ | 诊断源 | tokens |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | EVIDENCE_FAILURE | `AGENT_MAX_ITERATIONS_CODE` | 1 | REJECT/within_noise | 13 | +1.31 | 4.35 | 0.525 | - | round_traces(4) | 23,924,015 |
+| 1 | PLANNING_FAILURE | `supervisor.B2_plan_dedup` | 3 | REJECT/within_noise | 13 | +1.28 | 4.65 | 0.560 | - | round_traces(4) | 24,576,456 |
 
-- 第 1 轮备注：第 1 轮：用 base 臂 bootstrap 扫描作为诊断输入（不读人工日志）; UNKNOWN 占比超过阈值：taxonomy 已超前于埋点，应先补字段而不是增加类别
+- 第 1 轮备注：第 1 轮：用 base 臂 bootstrap 扫描作为诊断输入（不读人工日志）
 
 ## 怎么读这份报告
 

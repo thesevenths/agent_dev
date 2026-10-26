@@ -2,13 +2,13 @@
 
 - 判分口径：`1ef704c6ebac`
 - 轮数：1（ACCEPT 0 / REJECT 1 / SKIP 0）
-- ΔQ 序列：[1.6754]
-- holdout Q 序列：[86.19]（drift +0.00）
+- ΔQ 序列：[1.0319]
+- holdout Q 序列：[87.27]（drift +0.00）
 
 ## 结论
 
 - 跑完 1 轮：ACCEPT 0 / REJECT 1 / SKIP 0
-- ΔQ 序列（evolve 集）：['+1.7']
+- ΔQ 序列（evolve 集）：['+1.0']
 - 诊断输入来源：`round_traces`
 - 没有任何改动过门：要么搜索空间已穷举，要么诊断信号不足（看 UNKNOWN 占比）
 - holdout 平稳（drift=+0.00），未 promote 期间没有泄漏或漂移
@@ -17,7 +17,7 @@
 
 | 轮 | dominant | 候选 | L | 决策 | n | ΔQ | δ | p | holdout ΔQ | 诊断源 | tokens |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | EVIDENCE_FAILURE | `prompt.py::coder.require-sources` | 2 | REJECT/within_noise | 13 | +1.68 | 4.07 | 0.388 | - | round_traces(4) | 25,947,677 |
+| 1 | EVIDENCE_FAILURE | `prompt.py::coder.require-sources` | 2 | REJECT/within_noise | 13 | +1.03 | 5.00 | 0.661 | - | round_traces(4) | 25,922,925 |
 
 - 第 1 轮备注：第 1 轮：用 base 臂 bootstrap 扫描作为诊断输入（不读人工日志）
 
