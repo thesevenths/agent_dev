@@ -210,7 +210,8 @@ def run_auto(tasks: list[dict], *, rounds: int = 3, n: int | None = None,
              out_dir: str | Path | None = None, cfg: Settings | None = None,
              resume: bool = True, verify: bool = True,
              fake_profiles: dict[str, str] | None = None,
-             keep_sandbox: bool = False, on_progress=None) -> dict:
+             keep_sandbox: bool = False, on_progress=None,
+             force_dominant: str | None = None) -> dict:
     """跑（或续跑）无人值守闭环，返回 ``{"report", "state", "verdict"}``。
 
     续跑语义：``state.json`` 里记了 ``rounds_done`` 与任务集指纹。同一 label 且任务集
@@ -263,7 +264,7 @@ def run_auto(tasks: list[dict], *, rounds: int = 3, n: int | None = None,
         on_accept=make_on_accept(tally, cfg, verify=verify,
                                  fake_profiles=fake_profiles,
                                  keep_sandbox=keep_sandbox),
-        ledger_path=ledger_path)
+        ledger_path=ledger_path, force_dominant=force_dominant)
     if "error" in report:
         return {"error": report["error"], "state": state}
 

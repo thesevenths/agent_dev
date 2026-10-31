@@ -23,7 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from adaptive_runtime import token_probe  # noqa: E402
-from adaptive_runtime.evaluator import score_trace, write_score  # noqa: E402
+from adaptive_runtime.evaluator import Score, score_trace, write_score  # noqa: E402
+from adaptive_runtime.humaneval import grade_run  # noqa: E402
 from adaptive_runtime.io_util import write_json  # noqa: E402
 from adaptive_runtime.trace_export import export_from_log  # noqa: E402
 
@@ -212,6 +213,11 @@ def _run_real(args, out: Path) -> dict:
     from graph import invoke_with_memory  # 延迟导入：沙箱 cwd 必须已在 sys.path
     final_state = invoke_with_memory(args.query, thread_id=args.thread_id)
 
+    # HumanEval 分支：用「单测断言通过比例」算 Q，而不是交付物 A/E/C。
+    # 其余逻辑（token 埋点、infra 判定、产物落盘）保持不变。
+    if args.benchmark == "humaneval":
+        return _run_humaneval(args, out, final_state)
+
     import runlog
     log_file = runlog.run_file()
     if not log_file:
@@ -232,6 +238,32 @@ def _run_real(args, out: Path) -> dict:
             **({"error": infra, "infra_error": True} if infra else {})}
 
 
+def _run_humaneval(args, out: Path, final_state) -> dict:
+    """HumanEval 单 run：抽代码 → 跑单测 → 写 Q（断言通过比例）。
+
+    与 ``_run_real`` 共用 token 埋点（``_run_real`` 已在调用前 install/clear/bind），
+    这里只补 grades 与产物落盘。trace 对编码任务无意义（没有交付物步骤），写占位。
+    """
+    usage = token_probe.totals()
+    grade = grade_run(args.entry_point, args.test, final_state, Path.cwd())
+    score = Score(
+        run_id=f"{args.task_id}-r{args.rep}-{args.arm}", task_id=args.task_id, arm=args.arm,
+        A=round(grade["A"], 4), E=None, C=None, Q=round(grade["Q"], 2),
+        planned=0,
+        components={"humaneval_pass": grade["all_pass"],
+                    "passed_asserts": grade["passed"], "total_asserts": grade["total"]},
+        weights_used={}, flags=[], detail=grade)
+    write_json(out / "trace.json", {"note": "humaneval run: trace 不适用（无交付物步骤）"})
+    write_score(score, out)
+    write_json(out / "usage.json", usage)
+    infra = _infra_error(usage, score)
+    return {"ok": infra is None, "fake": False, "Q": score.Q, "A": score.A,
+            "tokens": usage["total"], "estimated_ratio": usage["estimated_ratio"],
+            "log": None, "finalized": bool(final_state),
+            "calls": usage["calls"], "call_errors": usage["errors"],
+            **({"error": infra, "infra_error": True} if infra else {})}
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv: list[str] | None = None) -> int:
@@ -244,6 +276,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--thread-id", default=None)
     ap.add_argument("--round-id", default=None)
     ap.add_argument("--fake-profile", default=None)
+    # HumanEval：把单测 `test` / `entry_point` 透传给评分器（仅 --benchmark humaneval 时生效）
+    ap.add_argument("--benchmark", default=None,
+                    help="任务类型；humaneval 时改用单测断言比例算 Q")
+    ap.add_argument("--test", default=None, help="HumanEval 的 test 源码（含 assert）")
+    ap.add_argument("--entry-point", default=None, help="HumanEval 的入口函数名")
     args = ap.parse_args(argv)
 
     out = Path(args.out)

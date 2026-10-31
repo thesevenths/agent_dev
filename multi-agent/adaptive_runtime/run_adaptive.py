@@ -19,6 +19,8 @@
     # 无人值守：自己换基线 + 自己落地 + 自己出具达成判据
     python -m adaptive_runtime.run_adaptive auto --offline --rounds 3 --n 8 --parallel 4 --yes
     python -m adaptive_runtime.run_adaptive auto --verify-only     # 只从产物重算判据（不跑模型）
+    # HumanEval 正路径（免 Docker，证明 Capability A）：先 fetch 数据，再跑
+    python -m adaptive_runtime.run_adaptive auto --benchmark humaneval --offline --rounds 3 --n 6 --limit 18 --task-label he --yes
 
 两个全局开关为什么放在子命令上而不是只靠环境变量：
 ``--offline`` 是**不烧 Tavily 免费额度**与**降噪**的同一件事（联网内容逐日变化会把
@@ -34,6 +36,7 @@ from pathlib import Path
 
 from . import auto as auto_module
 from . import bench_tasks as bench_tasks_mod
+from . import humaneval as humaneval_mod
 from . import calibrate as calib
 from . import (benchmark, diag_batch, diagnosis, evolution, frozen, harness, offline_tasks,
                proposer, quarantine, regression, trajectory, version)
@@ -638,7 +641,16 @@ def cmd_benchmark(args) -> int:
     if args.rounds < 2:
         _say("提示：rounds<2 只能看单轮，看不到「累积提升」；建议 ≥3")
 
-    tasks = _load_tasks(args.tasks_file, limit=args.limit)
+    if args.benchmark == "humaneval":
+        try:
+            tasks = humaneval_mod.load_tasks(n=args.limit)
+        except SystemExit as e:
+            _say(str(e))
+            return 1
+        force_dominant = "PLANNING_FAILURE"
+    else:
+        tasks = _load_tasks(args.tasks_file, limit=args.limit)
+        force_dominant = None
     fakes = {"base": "base", "cand": args.case} if args.fake else None
     if not args.fake:
         est = args.rounds * args.n * 2 * args.avg_tokens
@@ -648,7 +660,8 @@ def cmd_benchmark(args) -> int:
     rep = benchmark.run_benchmark(
         tasks, rounds=args.rounds, n=args.n, holdout_ratio=args.holdout,
         level=args.level, trace=args.trace, task_label=args.task_label,
-        fake_profiles=fakes, keep_sandbox=args.keep)
+        fake_profiles=fakes, keep_sandbox=args.keep,
+        force_dominant=force_dominant)
 
     if rep.get("error"):
         _say(f"无法开始：{rep['error']}")
@@ -674,7 +687,19 @@ def cmd_auto(args) -> int:
         _say(f"产物：{out / auto_module.VERDICT_NAME}")
         return 0 if v["achieved"] else 1
 
-    tasks = _load_tasks(args.tasks_file, limit=args.limit)
+    # HumanEval 走公开基准源：免 Docker、用单测断言比例算 Q；强制 dominant 拉出 B1–B4。
+    if args.benchmark == "humaneval":
+        try:
+            tasks = humaneval_mod.load_tasks(n=args.limit)
+        except SystemExit as e:
+            _say(str(e))
+            return 1
+        force_dominant = "PLANNING_FAILURE"
+        _say(f"HumanEval 任务集：{len(tasks)} 题（limit={args.limit}）；"
+             f"强制 dominant=PLANNING_FAILURE 以拉出 B1–B4 结构性候选")
+    else:
+        tasks = _load_tasks(args.tasks_file, limit=args.limit)
+        force_dominant = None
     fakes = {"base": "base", "cand": args.case} if args.fake else None
 
     # δ 的口径必须与真实跑法一致：自由度是 **train 任务数**，不是 ADAPTIVE_N。
@@ -718,6 +743,7 @@ def cmd_auto(args) -> int:
         label=args.task_label, out_dir=args.out_dir or None,
         resume=not args.no_resume, verify=not args.no_verify,
         fake_profiles=fakes, keep_sandbox=args.keep,
+        force_dominant=force_dominant,
         on_progress=lambda m: _say(f"  · {m}"))
     if rep.get("error"):
         _say(f"无法开始：{rep['error']}")
@@ -897,6 +923,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep", action="store_true", help="保留沙箱目录")
     p.add_argument("--offline", action="store_true", help="离线模式（不联网，用本地数据任务集）")
     p.add_argument("--parallel", type=int, default=None, help="并发 run 数（默认 1=串行）")
+    p.add_argument("--benchmark", default=None, choices=("humaneval",),
+                   help="任务源换成公开基准 humaneval（免 Docker，用单测断言比例算 Q）")
     p.set_defaults(func=cmd_benchmark)
 
     p = sub.add_parser("auto", help="无人值守闭环：自己换基线 + 自己落地 + 自己出达成判据")
@@ -919,6 +947,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="不跑任何模型，只从磁盘产物重算达成判据")
     p.add_argument("--yes", action="store_true", help="跳过墙钟预估确认")
     p.add_argument("--keep", action="store_true", help="保留沙箱目录")
+    p.add_argument("--benchmark", default=None, choices=("humaneval",),
+                   help="任务源换成公开基准 humaneval（免 Docker，用单测断言比例算 Q）")
     p.set_defaults(func=cmd_auto)
 
     p = sub.add_parser("regression", help="回归集管理（只否决不演化）")

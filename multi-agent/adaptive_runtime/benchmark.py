@@ -170,7 +170,8 @@ def run_benchmark(tasks: list[dict], *, rounds: int = 3, n: int = 4,
                   keep_sandbox: bool = False,
                   cfg: Settings | None = None,
                   on_accept=None,
-                  ledger_path: str | Path | None = None) -> dict:
+                  ledger_path: str | Path | None = None,
+                  force_dominant: str | None = None) -> dict:
     """跑 rounds 轮闭环，返回曲线与结论。
 
     ``on_accept(cand, rr, ctx)``：每轮 ACCEPT 后的回调（``auto.py`` 用它做自动换基线）。
@@ -236,7 +237,7 @@ def run_benchmark(tasks: list[dict], *, rounds: int = 3, n: int = 4,
             diag_batch.write_diagnosis(out / f"round{r}", findings_all, dsum, cfg)
             rr.diag_source = str(dsum.get("source"))
             rr.diag_runs = int(dsum.get("n_runs") or 0)
-        rr.dominant = dsum["dominant"]
+        rr.dominant = force_dominant or dsum["dominant"]
         rr.unknown_ratio = float(dsum.get("unknown_ratio") or 0.0)
         if dsum.get("hint"):
             rr.notes.append(dsum["hint"])

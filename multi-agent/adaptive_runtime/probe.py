@@ -213,6 +213,10 @@ def run_one(sandbox: Sandbox, task: dict, rep: int, arm: str, out_dir: str | Pat
         cmd += ["--fake-profile", fake_profile]
     if task.get("thread_id"):
         cmd += ["--thread-id", task["thread_id"]]
+    # HumanEval：把单测 test / entry_point 透传；其余任务不走这条分支
+    if task.get("benchmark") == "humaneval":
+        cmd += ["--benchmark", "humaneval",
+                "--test", task["test"], "--entry-point", task["entry_point"]]
 
     env = _env_for_run(sandbox, overrides or {}, out, fake=bool(fake_profile), cfg=cfg)
     t0 = time.time()
