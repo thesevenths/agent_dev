@@ -2,13 +2,13 @@
 
 - 结论：**未达成**（硬条件 4/9）
 - 基线版本：`base/v2`；轮数 6；promote 1 / demote 0
-- 生成时间：2026-10-31T13:57:43
+- 生成时间：2026-10-31T18:16:44
 
 | 判据 | 结果 | 证据 |
 | --- | --- | --- |
 | `noise_calibrated`（硬）噪声已**实测**标定（δ 不是假设值） | ❌ | `{"exists": true, "passed": false, "sd_diff_null": 16.0508, "k": 4, "validity": [], "target": 15.0, "tasks": 8, "n_pairs": 48}` |
 | `loop_self_contained`（硬）每轮诊断只吃本轮自己跑出的轨迹 | ✅ | `{"rounds": 6, "offenders": []}` |
-| `holdout_quarantined`（硬）holdout 从未参与诊断/提案（泛化层干净） | ✅ | `{"rounds_checked": 6, "leaked": [], "holdout_ids": [], "excluded_run_counts": []}` |
+| `holdout_quarantined`（硬）holdout 从未参与诊断/提案（泛化层干净） | ✅ | `{"rounds_checked": 6, "leaked": [], "holdout_ids": ["HumanEval/1", "HumanEval/107", "HumanEval/108", "HumanEval/109", "HumanEval/110"], "holdout_reserved": true, "excluded_run_counts": []}` |
 | `auto_promote_happened`（硬）闭环自己至少换过一次基线 | ❌ | `{"auto_promotes_in_window": 0, "auto_promotes_total": 1, "tags": [], "targets": []}` |
 | `no_human_promote_in_run`（硬）本次运行窗口内没有任何人工签字 | ✅ | `{"human_promotes": []}` |
 | `behavior_actually_changed`（硬）改动真正落到生产（内容指纹改变） | ❌ | `{"content_stamp_before": "23dd8b2d79c3d661", "content_stamp_after": "23dd8b2d79c3d661", "content_stamp_now": "23dd8b2d79c3d661", "promote_records": 1, "note": "内容指纹变了才说明生产 harness 真的换了一版；只升版本号不改内容 = 自欺"}` |

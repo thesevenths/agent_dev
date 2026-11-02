@@ -375,6 +375,48 @@ def apply_prompt_patch(sandbox: Sandbox, patch: dict) -> dict:
             "diff": "\n".join(diff)}
 
 
+def apply_code_patch(sandbox: Sandbox, patch: dict, *, name: str = "") -> dict:
+    """在**一次性沙箱副本**上插入带哨兵的代码块（与 ``landing.land_code`` 同构，但只作用于 sandbox）。
+
+    为什么需要它：L3 结构性候选（如 ``supervisor.B1_plan_validator``）是 ``kind=="code"``，
+    目标文件是生产 harness 模块（``supervisor.py`` 等）。agent 子进程从 sandbox 副本
+    ``import`` 这些模块（``cwd=sandbox.path`` + ``PYTHONPATH=sandbox.path``），所以把代码补丁
+    打到 cand sandbox 副本上，cand 臂就能真正执行到补丁代码；base 臂用未改副本，互不污染。
+
+    旧实现只在 ``is_prompt`` 时打补丁，code 候选被整段跳过 —— 这是 RRSI 正路径的接线缺口：
+    cand 臂跑的是和 base 完全相同的代码，于是 ``mean_delta`` 恒为精确 0、``p_value`` 恒为 1.0。
+    此函数把缺口补上。sandbox 是一次性的，无需回滚。
+    """
+    import difflib
+    from .landing import wrap_code_patch
+
+    fname = str(patch.get("file") or "")
+    anchor = str(patch.get("anchor") or "")
+    insert = str(patch.get("insert") or "")
+    if not fname or not anchor or not insert:
+        raise PatchError(f"代码补丁字段不完整：{sorted(patch)}")
+    p = sandbox.path / fname
+    if not p.exists():
+        raise PatchError(f"目标文件不存在：{p}")
+    old_text = p.read_text(encoding="utf-8", errors="replace")
+    n = old_text.count(anchor)
+    if n != 1:
+        raise PatchError(f"锚点在 {fname} 出现 {n} 次（必须恰好 1 次）：{anchor!r}")
+    sentinel_name = name or fname
+    wrapped = wrap_code_patch(sentinel_name, insert)
+    if old_text.count(wrapped) != 0:
+        raise PatchError(f"代码补丁正文已存在于 {fname}，拒绝重复落地")
+    new_text = old_text.replace(anchor, wrapped + anchor, 1)
+    p.write_text(new_text, encoding="utf-8")
+
+    diff = list(difflib.unified_diff(old_text.splitlines(), new_text.splitlines(),
+                                     fromfile=f"a/{fname}", tofile=f"b/{fname}", lineterm=""))
+    added = sum(1 for ln in diff if ln.startswith("+") and not ln.startswith("+++"))
+    removed = sum(1 for ln in diff if ln.startswith("-") and not ln.startswith("---"))
+    return {"file": fname, "anchor": anchor, "added": added, "removed": removed,
+            "diff": "\n".join(diff), "kind": "code"}
+
+
 # ---------------------------------------------------------------- 调度
 
 def run_jobs(jobs: list[tuple[Any, Any]], workers: int, *, should_stop=None) -> dict:
@@ -497,6 +539,10 @@ def probe_candidate(cand: Any, tasks: list[dict], out_dir: str | Path,
     # 打两次就会插两遍（锚点仍存在），候选实际改了两处而指纹只有一处 —— 归因就错了。
     if getattr(cand, "is_prompt", False):
         outcome.patch_applied = apply_prompt_patch(cand_sb, cand.patch)
+    elif getattr(cand, "patch", {}).get("kind") == "code":
+        # L3：代码补丁（结构性候选）同样只打在 cand 副本上、跑任何 run 之前打一次。
+        # 旧实现漏了这条分支，导致 code 候选从没进 cand 臂 —— 接线缺口，现已补上。
+        outcome.patch_applied = apply_code_patch(cand_sb, cand.patch, name=cand.target)
 
     def _profile(arm: str) -> str | None:
         return (fake_profiles or {}).get(arm)

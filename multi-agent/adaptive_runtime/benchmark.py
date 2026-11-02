@@ -171,7 +171,8 @@ def run_benchmark(tasks: list[dict], *, rounds: int = 3, n: int = 4,
                   cfg: Settings | None = None,
                   on_accept=None,
                   ledger_path: str | Path | None = None,
-                  force_dominant: str | None = None) -> dict:
+                  force_dominant: str | None = None,
+                  force_target: str | None = None) -> dict:
     """跑 rounds 轮闭环，返回曲线与结论。
 
     ``on_accept(cand, rr, ctx)``：每轮 ACCEPT 后的回调（``auto.py`` 用它做自动换基线）。
@@ -246,7 +247,8 @@ def run_benchmark(tasks: list[dict], *, rounds: int = 3, n: int = 4,
         plan = evolution.evolve_plan(ledger.rows, rr.dominant)
         cands = proposer.propose(rr.dominant, ledger, cfg=cfg,
                                  exclude_targets=plan["exclude_targets"],
-                                 prefer_pair=plan["forced_pair"])
+                                 prefer_pair=plan["forced_pair"],
+                                 force_target=force_target)
         if level is not None:
             cands = [c for c in cands if c.level == level]
         if not cands:

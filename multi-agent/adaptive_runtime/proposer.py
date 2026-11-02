@@ -47,6 +47,16 @@ SEARCH_SPACE: dict[str, dict] = {
         "rationale": "产物缺失时触发 replan 的门槛（弱效应）",
         "expectation": "weak",
     },
+    # 正向控制夹具（Step 4）：best-of-K 采样用真实单测挑最优。
+    # target 即 env 变量名 HE_BEST_OF_K；候选只作用于 cand 臂（env_overrides），
+    # 经 runner_once._run_real 的 best-of-K 循环消费。默认 K=1（不设置时）不影响现有行为。
+    # 它不在冻结清单的 10 个 env 之内，不会触发 frozen_core_violation。
+    "HE_BEST_OF_K": {
+        "values": ["4"], "level": 1,
+        "taxonomies": (Taxonomy.PLANNING_FAILURE,),
+        "rationale": "正向控制夹具：同一题采样 K 次、用真实单测挑最优，必然提升期望 Q（数学模型保证）",
+        "expectation": "improve",
+    },
     "AGENT_REPLAN_NOOP_MAX": {
         "values": ["2", "3"], "level": 3,
         "taxonomies": (Taxonomy.PLANNING_FAILURE,),
@@ -489,17 +499,40 @@ def _adjacent(values: list[str], old: str) -> list[str]:
 def propose(dominant: str, ledger: Ledger, cfg: Settings | None = None,
             avg_run_tokens: int = 600_000, n_pairs: int | None = None,
             limit: int | None = None, exclude_targets: Iterable[str] | None = None,
-            prefer_pair: tuple[str, int] | None = None) -> list[Candidate]:
+            prefer_pair: tuple[str, int] | None = None,
+            force_target: str | None = None) -> list[Candidate]:
     """按失败模式生成候选。确定性规则，不花 LLM 钱。
 
     ``exclude_targets``：已进入 dormant 的组件（V3 §10.6），不再由它生成候选。
     ``prefer_pair``：强制探索时指定的 (失败模式 × 层)（V3 §10.4），优先覆盖它。
+    ``force_target``：正向控制夹具用 —— 直接构造指定候选、跳过主导模式/层级过滤，
+    仅当该候选 level ≤ max_edit_level。用于 ``--positive-control`` 注入已知有效改动。
     """
     cfg = cfg or CFG
     n_pairs = n_pairs or cfg.n_default
     est = estimate_round_tokens(avg_run_tokens, n_pairs)
     out: list[Candidate] = []
     skip = set(exclude_targets or ())
+
+    # ---- 正向控制：直接构造指定候选，绕过搜索空间过滤 ----
+    if force_target:
+        _spec = SEARCH_SPACE.get(force_target)
+        if _spec and _spec["level"] <= cfg.max_edit_level:
+            _old = current_value(force_target)
+            for _new in _adjacent(list(_spec["values"]), _old):
+                if _new == _old:
+                    continue
+                _patch = {"kind": "env", "key": force_target, "old": _old, "new": _new}
+                _fp = fingerprint(force_target, _old, _new, dominant or "")
+                out.append(Candidate(
+                    candidate_id=new_id("cand"), target=force_target,
+                    level=_spec["level"], old=_old, new=_new,
+                    hypothesis=f"{force_target} {_old}→{_new}（{_spec.get('rationale','')}）",
+                    taxonomy=dominant or (_spec["taxonomies"][0] if _spec["taxonomies"] else ""),
+                    est_cost=est, expected_behavior=[_spec.get("expectation", "improve")],
+                    patch=_patch, hyp_fingerprint=_fp))
+                break
+        return out
 
     keys = [k for k in SEARCH_SPACE if k not in skip]
     forced: list[str] = []

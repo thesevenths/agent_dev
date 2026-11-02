@@ -246,6 +246,7 @@ def invoke_with_memory(query: str, thread_id: str = None, config: Optional = Non
         # updates 模式 data={node_name: state_update}。
         # 注：子 agent 是嵌套 invoke，其 token 仅在「父 config 被透传进子图」（HITL 开启）或
         # 经 langgraph dev/Studio 平台回调传播时才会流到这里；本自测入口至少能流外层节点消息。
+        accumulated: list = []
         final_state = None
         for mode, data in graph.stream(
             {"messages": [HumanMessage(content=query)], "memory_key": thread_id},
@@ -261,7 +262,23 @@ def invoke_with_memory(query: str, thread_id: str = None, config: Optional = Non
                 for _node, upd in (data or {}).items():
                     if isinstance(upd, dict):
                         final_state = upd
+                        # 累积每个节点新产生的消息（增量），作为 get_state 失败时的回退
+                        for _m in (upd.get("messages") or []):
+                            accumulated.append(_m)
         print()  # token 流结束后补一个换行
+
+        # 取「完整累积状态」覆盖上面的 final_state：后者只是【最后一个节点】的增量更新，
+        # 会丢掉 code_agent 子图产生的 create_file 等中间消息，导致 HumanEval 抽不到代码 → 全 0 分。
+        # graph.get_state 从持久化检查点读回最终全量状态（含所有节点 messages）。
+        try:
+            _snap = graph.get_state(config)
+            if _snap is not None and getattr(_snap, "values", None):
+                final_state = _snap.values
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(f"[invoke_with_memory] get_state 失败，回退到累积消息：{_e}")
+            if accumulated:
+                _base = {k: v for k, v in (final_state or {}).items() if k != "messages"}
+                final_state = {"messages": accumulated, **_base}
 
         # 可视化最终快照 (middleware already handles, but fallback)
         if final_state and final_state.get("snapshot_id"):

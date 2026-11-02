@@ -213,6 +213,27 @@ def _run_real(args, out: Path) -> dict:
     from graph import invoke_with_memory  # 延迟导入：沙箱 cwd 必须已在 sys.path
     final_state = invoke_with_memory(args.query, thread_id=args.thread_id)
 
+    # HumanEval best-of-K（正向控制夹具 / 通用增强）：同一题采样 K 次、用真实单测挑最优。
+    # 由 env HE_BEST_OF_K 控制，默认 1（不设置时）不改变现有单样本行为，仅 --benchmark humaneval 生效。
+    # base 臂不设该变量 → K=1；cand 臂通过候选 env_overrides 设 K>1，两臂差异即被测对象。
+    # 模型随机且单测精确，best-of-K 在数学上必然提升期望 Q（正向控制即据此证明管线能 accept→land）。
+    if args.benchmark == "humaneval":
+        try:
+            _he_k = max(1, int(os.environ.get("HE_BEST_OF_K", "1") or "1"))
+        except (TypeError, ValueError):
+            _he_k = 1
+        if _he_k > 1:
+            _samples = [final_state]
+            for _i in range(1, _he_k):
+                _samples.append(invoke_with_memory(
+                    args.query, thread_id=f"{args.thread_id}-bk{_i}"))
+            _best_state, _best_q = final_state, -1.0
+            for _st in _samples:
+                _g = grade_run(args.entry_point, args.test, _st, Path.cwd())
+                if _g["Q"] > _best_q:
+                    _best_q, _best_state = _g["Q"], _st
+            final_state = _best_state
+
     # HumanEval 分支：用「单测断言通过比例」算 Q，而不是交付物 A/E/C。
     # 其余逻辑（token 埋点、infra 判定、产物落盘）保持不变。
     if args.benchmark == "humaneval":

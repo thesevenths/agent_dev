@@ -641,16 +641,18 @@ def cmd_benchmark(args) -> int:
     if args.rounds < 2:
         _say("提示：rounds<2 只能看单轮，看不到「累积提升」；建议 ≥3")
 
-    if args.benchmark == "humaneval":
+    if args.benchmark == "humaneval" or args.positive_control:
         try:
             tasks = humaneval_mod.load_tasks(n=args.limit)
         except SystemExit as e:
             _say(str(e))
             return 1
         force_dominant = "PLANNING_FAILURE"
+        force_target = "HE_BEST_OF_K" if args.positive_control else None
     else:
         tasks = _load_tasks(args.tasks_file, limit=args.limit)
         force_dominant = None
+        force_target = None
     fakes = {"base": "base", "cand": args.case} if args.fake else None
     if not args.fake:
         est = args.rounds * args.n * 2 * args.avg_tokens
@@ -661,7 +663,7 @@ def cmd_benchmark(args) -> int:
         tasks, rounds=args.rounds, n=args.n, holdout_ratio=args.holdout,
         level=args.level, trace=args.trace, task_label=args.task_label,
         fake_profiles=fakes, keep_sandbox=args.keep,
-        force_dominant=force_dominant)
+        force_dominant=force_dominant, force_target=force_target)
 
     if rep.get("error"):
         _say(f"无法开始：{rep['error']}")
@@ -688,18 +690,21 @@ def cmd_auto(args) -> int:
         return 0 if v["achieved"] else 1
 
     # HumanEval 走公开基准源：免 Docker、用单测断言比例算 Q；强制 dominant 拉出 B1–B4。
-    if args.benchmark == "humaneval":
+    if args.benchmark == "humaneval" or args.positive_control:
         try:
             tasks = humaneval_mod.load_tasks(n=args.limit)
         except SystemExit as e:
             _say(str(e))
             return 1
         force_dominant = "PLANNING_FAILURE"
+        force_target = "HE_BEST_OF_K" if args.positive_control else None
         _say(f"HumanEval 任务集：{len(tasks)} 题（limit={args.limit}）；"
-             f"强制 dominant=PLANNING_FAILURE 以拉出 B1–B4 结构性候选")
+             f"强制 dominant=PLANNING_FAILURE 以拉出 B1–B4 结构性候选"
+             + ("；正向控制夹具 HE_BEST_OF_K 注入" if args.positive_control else ""))
     else:
         tasks = _load_tasks(args.tasks_file, limit=args.limit)
         force_dominant = None
+        force_target = None
     fakes = {"base": "base", "cand": args.case} if args.fake else None
 
     # δ 的口径必须与真实跑法一致：自由度是 **train 任务数**，不是 ADAPTIVE_N。
@@ -743,7 +748,7 @@ def cmd_auto(args) -> int:
         label=args.task_label, out_dir=args.out_dir or None,
         resume=not args.no_resume, verify=not args.no_verify,
         fake_profiles=fakes, keep_sandbox=args.keep,
-        force_dominant=force_dominant,
+        force_dominant=force_dominant, force_target=force_target,
         on_progress=lambda m: _say(f"  · {m}"))
     if rep.get("error"):
         _say(f"无法开始：{rep['error']}")
@@ -925,6 +930,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--parallel", type=int, default=None, help="并发 run 数（默认 1=串行）")
     p.add_argument("--benchmark", default=None, choices=("humaneval",),
                    help="任务源换成公开基准 humaneval（免 Docker，用单测断言比例算 Q）")
+    p.add_argument("--positive-control", action="store_true",
+                   help="正向控制夹具：注入 HE_BEST_OF_K 已知有效候选，验证 accept→promote→land→holdout 正路径（自动切 humaneval）")
     p.set_defaults(func=cmd_benchmark)
 
     p = sub.add_parser("auto", help="无人值守闭环：自己换基线 + 自己落地 + 自己出达成判据")
@@ -949,6 +956,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep", action="store_true", help="保留沙箱目录")
     p.add_argument("--benchmark", default=None, choices=("humaneval",),
                    help="任务源换成公开基准 humaneval（免 Docker，用单测断言比例算 Q）")
+    p.add_argument("--positive-control", action="store_true",
+                   help="正向控制夹具：注入 HE_BEST_OF_K 已知有效候选，验证 accept→promote→land→holdout 正路径（自动切 humaneval）")
     p.set_defaults(func=cmd_auto)
 
     p = sub.add_parser("regression", help="回归集管理（只否决不演化）")

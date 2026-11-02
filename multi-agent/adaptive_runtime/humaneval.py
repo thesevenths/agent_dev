@@ -136,34 +136,135 @@ def _extract_block(text: str) -> str | None:
     if blocks:
         blocks.sort(key=lambda b: (0 if "def " in b else 1, -len(b)))
         return blocks[0]
-    if re.search(r"^\s*def\s+\w+\s*\(", text, re.M):
-        return text.strip()
+    # 兜底：仅当整段文本**以** def/class/@ 开头（绝对行首，无前导 import/自然语言）
+    # 才视为裸代码块。不能用 re.M 的「文本中某行含 def」匹配 —— HumanEval 的
+    # prompt 本身以函数签名开头、其后跟自然语言指令，会被误判为代码 → SyntaxError → 0 分。
+    stripped = text.strip()
+    if re.match(r"(def|class|@)", stripped):
+        return stripped
     return None
 
 
-def extract_code_from_state(final_state: Any, root: str | Path) -> str | None:
-    """从 agent 产出抽取代码：先扫最终消息，再退到 ``documents/*.py``。"""
-    candidates: list[str] = []
+def _msg_role(m: Any) -> str:
+    """从 langchain 消息对象或 dict 两种形态里提取 role 字符串（小写）。
+
+    langchain BaseMessage 用 ``.type``（"human"/"ai"/"system"/"tool"）；
+    走序列化 dict 时用 ``role`` 字段（"user"/"assistant"/...）。
+    无法识别时返回空串，由调用方按「非生成侧」处理。
+    """
+    if isinstance(m, dict):
+        r = m.get("role")
+    else:
+        r = getattr(m, "type", None) or getattr(m, "role", None)
+    return (r or "").lower()
+
+
+def _msg_content(m: Any) -> str | None:
+    """从 langchain 消息对象或 dict 提取文本内容。"""
+    if isinstance(m, dict):
+        c = m.get("content")
+    else:
+        c = getattr(m, "content", None)
+    return c if isinstance(c, str) else None
+
+
+def _tool_calls_of(m: Any) -> list:
+    """从 langchain 消息对象或 dict 提取 tool_calls 列表（每个含 name/args）。
+
+    langchain 的 ``AIMessage.tool_calls`` 在运行时是 ``ToolCall``（dict 子类）；
+    走序列化 dict 时是 ``{"name":..., "args":...}``。两种形态都兼容。
+    """
+    if isinstance(m, dict):
+        tcs = m.get("tool_calls")
+    else:
+        tcs = getattr(m, "tool_calls", None)
+    if not tcs:
+        return []
+    out: list = []
+    for tc in tcs:
+        if isinstance(tc, dict):
+            out.append(tc)
+        else:
+            args = getattr(tc, "args", None) or {}
+            out.append({"name": getattr(tc, "name", ""),
+                        "args": dict(args) if isinstance(args, dict) else {}})
+    return out
+
+
+def _defines(code: str, entry_point: str) -> bool:
+    """判断 code 里是否定义了名为 entry_point 的函数。"""
+    return bool(re.search(rf"\bdef\s+{re.escape(entry_point)}\s*\(", code or ""))
+
+
+def extract_code_from_state(final_state: Any, root: str | Path,
+                            entry_point: str | None = None) -> str | None:
+    """从 agent 产出抽取解题代码。
+
+    覆盖三类真实来源（根因修复）：
+    1. ``create_file`` 工具调用里的 ``file_contents`` —— 真实 agent 把 HumanEval 解答
+       写进这个参数（如 ``_sandbox/tmp/<entry>.py``），但**不落持久盘**，故必须直接读
+       tool_call 参数。这是之前所有 HumanEval 0 分的真正根因：旧实现既没扫
+       tool_calls，也没 glob ``_sandbox/tmp/*.py``（磁盘文件本身也不持久化）。
+    2. 磁盘上的 ``.py`` 文件（``_sandbox/tmp/*.py``、``documents/*.py``）—— 兜底，
+       按 entry_point 命中优先（注意：文件通常不持久化，故第 1 类才是主路径）。
+    3. assistant 消息里的围栏代码块 —— 直连/简单路径。
+
+    选择优先级（命中 ``entry_point`` 的定义永远最优先，避免取到测试/脚手架文件）：
+    含 entry_point 的 create_file 内容 > 含 entry_point 的磁盘文件 > 含 entry_point
+    的围栏块 > 任意含 ``def`` 的 create_file/文件 > 任意围栏块 > 首个非空候选。
+    """
+    text_cands: list[str] = []     # assistant 消息文本（跑 _extract_block）
+    tool_cands: list[str] = []     # create_file 的 file_contents（整段用）
+    file_cands: list[str] = []     # 磁盘 .py（整段用）
+
     try:
         msgs = (final_state or {}).get("messages") or []
     except Exception:
         msgs = []
+
     for m in msgs:
-        content = getattr(m, "content", None)
-        if content is None and isinstance(m, dict):
-            content = m.get("content")
-        if isinstance(content, str):
-            candidates.append(content)
-    # 退路：agent 可能用 create_file 把代码写进了 documents/
-    try:
-        for py in sorted(Path(root).glob("documents/*.py")):
-            candidates.append(py.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        pass
-    for text in candidates:
-        code = _extract_block(text)
-        if code:
-            return code
+        role = _msg_role(m)
+        if role in ("ai", "assistant"):
+            c = _msg_content(m)
+            if c:
+                text_cands.append(c)
+        # create_file 的 file_contents 是解答的权威来源，与消息 role 无关都要扫
+        for tc in _tool_calls_of(m):
+            if str(tc.get("name", "")).lower() == "create_file":
+                fc = (tc.get("args") or {}).get("file_contents")
+                if isinstance(fc, str) and fc.strip():
+                    tool_cands.append(fc)
+
+    # 磁盘 .py 兜底（仅限定两个真实落点，避免误扫 sandbox 里的 scaffold 代码）
+    for pat in ("documents/*.py", "_sandbox/tmp/*.py"):
+        try:
+            for py in sorted(Path(root).glob(pat)):
+                file_cands.append(py.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            pass
+
+    # ---- 命中 entry_point 的优先 ----
+    if entry_point:
+        for c in reversed(tool_cands + file_cands):
+            if _defines(c, entry_point):
+                return c
+        for c in text_cands:
+            blk = _extract_block(c)
+            if blk and _defines(blk, entry_point):
+                return blk
+
+    # ---- 无 entry_point 或都未命中：退而求其次 ----
+    for c in tool_cands + file_cands:
+        if re.search(r"\bdef\s+\w+\s*\(", c or ""):
+            return c
+    for c in text_cands:
+        blk = _extract_block(c)
+        if blk:
+            return blk
+    # 最后的兜底：首个非空候选
+    for c in tool_cands + file_cands + text_cands:
+        if c and c.strip():
+            return c
     return None
 
 
@@ -253,7 +354,7 @@ def functional_correctness(entry_point: str, test: str, code: str | None
 
 def grade_run(entry_point: str, test: str, final_state: Any, root: str | Path) -> dict:
     """在 ``runner_once`` 里调用：抽取代码 → 跑单测 → 产出结构化结果。"""
-    code = extract_code_from_state(final_state, root)
+    code = extract_code_from_state(final_state, root, entry_point)
     passed, total = functional_correctness(entry_point, test, code)
     q = 100.0 * passed / total if total else 0.0
     a = passed / total if total else 0.0

@@ -211,7 +211,8 @@ def run_auto(tasks: list[dict], *, rounds: int = 3, n: int | None = None,
              resume: bool = True, verify: bool = True,
              fake_profiles: dict[str, str] | None = None,
              keep_sandbox: bool = False, on_progress=None,
-             force_dominant: str | None = None) -> dict:
+             force_dominant: str | None = None,
+             force_target: str | None = None) -> dict:
     """跑（或续跑）无人值守闭环，返回 ``{"report", "state", "verdict"}``。
 
     续跑语义：``state.json`` 里记了 ``rounds_done`` 与任务集指纹。同一 label 且任务集
@@ -264,7 +265,8 @@ def run_auto(tasks: list[dict], *, rounds: int = 3, n: int | None = None,
         on_accept=make_on_accept(tally, cfg, verify=verify,
                                  fake_profiles=fake_profiles,
                                  keep_sandbox=keep_sandbox),
-        ledger_path=ledger_path, force_dominant=force_dominant)
+        ledger_path=ledger_path, force_dominant=force_dominant,
+        force_target=force_target)
     if "error" in report:
         return {"error": report["error"], "state": state}
 
@@ -298,6 +300,24 @@ def run_auto(tasks: list[dict], *, rounds: int = 3, n: int | None = None,
 
 # ---------------------------------------------------------------- 达成判据
 
+def _resolve_holdout_ids(out: Path, state: dict) -> list[str]:
+    """从磁盘上各 batch 的 ``benchmark.json`` 汇总**真实**被保留 / 测过的 holdout 任务集合。
+
+    为什么不直接用 ``state.holdout_ids``：本仓库曾出现 run 级 ``state.holdout_ids`` 为
+    ``None``（顶层状态没回写），导致 ``holdout_quarantined`` 用空 ``banned`` 集合「空真通过」。
+    这里以磁盘产物为准 —— 任一 batch 里出现过的 holdout 任务都算数；若并集仍为空，
+    调用方必须把它判为 FAIL（没有 holdout 可隔离 = 隔离声明无效）。
+    """
+    ids: set[str] = set()
+    for f in sorted(out.glob("bench/**/benchmark.json")):
+        d = read_json(f, default=None) or {}
+        for x in (d.get("holdout_ids") or []):
+            ids.add(str(x))
+    if not ids:  # 兜底：磁盘没有就以 state 为准（可能仍为空）
+        ids = {str(x) for x in (state.get("holdout_ids") or [])}
+    return sorted(ids)
+
+
 def _diagnosis_leakage(out: Path, holdout_ids: list[str]) -> tuple[bool, dict]:
     """逐轮核对 diagnosis.json：holdout 任务是否曾进入诊断池。"""
     banned = {str(x) for x in (holdout_ids or [])}
@@ -325,7 +345,6 @@ def assess(out: Path, state: dict, *, cfg: Settings | None = None) -> dict:
     curve = state.get("curve") or []
     hist = version.history()
     cal = read_json(PATHS.calibration, default=None) or {}
-    holdout_ids = list(state.get("holdout_ids") or [])
     promotes = [h for h in hist if h.get("event") == "promote"]
     demotes = [h for h in hist if h.get("event") == "demote"]
     started = str(state.get("started_at") or "")
@@ -353,13 +372,16 @@ def assess(out: Path, state: dict, *, cfg: Settings | None = None) -> dict:
     add("loop_self_contained", not bad_src,
         {"rounds": len(curve), "offenders": bad_src})
 
-    # 3) 泛化层干净：holdout 从未参与诊断
-    leak_ok, leak_detail = _diagnosis_leakage(out, holdout_ids)
+    # 3) 泛化层干净：holdout 从未参与诊断（且必须真有 holdout 被保留，否则隔离声明空真）
+    resolved_holdout = _resolve_holdout_ids(out, state)
+    holdout_reserved = bool(resolved_holdout)
+    leak_ok, leak_detail = _diagnosis_leakage(out, resolved_holdout)
     excluded = [int((read_json(d, default=None) or {}).get("summary", {})
                     .get("holdout_runs_excluded") or 0)
                 for d in sorted(out.glob("bench/**/round*/diagnosis.json"))]
-    add("holdout_quarantined", leak_ok,
-        dict(leak_detail, holdout_ids=holdout_ids,
+    add("holdout_quarantined", holdout_reserved and leak_ok,
+        dict(leak_detail, holdout_ids=resolved_holdout,
+             holdout_reserved=holdout_reserved,
              excluded_run_counts=[e for e in excluded if e]))
 
     # 4) 闭环自己换过基线（只算**本次运行窗口内**：上一次 auto 的 promote 不能为本次作证）
