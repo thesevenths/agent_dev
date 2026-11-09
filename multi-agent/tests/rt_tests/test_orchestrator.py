@@ -52,7 +52,13 @@ class TestOrchestrator(unittest.TestCase):
         adapter, orch = self._orch()
         report = orch.run_baseline(self._objective(),
                                    config_path="configs/pendulum_smoke.yaml")
-        self.assertTrue(report["success"])
+        # A08: no target was declared => the pipeline succeeded but NO research
+        # objective can be claimed. This is the whole point of the split.
+        self.assertTrue(report["pipeline_success"])
+        self.assertFalse(report["objective_success"])
+        self.assertFalse(report["success"])
+        self.assertEqual(report["objective_status"], "undefined")
+        self.assertFalse(report["success_criteria"]["decidable"])
         self.assertEqual(report["train"]["run_id"], "run1")
         self.assertEqual(report["evaluate"]["run_id"], "run1")
         self.assertEqual(len(adapter.submits), 2)
@@ -81,7 +87,11 @@ class TestOrchestrator(unittest.TestCase):
             config_path="c.yaml",
         )
         self.assertFalse(report["success"])
+        self.assertTrue(report["pipeline_success"],
+                        "missing the target must NOT be reported as a broken run")
+        self.assertEqual(report["objective_status"], "not_achieved")
         self.assertEqual(report["success_criteria"]["passed"], False)
+        self.assertTrue(report["success_criteria"]["decidable"])
         self.assertTrue(report["success_criteria"]["violations"])
         # a rejected candidate still leaves full evidence + lineage
         self.assertIsNotNone(report["model_version"])
@@ -91,6 +101,8 @@ class TestOrchestrator(unittest.TestCase):
         _, orch = self._orch(FakeAdapter(fail_stage="train"))
         report = orch.run_baseline(self._objective(), config_path="c.yaml")
         self.assertFalse(report["success"])
+        self.assertFalse(report["pipeline_success"])
+        self.assertEqual(report["objective_status"], "pipeline_failed")
         self.assertNotIn("evaluate", report)
         self.assertIsNone(report["model_version"])
         self.assertTrue(report["failure_reports"])
@@ -101,6 +113,8 @@ class TestOrchestrator(unittest.TestCase):
         report = orch.run_baseline(self._objective(), config_path="c.yaml")
         self.assertEqual(len(adapter.submits), 2)
         self.assertFalse(report["success"])
+        self.assertFalse(report["pipeline_success"])
+        self.assertEqual(report["objective_status"], "pipeline_failed")
         self.assertIsNone(report["model_version"])
         self.assertTrue(report["failure_reports"])
 
@@ -139,7 +153,17 @@ class TestSuccessCriteria(unittest.TestCase):
         self.assertIn("missing", why3[0])
 
     def test_empty_criteria_always_pass(self):
+        # PURE comparison semantics: an empty set of bounds has no violations.
+        # The orchestrator's evaluate_objective gate is what stops this from
+        # being reported as a research success. See test_objective_gate.py.
         self.assertEqual(check_success_criteria({}, {"a": 1.0}), (True, []))
+
+    def test_invalid_rule_is_never_silently_skipped(self):
+        for bad in (True, "0.05", None, {}, {"max": "loose"}, {"min": False}):
+            with self.subTest(rule=bad):
+                ok, why = check_success_criteria({"mse": bad}, {"mse": 0.01})
+                self.assertFalse(ok)
+                self.assertTrue(why)
 
 
 if __name__ == "__main__":

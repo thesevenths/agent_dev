@@ -57,10 +57,15 @@ class TestRealP0Flow(unittest.TestCase):
                                     wait_timeout=300)
         orch = ResearchOrchestrator(manager, registry=registry,
                                     evidence_store=evidence)
+        # Regression gate, not a scientific claim: the frozen smoke baseline is
+        # ~0.026 / ~0.54, so these bounds (about 2x MSE headroom plus a cosine
+        # floor) DO distinguish a working model from a collapsed one. A bound
+        # of 10.0 would pass a completely broken model and proves nothing.
         objective = ResearchObjective(
             objective_id="p0_acceptance", domain="science",
             description="Train a baseline world model and evaluate rollout horizons",
-            success_criteria={"latent_mse@1": {"max": 10.0}},
+            success_criteria={"latent_mse@1": {"max": 0.05},
+                              "cosine@1": {"min": 0.40}},
         )
         report = orch.run_baseline(
             objective, config_path="configs/pendulum_smoke.yaml",
@@ -87,7 +92,11 @@ class TestRealP0Flow(unittest.TestCase):
             self.assertIn(f"cosine@{k}", metrics)
 
         # 4) lineage + evidence + report are all persisted
+        self.assertTrue(report["pipeline_success"])
+        self.assertTrue(report["objective_success"])
+        self.assertEqual(report["objective_status"], "achieved")
         self.assertTrue(report["success"])
+        self.assertTrue(report["success_criteria"]["decidable"])
         mv = registry.get(report["model_version"]["version_id"])
         self.assertIsNotNone(mv)
         self.assertEqual(mv.checkpoint_sha256, ckpt["sha256"])

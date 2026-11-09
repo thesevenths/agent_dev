@@ -99,6 +99,11 @@ class SciNetAdapter(ModelAdapter):
         ]
         if spec.run_id:
             args += ["--run-id", spec.run_id]
+        # Only the evaluation stage consumes an explicit split. Other stages
+        # own their split policy (train -> train/validation, tta -> adapt), so
+        # forwarding a stray flag could silently change what they train on.
+        if spec.stage == "evaluate":
+            args += ["--split", spec.split]
         epochs = spec.budget.get("epochs")
         if epochs is not None:
             args += ["--epochs", str(int(epochs))]

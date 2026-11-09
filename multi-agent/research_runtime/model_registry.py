@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS model_versions (
     config_path         TEXT,
     config_sha256       TEXT,
     code_version        TEXT,
+    runtime_code_version TEXT,
+    code_dirty          INTEGER,
     dataset_version     TEXT,
     parent_version_id   TEXT,
     metrics             TEXT,
@@ -43,6 +45,20 @@ class ModelRegistry:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._session() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Idempotent additive migration for registries created before A08."""
+        existing = {row["name"] for row in conn.execute(
+            "PRAGMA table_info(model_versions)"
+        )}
+        for column, ddl in (("runtime_code_version", "TEXT"),
+                            ("code_dirty", "INTEGER")):
+            if column not in existing:
+                conn.execute(
+                    f"ALTER TABLE model_versions ADD COLUMN {column} {ddl}"
+                )
 
     @contextmanager
     def _session(self):
@@ -62,7 +78,10 @@ class ModelRegistry:
         return (
             mv.version_id, mv.experiment_id, mv.job_id, mv.engine,
             mv.checkpoint_path, mv.checkpoint_sha256, mv.config_path,
-            mv.config_sha256, mv.code_version, mv.dataset_version,
+            mv.config_sha256, mv.code_version,
+            mv.runtime_code_version,
+            None if mv.code_dirty is None else int(mv.code_dirty),
+            mv.dataset_version,
             mv.parent_version_id, json.dumps(mv.metrics, sort_keys=True),
             int(mv.promoted), mv.promotion_reason, mv.created_at,
         )
@@ -72,6 +91,8 @@ class ModelRegistry:
         data = dict(row)
         data["metrics"] = json.loads(data.get("metrics") or "{}")
         data["promoted"] = bool(data.get("promoted"))
+        if "code_dirty" in data and data["code_dirty"] is not None:
+            data["code_dirty"] = bool(data["code_dirty"])
         return ModelVersion(**data)
 
     def register(self, mv: ModelVersion) -> ModelVersion:
@@ -79,11 +100,11 @@ class ModelRegistry:
             conn.execute(
                 """INSERT OR REPLACE INTO model_versions
                    (version_id, experiment_id, job_id, engine,
-                    checkpoint_path, checkpoint_sha256, config_path,
-                    config_sha256, code_version, dataset_version,
-                    parent_version_id, metrics, promoted, promotion_reason,
-                    created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   checkpoint_path, checkpoint_sha256, config_path,
+                   config_sha256, code_version, runtime_code_version,
+                   code_dirty, dataset_version, parent_version_id, metrics,
+                   promoted, promotion_reason, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 self._to_row(mv),
             )
         return mv

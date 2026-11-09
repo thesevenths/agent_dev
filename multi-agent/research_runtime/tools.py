@@ -165,6 +165,12 @@ def run_research_baseline(description: str = "Train and evaluate a baseline worl
     Returns only a compact summary plus report_path; the full auditable report
     is written to disk. ``success_criteria_json`` accepts e.g.
     ``{"latent_mse@1": 0.05}`` (upper bound) or ``{"cosine@1": {"min": 0.8}}``.
+
+    Two separate scoreboards are returned: ``pipeline_success`` means the jobs
+    ran; ``objective_success`` means a DECLARED, DECIDABLE target was met.
+    Omitting ``success_criteria_json`` yields ``objective_status="undefined"``
+    and ``success=false`` -- a run with no target is never a research success.
+    The legacy ``success`` field is an alias of ``objective_success``.
     """
     try:
         from .orchestrator import ResearchOrchestrator
@@ -184,7 +190,12 @@ def run_research_baseline(description: str = "Train and evaluate a baseline worl
         )
         return _ok(
             summary=ResearchOrchestrator.summarize(report),
-            success=report.get("success"),
+            success=report.get("success"),  # deprecated alias
+            pipeline_success=report.get("pipeline_success"),
+            objective_success=report.get("objective_success"),
+            objective_status=report.get("objective_status"),
+            objective_violations=(report.get("success_criteria") or {}).get(
+                "violations", []),
             experiment_id=report.get("experiment_id"),
             metrics=(report.get("evaluate") or {}).get("metrics", {}),
             model_version=(report.get("model_version") or {}).get("version_id"),

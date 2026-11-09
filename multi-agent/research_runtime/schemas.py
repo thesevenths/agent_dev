@@ -89,8 +89,15 @@ class ExperimentSpec(BaseModel):
     created_at: str = Field(default_factory=_now)
 
     def with_run_id(self, run_id: str, *, stage: str | None = None,
-                    parent_job_id: str | None = None) -> "ExperimentSpec":
-        """Return a copy wired to a parent run (used for train -> evaluate)."""
+                    parent_job_id: str | None = None,
+                    split: str | None = None) -> "ExperimentSpec":
+        """Return a copy wired to a parent run (used for train -> evaluate).
+
+        ``split`` must be set explicitly when switching to an evaluation stage:
+        a train spec's ``split="train"`` would otherwise make the engine
+        evaluate on the training data. The orchestrator defaults to the frozen
+        test split; candidate selection passes ``validation``.
+        """
         update: dict[str, Any] = {
             "run_id": run_id,
             "parent_run_id": run_id,
@@ -98,6 +105,8 @@ class ExperimentSpec(BaseModel):
         }
         if stage:
             update["stage"] = stage
+        if split is not None:
+            update["split"] = split
         return self.model_copy(update=update)
 
     def to_engine_spec(self) -> dict[str, Any]:
@@ -131,6 +140,9 @@ class ExperimentResult(BaseModel):
     run_id: str | None = None
     model_version: str | None = None
     dataset_version: str | None = None
+    # Which split the engine ACTUALLY evaluated on. Never infer it from the
+    # requested spec alone -- the engine's own evidence is authoritative.
+    evaluation_split: str | None = None
     result_path: str | None = None
     log_path: str | None = None
     exit_code: int | None = None
@@ -186,6 +198,7 @@ class ExperimentResult(BaseModel):
             run_id=raw.get("run_id"),
             model_version=raw.get("model_version"),
             dataset_version=raw.get("dataset_version"),
+            evaluation_split=raw.get("evaluation_split"),
             result_path=raw.get("result_path"),
             log_path=raw.get("log_path"),
             exit_code=raw.get("exit_code"),
@@ -232,7 +245,11 @@ class ModelVersion(BaseModel):
     checkpoint_sha256: str | None = None
     config_path: str | None = None
     config_sha256: str | None = None
-    code_version: str | None = None
+    # Reproducibility needs BOTH repos: the model engine AND the Agent runtime
+    # that orchestrated the run. A dirty worktree is not a reproducible commit.
+    code_version: str | None = None            # engine repo HEAD
+    runtime_code_version: str | None = None   # Agent runtime repo HEAD
+    code_dirty: bool | None = None            # None = could not be determined
     dataset_version: str | None = None
     parent_version_id: str | None = None
 

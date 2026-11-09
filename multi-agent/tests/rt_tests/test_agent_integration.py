@@ -40,6 +40,9 @@ class _FakeOrchestrator:
     def run_baseline(self, objective, **kw):
         return {
             "experiment_id": "exp1", "success": True,
+            "pipeline_success": True, "objective_success": True,
+            "objective_status": "achieved",
+            "success_criteria": {"violations": []},
             "evaluate": {"metrics": {"latent_mse@1": 0.02}},
             "model_version": {"version_id": "mv1"},
             "failure_reports": [], "report_path": "/tmp/report.json",
@@ -162,6 +165,9 @@ class TestToolContract(unittest.TestCase):
             }))
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["success"])
+        self.assertTrue(payload["pipeline_success"])
+        self.assertTrue(payload["objective_success"])
+        self.assertEqual(payload["objective_status"], "achieved")
         self.assertIn("report_path", payload)
         # Large reports must NOT be inlined into an Agent message.
         self.assertNotIn("raw", payload)

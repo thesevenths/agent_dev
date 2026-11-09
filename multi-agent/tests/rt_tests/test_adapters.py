@@ -49,13 +49,16 @@ class TestSciNetAdapter(unittest.TestCase):
         self.assertIn('"timeout_s": 900', spec_json)
 
     def test_evaluate_requires_run_id_propagated(self):
-        spec = self._spec(stage="evaluate", run_id="run_42")
+        # An evaluate spec must name its split explicitly; leaving the
+        # train-stage default ("train") would evaluate on training data.
+        spec = self._spec(stage="evaluate", run_id="run_42", split="test")
         with patch.object(self.adapter, "_cli",
                           return_value={"job_id": "j2"}) as cli:
             self.adapter.submit(spec)
         args = cli.call_args.args
         self.assertIn("--run-id", args)
         self.assertEqual(args[args.index("--run-id") + 1], "run_42")
+        self.assertEqual(args[args.index("--split") + 1], "test")
 
     def test_unsupported_stage_is_rejected_locally(self):
         with self.assertRaises(AdapterError):
