@@ -157,6 +157,21 @@ class SciNetAdapter(ModelAdapter):
             args += ["--experiment-id", experiment_id]
         return list(self._cli(*args).get("jobs", []))
 
+    def probe_job(self, job_id: str) -> str | None:
+        """Existence-based lookup, safe for campaign recovery.
+
+        The engine's ``status`` command reports an unknown job as an ERROR
+        payload, indistinguishable from a broken CLI at the transport layer.
+        ``list`` is a successful query whose result is authoritative: a job id
+        either appears or it was never submitted. If ``list`` itself fails,
+        ``AdapterError`` propagates and the campaign pauses instead of
+        launching a duplicate training run.
+        """
+        for job in self.list_jobs():
+            if str(job.get("job_id")) == job_id:
+                return str(job.get("status") or "incomplete")
+        return None
+
     def capabilities(self) -> dict:
         return {
             "name": self.name,

@@ -366,3 +366,113 @@ class CandidateConfigBuilder:
             candidate_config_sha256=metadata["candidate_config_sha256"],
             metadata=metadata,
         )
+
+    # ------------------------------------------------------- build_baseline
+    def build_baseline(self, *, base_config: str | Path, campaign_id: str,
+                       seed: int, dataset_version: str) -> CandidateArtifact:
+        """P1-04: materialise ONE isolated baseline config for ONE paired seed.
+
+        A paired experiment needs a baseline per seed: baseline and candidate
+        must share the seed, the frozen data and every config value EXCEPT the
+        intervention -- but must NOT share an output directory. The only edit
+        here is the root training seed; ``data.dataset_seed`` is untouched, so
+        the dataset version cannot silently change between arms.
+
+        This is additive: ``build()`` above keeps its original behaviour.
+        """
+        _check_id(campaign_id, "campaign_id")
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise CandidateConfigError(f"seed must be a non-negative int, got {seed!r}")
+        if not dataset_version or not isinstance(dataset_version, str):
+            raise CandidateConfigError("dataset_version is required")
+
+        config_path = Path(base_config)
+        if not config_path.is_absolute():
+            config_path = self.project_dir / config_path
+        config_path = config_path.resolve()
+        if not config_path.is_file():
+            raise CandidateConfigError(f"baseline config not found: {config_path}")
+        try:
+            baseline_relpath = config_path.relative_to(self.project_dir)
+        except ValueError as exc:
+            raise CandidateConfigError(
+                "baseline config must live inside the project directory") from exc
+        baseline_bytes = config_path.read_bytes()
+        try:
+            baseline = yaml.safe_load(baseline_bytes.decode("utf-8"))
+        except (yaml.YAMLError, UnicodeDecodeError) as exc:
+            raise CandidateConfigError(f"invalid baseline YAML: {exc}") from exc
+        if not isinstance(baseline, dict):
+            raise CandidateConfigError("baseline config must be a YAML mapping")
+        if self.seed_key not in baseline:
+            raise CandidateConfigError(
+                f"baseline config has no {self.seed_key!r} field; cannot set a "
+                "paired training seed without changing the config contract"
+            )
+        frozen = self._verify_frozen_dataset(baseline, dataset_version)
+
+        data_before = copy.deepcopy(baseline.get("data"))
+        generated = copy.deepcopy(baseline)
+        generated[self.seed_key] = seed
+        if generated.get("data") != data_before:
+            raise CandidateConfigError(
+                "the data section changed while setting the baseline seed"
+            )
+        data_section = generated.get("data") or {}
+        if "dataset_seed" in data_section and (
+            data_section["dataset_seed"] != (data_before or {}).get("dataset_seed")
+        ):
+            raise CandidateConfigError("data.dataset_seed must not change")
+
+        campaign_base = (self.project_dir / self.campaign_root).resolve()
+        directory = (campaign_base / campaign_id
+                     / f"baseline_seed_{seed}").resolve()
+        try:
+            directory.relative_to(campaign_base)
+        except ValueError as exc:
+            raise CandidateConfigError(
+                "baseline directory escapes the campaign root") from exc
+        if directory.exists():
+            raise CandidateConfigError(
+                f"baseline directory already exists, refusing to overwrite: "
+                f"{directory}")
+        directory.mkdir(parents=True, exist_ok=False)
+
+        config_bytes = yaml.safe_dump(
+            generated, sort_keys=False, allow_unicode=True
+        ).encode("utf-8")
+        out_config = directory / "config.yaml"
+        out_config.write_bytes(config_bytes)
+
+        metadata = {
+            "schema_version": 1,
+            "arm_type": "baseline",
+            "campaign_id": campaign_id,
+            "candidate_id": None,
+            "hypothesis_id": None,
+            "seed": seed,
+            "seed_key": self.seed_key,
+            "dataset_version": dataset_version,
+            "config_overrides": {},
+            "allowed_keys": sorted(self.allowed_keys),
+            "forbidden_roots": sorted(self.forbidden_roots),
+            "baseline_config_path": baseline_relpath.as_posix(),
+            "baseline_config_sha256": sha256_bytes(baseline_bytes),
+            "candidate_config_sha256": sha256_bytes(config_bytes),
+            "data_section_unchanged": True,
+            "frozen_dataset": frozen,
+        }
+        out_metadata = directory / "metadata.json"
+        out_metadata.write_text(
+            json.dumps(metadata, indent=2, sort_keys=True, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return CandidateArtifact(
+            directory=directory,
+            config_path=out_config,
+            config_relpath=out_config.relative_to(self.project_dir).as_posix(),
+            metadata_path=out_metadata,
+            baseline_config_sha256=metadata["baseline_config_sha256"],
+            candidate_config_sha256=metadata["candidate_config_sha256"],
+            metadata=metadata,
+        )

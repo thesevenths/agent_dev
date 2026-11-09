@@ -39,6 +39,17 @@ class ModelAdapter(ABC):
             status = self.get_status(job_id)
         return status
 
+    def probe_job(self, job_id: str) -> str | None:
+        """Return the job's status, or ``None`` if the job does not exist.
+
+        P1-04 recovery needs to distinguish "no such job" (safe to submit)
+        from "engine unreachable" (MUST pause, never resubmit). The default
+        delegates to ``get_status``; adapters whose status command conflates
+        the two should override this with an existence-based lookup.
+        Transport exceptions propagate by design.
+        """
+        return self.get_status(job_id)
+
     def capabilities(self) -> dict:
         return {"name": self.name, "stages": list(self.stages)}
 

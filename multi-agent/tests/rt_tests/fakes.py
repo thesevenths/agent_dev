@@ -39,6 +39,10 @@ class FakeAdapter(ModelAdapter):
     def get_status(self, job_id: str) -> str:
         return "succeeded" if job_id in self.specs else "incomplete"
 
+    def probe_job(self, job_id: str) -> str | None:
+        """None = never submitted (safe to submit); never a transport guess."""
+        return "succeeded" if job_id in self.specs else None
+
     def collect_result(self, job_id: str,
                        spec: ExperimentSpec | None = None) -> ExperimentResult:
         spec = spec or self.specs[job_id]
