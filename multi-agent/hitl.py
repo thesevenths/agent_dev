@@ -40,12 +40,20 @@ TOOL_RISK = {
     "delete_sale": "danger",
     "execute_sql": "danger",
     "shell_exec": "danger",
+    # P1-06：真正提交/恢复科研任务会启动长时间训练作业，属于 danger。
+    # 注意：HITL 只是交互式第二道门；服务端还有 plan hash + 人工 approval
+    # + Critic + 白名单 + 预算的强制门禁（见 research_service.py）。
+    "run_research_campaign": "danger",
+    "resume_research_campaign": "danger",
     # warn：有副作用但高频 —— 仅记录，不阻断（避免每步都被打断）
     "add_sale": "warn",
     "update_sale": "warn",
     "python_repl": "warn",
     "create_file": "warn",
     "str_replace": "warn",
+    "start_research_session": "warn",
+    "create_research_plan": "warn",
+    "request_plan_approval": "warn",
     # 其余未列出的工具默认按 safe 处理（只读/查询）
 }
 

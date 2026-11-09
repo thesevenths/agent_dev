@@ -4,15 +4,23 @@ Opt-in: these are only imported when ``AGENT_RESEARCH_TOOLS=1``. With the flag
 off, ``agents.py`` produces the EXACT same tool lists as before (zero
 regression). See ``agents.py:create_agents``.
 
+Two tool families
+-----------------
+* ``RESEARCH_TOOLS`` (P0, 4 tools): single train / evaluate / status / baseline.
+* ``CAMPAIGN_RESEARCH_TOOLS`` (P1-06, 11 tools): the approved research loop.
+  These are thin JSON adapters over ``research_service.ResearchService``; the
+  service re-reads every trust input from durable storage before calling the
+  EXISTING P1-04 CampaignRunner / P1-05 CampaignComparator.
+
 Contract with the LLM
 ---------------------
 * Every tool returns a JSON *string*: ``{"ok": true, ...}`` or
-  ``{"ok": false, "error": ...}``. Exceptions never escape into the agent's
-  quality gate as opaque failures.
+  ``{"ok": false, "error_code": ..., "error": ...}``. Exceptions never escape
+  into the agent's quality gate as opaque failures.
 * Submit tools return only identifiers (job_id / run_id / paths). Large
-  artefacts and full reports are written to disk and referenced by path.
-* ``get_experiment_status`` is read-only; submit tools are serialised by a
-  module-level lock so concurrent tool calls cannot race on the job store.
+  artefacts and full reports are written to disk / SQLite and referenced by id.
+* No tool can grant a human approval, submit an arbitrary config payload, or
+  evaluate on the reserved frozen final split.
 """
 from __future__ import annotations
 
@@ -212,3 +220,211 @@ RESEARCH_TOOLS = [
     get_experiment_status,
     run_research_baseline,
 ]
+
+
+# --------------------------------------------------------------------------- #
+# P1-06: campaign-level research tools (A2)
+# --------------------------------------------------------------------------- #
+# The LLM sees a tiny, identifier-only surface. The service re-reads the plan,
+# the hash-bound human approval, the persisted Critic verdicts, the config
+# whitelist, the frozen dataset and the budget BEFORE calling the EXISTING
+# P1-04 CampaignRunner / P1-05 Comparator. There is deliberately NO tool that
+# can grant an approval, submit an arbitrary config_json, or evaluate on the
+# reserved frozen final split.
+@lru_cache(maxsize=1)
+def _service():
+    from .research_environment import build_default_research_service
+    return build_default_research_service()
+
+
+def _from_service(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+@tool
+def start_research_session(objective_id: str, description: str = "",
+                           success_criteria_json: str = "",
+                           session_id: str = "") -> str:
+    """Register a research objective and open a research session. Safe.
+
+    A session links objective / hypotheses / reviews / plans / approvals /
+    campaigns / comparison reports. By default an objective allows at most TWO
+    campaign rounds, so an inconclusive result cannot loop forever.
+    """
+    try:
+        return _from_service(_service().start_research_session(
+            objective_id=objective_id, description=description,
+            success_criteria_json=success_criteria_json, session_id=session_id))
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@tool
+def propose_research_hypotheses(objective_id: str, source_experiment_id: str,
+                                session_id: str = "",
+                                hypotheses_json: str = "") -> str:
+    """Propose evidence-grounded hypotheses from a RECORDED experiment. Safe.
+
+    Evidence is re-read by the server from the append-only ledger; the Agent
+    cannot inject metrics. ``hypotheses_json`` optionally accepts a structured
+    operator/LLM proposal, but its ids and evidence source are overwritten and
+    it still needs a deterministic Critic review + human approval.
+    """
+    try:
+        return _from_service(_service().propose_research_hypotheses(
+            objective_id=objective_id,
+            source_experiment_id=source_experiment_id,
+            session_id=session_id, hypotheses_json=hypotheses_json))
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@tool
+def review_research_hypotheses(hypothesis_ids_json: str,
+                               session_id: str = "") -> str:
+    """Run the DETERMINISTIC Critic and persist the real verdict. Safe.
+
+    ``hypothesis_ids_json`` is a JSON array of ids, e.g. '["H1"]'. An LLM
+    advisor may add notes but can never turn a rejection into an approval.
+    The verdict is bound to the hypothesis content SHA-256.
+    """
+    try:
+        return _from_service(_service().review_research_hypotheses(
+            hypothesis_ids_json=hypothesis_ids_json, session_id=session_id))
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@tool
+def create_research_plan(objective_id: str, hypothesis_ids_json: str,
+                         session_id: str = "", plan_id: str = "") -> str:
+    """Create a versioned, SHA-256-addressed ExperimentPlan. Safe/warn.
+
+    Only hypotheses with a PERSISTED passing Critic review may become
+    candidates. Dataset, seeds, metric protocol and guardrails come from the
+    injected domain policy, NOT from the Agent.
+    """
+    try:
+        return _from_service(_service().create_research_plan(
+            objective_id=objective_id,
+            hypothesis_ids_json=hypothesis_ids_json,
+            session_id=session_id, plan_id=plan_id))
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@tool
+def request_plan_approval(plan_id: str, requested_by: str = "research_agent",
+                          session_id: str = "") -> str:
+    """Request HUMAN approval for a plan; returns a PENDING approval_id. Warn.
+
+    The returned ``human_action`` is a terminal command a human must run. No
+    Agent tool can grant an approval, and a pending record cannot execute
+    anything.
+    """
+    try:
+        return _from_service(_service().request_plan_approval(
+            plan_id=plan_id, requested_by=requested_by, session_id=session_id))
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@tool
+def run_research_campaign(plan_id: str, approval_id: str,
+                          session_id: str = "") -> str:
+    """Execute an APPROVED plan with the existing CampaignRunner. DANGER/HITL.
+
+    The server re-validates plan hash, human approval source + scope, Critic
+    verdicts, config whitelist, frozen dataset and budget. Duplicate calls
+    return the existing campaign status instead of launching new jobs. This
+    call is synchronous (P1-04 runner is serial). No model is promoted.
+    """
+    try:
+        return _from_service(_service().run_research_campaign(
+            plan_id=plan_id, approval_id=approval_id, session_id=session_id))
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@tool
+def get_campaign_status(campaign_id: str) -> str:
+    """Read-only campaign status for a campaign_id. Safe."""
+    try:
+        return _from_service(_service().get_campaign_status(
+            campaign_id=campaign_id))
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@tool
+def resume_research_campaign(campaign_id: str, approval_id: str = "",
+                             session_id: str = "") -> str:
+    """Resume a PAUSED campaign via the existing runner. DANGER/HITL.
+
+    Rejects running, terminal and unbound campaigns; re-checks the bound
+    human approval before calling CampaignRunner.resume().
+    """
+    try:
+        return _from_service(_service().resume_research_campaign(
+            campaign_id=campaign_id, approval_id=approval_id,
+            session_id=session_id))
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@tool
+def compare_research_campaign(campaign_id: str, session_id: str = "") -> str:
+    """Run the P1-05 paired Comparator on a COMPLETED campaign. Safe.
+
+    Produces immutable ComparisonReports, then the Research Reviewer writes an
+    Experience Store record and a structured ResearchReport. A verdict is NOT
+    a promotion and never uses the frozen final split.
+    """
+    try:
+        return _from_service(_service().compare_research_campaign(
+            campaign_id=campaign_id, session_id=session_id))
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@tool
+def get_comparison_report(campaign_id: str, comparison_id: str = "") -> str:
+    """Read persisted ComparisonReport(s) for a campaign. Safe.
+
+    With no comparison_id, returns report metadata. A missing report is an
+    explicit error -- no result is ever fabricated.
+    """
+    try:
+        return _from_service(_service().get_comparison_report(
+            campaign_id=campaign_id, comparison_id=comparison_id))
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@tool
+def get_research_report(session_id: str) -> str:
+    """Read the immutable final ResearchReport for a session. Safe."""
+    try:
+        return _from_service(_service().get_research_report(
+            session_id=session_id))
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+CAMPAIGN_RESEARCH_TOOLS = [
+    start_research_session,
+    propose_research_hypotheses,
+    review_research_hypotheses,
+    create_research_plan,
+    request_plan_approval,
+    run_research_campaign,
+    get_campaign_status,
+    resume_research_campaign,
+    compare_research_campaign,
+    get_comparison_report,
+    get_research_report,
+]
+
+# What agents.py registers when AGENT_RESEARCH_TOOLS=1. With the flag OFF the
+# six role tool lists stay byte-for-byte identical to pre-P1-06 behaviour.
+ALL_RESEARCH_TOOLS = RESEARCH_TOOLS + CAMPAIGN_RESEARCH_TOOLS

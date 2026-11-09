@@ -412,8 +412,10 @@ def create_agents() -> dict:
     # 延迟导入同时保证主 import 链不会因 SciNet++/pydantic 依赖而变重。
     research_tools = []
     if os.environ.get("AGENT_RESEARCH_TOOLS", "0").strip().lower() in ("1", "true", "yes", "on"):
-        from research_runtime.tools import RESEARCH_TOOLS
-        research_tools = list(RESEARCH_TOOLS)
+        # P1-06: ALL_RESEARCH_TOOLS = 4 P0 tools + 11 approved-research-loop
+        # tools. Flag OFF keeps every role's list byte-for-byte unchanged.
+        from research_runtime.tools import ALL_RESEARCH_TOOLS
+        research_tools = list(ALL_RESEARCH_TOOLS)
 
     # 1. Chat Agent
     chat_agent = create_resilient_agent(

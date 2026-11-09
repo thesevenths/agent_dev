@@ -118,6 +118,17 @@ class ResearchSessionStore:
             return None
         return ResearchSession.model_validate(_load(rows[0]["record_json"], {}))
 
+    def unique_session(self) -> ResearchSession | None:
+        """Resolve an omitted session_id ONLY when unambiguous.
+
+        Returning "the latest" session would silently attach evidence to the
+        wrong objective once more than one exists; failing closed is safer.
+        """
+        rows = self.db.rows("SELECT record_json FROM research_sessions")
+        if len(rows) != 1:
+            return None
+        return ResearchSession.model_validate(_load(rows[0]["record_json"], {}))
+
     def save(self, session: ResearchSession, *, event_type: str | None = None,
              payload: dict[str, Any] | None = None) -> ResearchSession:
         session.updated_at = _now()
@@ -187,6 +198,12 @@ class ResearchSessionStore:
             """SELECT * FROM campaign_bindings
                WHERE plan_id=? AND approval_id=? AND plan_sha256=?""",
             (plan_id, approval_id, plan_sha256))
+        return self._binding_row(rows[0]) if rows else None
+
+    def binding_for_campaign(self, campaign_id: str) -> CampaignBinding | None:
+        rows = self.db.rows(
+            "SELECT * FROM campaign_bindings WHERE campaign_id=?",
+            (campaign_id,))
         return self._binding_row(rows[0]) if rows else None
 
     def campaigns_for_objective(self, objective_id: str) -> list[CampaignBinding]:

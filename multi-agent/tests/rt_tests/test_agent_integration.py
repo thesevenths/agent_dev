@@ -100,16 +100,22 @@ class TestZeroRegression(unittest.TestCase):
         self.assertEqual(len(off["ContextEngineer"]), 5)
 
     def test_flag_on_adds_tools_only_to_code_agent(self):
+        from research_runtime.tools import ALL_RESEARCH_TOOLS
         off = self._capture(False)
         on = self._capture(True)
-        research = {"train_world_model", "evaluate_world_model",
-                    "get_experiment_status", "run_research_baseline"}
+        research = {
+            getattr(item, "name", getattr(item, "__name__", str(item)))
+            for item in ALL_RESEARCH_TOOLS
+        }
+        # P0 (4 tools) + P1-06 campaign loop (11 tools) = 15, still ONLY
+        # on CodeAgent. Flag OFF is asserted byte-for-byte above.
         for role in off:
             with self.subTest(role=role):
                 delta = set(on[role]) - set(off[role])
                 if role == "CodeAgent":
                     self.assertEqual(delta, research)
-                    self.assertEqual(len(on[role]), len(off[role]) + 4)
+                    self.assertEqual(len(on[role]),
+                                     len(off[role]) + len(ALL_RESEARCH_TOOLS))
                 else:
                     self.assertEqual(delta, set())
                     self.assertEqual(on[role], off[role])
