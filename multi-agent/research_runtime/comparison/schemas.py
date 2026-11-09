@@ -86,9 +86,17 @@ class GuardrailAssessment(BaseModel):
 
     @property
     def violations(self) -> list[str]:
+        """Every non-passing rule (including insufficient / invalid ones)."""
         return [f"{r.metric}: {r.status}"
                 + (f" ({r.detail})" if r.detail else "")
                 for r in self.results if r.status != "passed"]
+
+    @property
+    def hard_violations(self) -> list[str]:
+        """Only observed regressions: these belong in ``guardrail_violations``."""
+        return [f"{r.metric}: {r.status}"
+                + (f" ({r.detail})" if r.detail else "")
+                for r in self.results if r.status == "violated"]
 
 
 class PairedComparisonReport(ComparisonReport):

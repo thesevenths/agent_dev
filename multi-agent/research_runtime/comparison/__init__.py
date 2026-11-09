@@ -20,6 +20,19 @@ from .exceptions import (
     ComparisonIntegrityError,
     ComparisonStoreError,
 )
+from .guardrails import GuardrailEvaluator
+from .comparator import CampaignComparator
+from .statistics import (
+    INTERVAL_METHOD,
+    HolmEntry,
+    HolmResult,
+    PairedStatistics,
+    PairedStatisticsEngine,
+    holm_adjust,
+    normalize_deltas,
+    student_t_critical,
+    student_t_two_sided_p,
+)
 from .report_store import (
     ComparisonReportStore,
     ReportArtifact,
@@ -38,9 +51,13 @@ from .schemas import (
 )
 
 __all__ = [
-    "COMPARISON_ALGORITHM_VERSION",
+    "COMPARISON_ALGORITHM_VERSION", "INTERVAL_METHOD",
     "ComparisonPolicy", "PairedObservation", "MissingPair",
     "GuardrailResult", "GuardrailAssessment", "PairedComparisonReport",
+    "CampaignComparator", "GuardrailEvaluator",
+    "PairedStatisticsEngine", "PairedStatistics", "HolmResult", "HolmEntry",
+    "normalize_deltas", "holm_adjust", "student_t_critical",
+    "student_t_two_sided_p",
     "ComparisonReportStore", "ReportArtifact",
     "content_sha256", "canonical_report_payload", "sha256_bytes",
     "ComparisonError", "ComparisonIntegrityError",

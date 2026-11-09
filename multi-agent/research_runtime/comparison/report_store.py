@@ -30,7 +30,7 @@ from typing import Any
 
 from ..schemas import ComparisonReport
 from .exceptions import ComparisonStoreError
-from .schemas import COMPARISON_ALGORITHM_VERSION
+from .schemas import COMPARISON_ALGORITHM_VERSION, PairedComparisonReport
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
@@ -116,14 +116,17 @@ class ComparisonReportStore:
             # is the same comparison before returning it.
             existing_bytes = path.read_bytes()
             try:
-                existing = ComparisonReport.model_validate_json(existing_bytes)
+                # Read only the id as raw JSON: validating with the P1-01 base
+                # class would reject a legitimate ZERO-PAIR report (its arrays
+                # are empty by design). PairedComparisonReport handles both.
+                existing = json.loads(existing_bytes)
             except (ValueError, TypeError) as exc:
                 raise ComparisonStoreError(
                     f"existing report file is corrupt: {path}") from exc
-            if existing.comparison_id != final.comparison_id:
+            if existing.get("comparison_id") != final.comparison_id:
                 raise ComparisonStoreError(
                     f"comparison_id collision at {path}: "
-                    f"{existing.comparison_id} != {final.comparison_id}")
+                    f"{existing.get('comparison_id')} != {final.comparison_id}")
             payload = existing_bytes
         except OSError as exc:
             raise ComparisonStoreError(f"cannot write report {path}: {exc}") from exc
@@ -205,5 +208,11 @@ class ComparisonReportStore:
             if sha256_bytes(data) != item.get("file_sha256"):
                 raise ComparisonStoreError(
                     f"indexed report {path} failed its SHA-256 check")
-            return ComparisonReport.model_validate_json(data)
+            try:
+                payload = json.loads(data)
+                return PairedComparisonReport.model_validate(payload)
+            except (ValueError, TypeError) as exc:
+                raise ComparisonStoreError(
+                    f"indexed report {path} is not a valid comparison report: {exc}"
+                ) from exc
         return None
