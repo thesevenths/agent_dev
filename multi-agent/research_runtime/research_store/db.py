@@ -53,10 +53,23 @@ class ResearchDatabase:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        with self.session() as conn:
+        # journal_mode is a connection-level pragma: it CANNOT be changed from
+        # inside a transaction, and re-opening an existing WAL database used to
+        # raise here. Set it once on a standalone connection instead.
+        conn = self._connect()
+        try:
             conn.execute("PRAGMA journal_mode=WAL")
-            if schema_sql:
-                conn.executescript(schema_sql)
+            conn.commit()
+        finally:
+            conn.close()
+        if schema_sql:
+            with self.session() as conn:
+                # executescript() implicitly COMMITs, which would break the
+                # atomic "check + write" guarantee. Execute statements
+                # individually so the whole schema stays in ONE transaction.
+                for statement in schema_sql.split(";"):
+                    if statement.strip():
+                        conn.execute(statement)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)

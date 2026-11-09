@@ -32,11 +32,11 @@ from __future__ import annotations
 import json
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .campaign.schemas import CAMPAIGN_TERMINAL_STATUSES, CampaignRunSpec, CampaignRecord
+from .campaign.schemas import CAMPAIGN_TERMINAL_STATUSES, CampaignRunSpec
 from .evidence_store import EvidenceStore
 from .failure_diagnoser import FailureDiagnoser
 from .hypothesis_critic import HypothesisCritic
@@ -268,20 +268,28 @@ class ResearchService:
             skip_reasons += [str(item) for item in (manager.rejections or [])]
 
         saved = [self.stores.hypotheses.save(h) for h in proposals]
+        failure_refs = []
+        for report in reports:
+            fid = (report.get("failure_id") if isinstance(report, dict)
+                   else getattr(report, "failure_id", None))
+            if fid:
+                failure_refs.append(f"failure:{fid}")
         session.link("hypothesis_ids", [s.hypothesis_id for s in saved])
         session.link("evidence_refs", [
             f"experiment:{source_experiment_id}:result:{result.job_id}",
-            *[f"failure:{getattr(r, 'failure_id', '')}" for r in reports],
+            *failure_refs,
         ])
+        diagnoses = [(r.get("category") if isinstance(r, dict)
+                      else getattr(r, "category", "")) or "" for r in reports]
         self.stores.sessions.save(
             session, event_type="hypotheses_proposed",
             payload={"count": len(saved), "source_experiment_id": source_experiment_id,
-                     "diagnoses": [getattr(r, "category", "") for r in reports]})
+                     "diagnoses": diagnoses})
         return {
             "ok": True, "session_id": session.session_id,
             "objective_id": objective_id,
             "source_experiment_id": source_experiment_id,
-            "evidence_diagnoses": [getattr(r, "category", "") for r in reports],
+            "evidence_diagnoses": diagnoses,
             "hypotheses": [{"hypothesis_id": s.hypothesis_id,
                             "content_sha256": s.content_sha256,
                             "status": "proposed"} for s in saved],
@@ -809,9 +817,12 @@ class ResearchService:
             campaigns.append({"campaign_id": cid,
                               "status": record.status if record else "unknown"})
         decisions = [item["decision"] for item in summaries]
+        # Conservative: ONE inconclusive candidate prevents a positive overall
+        # verdict. With multiple candidates, a single acceptance is not a
+        # licence to declare the objective achieved.
         if not decisions:
             outcome = "not_evaluated"
-        elif "accepted_for_confirmation" in decisions:
+        elif all(item == "accepted_for_confirmation" for item in decisions):
             outcome = "accepted_for_confirmation"
         elif all(item == "rejected" for item in decisions):
             outcome = "rejected"

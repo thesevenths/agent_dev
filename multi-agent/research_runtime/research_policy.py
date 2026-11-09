@@ -1,9 +1,9 @@
 """A2/A3: INJECTED domain + approval policy (no engine names in this module).
 
-The generic service must not know what a learning rate, a pendulum or a Pusher
-is. A domain supplies config whitelists, value rules, the intervention policy
-used by the proposer, dataset identity, metric protocol and the budget. A
-robotics or finance domain replaces ONE factory, not the runtime.
+The generic service must not know what a specific simulator, model field or
+robot is. A domain supplies config whitelists, value rules, the intervention
+policy used by the proposer, dataset identity, metric protocol and the budget.
+Any other scientific domain replaces ONE factory, not the runtime.
 
 Boundary note: this file is policy DATA and pure predicates. It never executes a
 campaign, never stores state and never calls an LLM.
