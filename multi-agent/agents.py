@@ -406,6 +406,15 @@ def create_resilient_agent(llm, tools, system_prompt, agent_name="Agent", middle
 
 def create_agents() -> dict:
     """构造 6 个语义角色 agent，返回 {节点名: agent}。"""
+    # === 研究工具注入（默认关闭，零回归）===
+    # AGENT_RESEARCH_TOOLS=1 时才延迟导入 research_runtime.tools；开关关闭时
+    # research_tools 为空列表，下面每个角色拿到的工具列表与改造前逐字一致。
+    # 延迟导入同时保证主 import 链不会因 SciNet++/pydantic 依赖而变重。
+    research_tools = []
+    if os.environ.get("AGENT_RESEARCH_TOOLS", "0").strip().lower() in ("1", "true", "yes", "on"):
+        from research_runtime.tools import RESEARCH_TOOLS
+        research_tools = list(RESEARCH_TOOLS)
+
     # 1. Chat Agent
     chat_agent = create_resilient_agent(
         chat_llm,
@@ -430,7 +439,7 @@ def create_agents() -> dict:
     # code_agent 的输入应当是上游落盘的产物文件，不是它自己去抓的新数据。
     code_agent = create_resilient_agent(
         coder_llm,
-        tools=[python_repl, create_file, read_file, grep_files, str_replace, shell_exec, get_current_time],
+        tools=[python_repl, create_file, read_file, grep_files, str_replace, shell_exec, get_current_time] + research_tools,
         system_prompt=coder_system_prompt,
         agent_name="CodeAgent",
         middleware=summarization_mw(coder_llm),

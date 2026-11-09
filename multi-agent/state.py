@@ -82,3 +82,9 @@ class AgentState(TypedDict):
     #     清空旧计划重新规划/轻量微调。与 messages 是否被平台注入完全无关，稳定。
     _submission_id: Optional[str]
     _plan_submission_id: Optional[str]
+    # === 研究运行时上下文（research_runtime P0，可选）===
+    # 刻意用「单个嵌套 dict」而不是往全局状态里堆几十个领域专用字段：
+    # 未启用研究工具时恒为 None，且 finance / AI4S / robotics 复用同一通道。
+    # 内容由 research_runtime 的编排器写入（objective_id / experiment_id /
+    # job_id / model_version / evaluation_protocol_id 等结构化字段）。
+    research_context: Optional[dict]
