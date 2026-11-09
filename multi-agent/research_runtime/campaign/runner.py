@@ -228,6 +228,13 @@ class CampaignRunner:
         except CandidateConfigError as exc:
             raise CampaignPreflightError(
                 f"config generation failed for {item.trial_id}: {exc}") from exc
+        # A resume that had to REBUILD a missing config must still reproduce
+        # the exact persisted hash. Otherwise the campaign would silently
+        # continue as a different experiment after losing its config file.
+        if expected_hash and artifact.candidate_config_sha256 != expected_hash:
+            raise CampaignIntegrityError(
+                f"{item.trial_id}: rebuilt config hash "
+                f"{artifact.candidate_config_sha256} != persisted {expected_hash}")
         return (artifact.config_relpath, artifact.candidate_config_sha256,
                 artifact.baseline_config_sha256, str(artifact.config_path))
 
@@ -312,6 +319,11 @@ class CampaignRunner:
         run_spec = CampaignRunSpec.model_validate(record.run_spec)
         schedule = build_schedule(plan.paired_seeds, plan.candidates)
         try:
+            # Re-verify data IDENTITY on disk after a restart. A campaign
+            # resumed onto different frozen split files would silently compare
+            # two experiments that were never paired.
+            self.config_builder.verify_dataset(
+                run_spec.baseline_config_path, run_spec.dataset_version)
             for item in schedule:
                 existing = record.trial(item.trial_id)
                 expected = existing.config_sha256 if existing else None
@@ -322,7 +334,8 @@ class CampaignRunner:
                                           event_type="config_recovered",
                                           payload={"config_sha256":
                                                    trial.config_sha256})
-        except (CampaignPreflightError, CampaignIntegrityError) as exc:
+        except (CampaignPreflightError, CampaignIntegrityError,
+                CandidateConfigError) as exc:
             record.status = "failed"
             self.store.save_campaign(record, event_type="resume_config_integrity_error",
                                      payload={"error": str(exc)})

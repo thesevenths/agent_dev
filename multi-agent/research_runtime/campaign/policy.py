@@ -1,9 +1,9 @@
 """P1-04: injected execution policy -- the ONLY place domain rules may live.
 
-The generic campaign runtime must not know that a world model has a
-``predictor_hidden`` field or that 4 GB of VRAM implies serial execution.
-Those decisions are injected here by the domain wiring (for this repository:
-``campaign/scinet.py``). Policy is a deployment constraint, not a protocol.
+The generic campaign runtime must not know about any domain's config field
+names, metric names or hardware limits. Those decisions are injected here by
+the domain wiring (for this repository: ``campaign/scinet.py``). Policy is a
+deployment constraint, not a protocol.
 """
 from __future__ import annotations
 
