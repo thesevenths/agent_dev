@@ -88,7 +88,11 @@ class TestFailureDiagnoser(unittest.TestCase):
                             for x in reports))
         target = next(x for x in reports
                       if x.category == "dynamics_error_accumulation")
-        self.assertIn("frozen test", target.recommended_action.lower())
+        # P1: candidate selection belongs on validation, frozen test is only
+        # for the final independent confirmation (no selection leakage).
+        self.assertIn("validation split", target.recommended_action.lower())
+        self.assertIn("frozen test for final confirmation",
+                      target.recommended_action.lower())
 
     def test_diagnose_runtime_factory(self):
         report = FailureDiagnoser.diagnose_runtime(

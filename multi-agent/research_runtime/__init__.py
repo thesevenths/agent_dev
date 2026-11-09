@@ -27,19 +27,31 @@ Quick start::
 """
 
 from .schemas import (
+    CandidateExperiment,
+    ComparisonReport,
+    ExperimentPlan,
     ExperimentResult,
     ExperimentSpec,
     FailureReport,
+    Hypothesis,
+    MetricPrediction,
     ModelVersion,
     ResearchObjective,
 )
 
 __all__ = [
+    # P0 execution contract
     "ResearchObjective",
     "ExperimentSpec",
     "ExperimentResult",
     "FailureReport",
     "ModelVersion",
+    # P1 research decision contract
+    "MetricPrediction",
+    "Hypothesis",
+    "CandidateExperiment",
+    "ExperimentPlan",
+    "ComparisonReport",
 ]
 
 __version__ = "1.0.0"

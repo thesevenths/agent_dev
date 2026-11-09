@@ -133,9 +133,9 @@ def default_rules() -> list[DiagnosticRule]:
             layer="model", severity="medium",
             hypothesis="multi-step prediction error accumulates with horizon; "
                        "the latent dynamics model may be under-trained",
-            recommended_action="run a controlled candidate with multi-step loss "
-                               "weighting or longer rollout training, then compare "
-                               "on the SAME frozen test set",
+            recommended_action="run controlled candidates and compare on the "
+                               "same validation split; reserve frozen test for "
+                               "final confirmation",
             match=_degrades_over_horizon,
         ),
     ]
