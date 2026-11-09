@@ -539,6 +539,15 @@ class CampaignComparator:
             payload.update({"report_path": artifact.path,
                             "file_sha256": artifact.file_sha256,
                             "created_new": artifact.created_new})
+            if not artifact.created_new:
+                # Immutable report already on disk: return THAT report, so a
+                # repeated compare() never hands out a different created_at or
+                # digest than the bytes that were actually persisted.
+                existing = self.report_store.load(record.campaign_id,
+                                                   report.comparison_id)
+                if existing is not None:
+                    report = PairedComparisonReport.model_validate(
+                        existing.model_dump())
         self._event(record, "comparison_completed", payload)
         return report
 
