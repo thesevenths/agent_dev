@@ -1,0 +1,90 @@
+"""P1-06 trusted research state (A1).
+
+    HypothesisStore        hypothesis versions + REAL Critic verdicts
+    ExperimentPlanStore    versioned, SHA-256-addressed ExperimentPlans
+    ApprovalStore          human / system-policy decisions bound to plan hashes
+    ResearchSessionStore   objective context, campaign idempotency, reports,
+                           append-only structured experience
+
+All four share ONE SQLite database and ONE transaction helper, so a check plus
+its write is atomic across stores. Nothing here imports an engine, an LLM, a
+tool or a campaign runner; this layer stores and verifies, it never executes.
+
+The tool surface may call ``request()`` (creates ``pending`` only). ``grant()``
+is reserved for the out-of-band console in ``approval_cli.py``.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from ..settings import DATA_DIR
+from .approval_store import ApprovalStore, SCHEMA_SQL as APPROVAL_SCHEMA
+from .db import (
+    ResearchDatabase,
+    ResearchStoreConflict,
+    ResearchStoreError,
+    canonical_bytes,
+    content_sha256,
+)
+from .experiment_plan_store import (
+    ExperimentPlanStore,
+    SCHEMA_SQL as PLAN_SCHEMA,
+    canonical_plan,
+    plan_sha256,
+)
+from .hypothesis_store import (
+    HypothesisStore,
+    SCHEMA_SQL as HYPOTHESIS_SCHEMA,
+    canonical_hypothesis,
+    hypothesis_sha256,
+)
+from .research_session_store import ResearchSessionStore, SCHEMA_SQL as SESSION_SCHEMA
+from .schemas import (
+    APPROVAL_SCOPES,
+    ApprovalRecord,
+    ApprovalSource,
+    CampaignBinding,
+    CriticReviewRecord,
+    ResearchOutcome,
+    ResearchReport,
+    ResearchSession,
+    StoredExperimentPlan,
+    StoredHypothesis,
+    safe_id,
+)
+
+ALL_SCHEMA_SQL = "\n".join((
+    HYPOTHESIS_SCHEMA, PLAN_SCHEMA, APPROVAL_SCHEMA, SESSION_SCHEMA,
+))
+
+
+def default_db_path() -> Path:
+    """Runtime state (git-ignored), never a reproducibility artefact."""
+    return DATA_DIR / "research.sqlite"
+
+
+class ResearchStores:
+    """Single construction point; inject a temp path for tests."""
+
+    def __init__(self, db_path: str | Path | None = None):
+        self.db = ResearchDatabase(db_path or default_db_path(),
+                                   schema_sql=ALL_SCHEMA_SQL)
+        self.hypotheses = HypothesisStore(self.db)
+        self.plans = ExperimentPlanStore(self.db)
+        self.approvals = ApprovalStore(self.db)
+        self.sessions = ResearchSessionStore(self.db)
+
+
+__all__ = [
+    "ResearchStores", "ResearchDatabase", "default_db_path",
+    "HypothesisStore", "ExperimentPlanStore", "ApprovalStore",
+    "ResearchSessionStore",
+    "canonical_hypothesis", "hypothesis_sha256",
+    "canonical_plan", "plan_sha256",
+    "canonical_bytes", "content_sha256", "safe_id",
+    "StoredHypothesis", "CriticReviewRecord", "StoredExperimentPlan",
+    "ApprovalRecord", "ApprovalSource", "CampaignBinding",
+    "ResearchSession", "ResearchReport", "ResearchOutcome",
+    "APPROVAL_SCOPES",
+    "ResearchStoreError", "ResearchStoreConflict",
+]
