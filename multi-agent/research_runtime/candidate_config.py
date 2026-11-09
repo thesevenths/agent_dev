@@ -258,6 +258,28 @@ class CandidateConfigBuilder:
             "dataset_seed": data.get("dataset_seed"),
         }
 
+    # ------------------------------------------------------------ preflight
+    def verify_dataset(self, base_config: str | Path,
+                       dataset_version: str) -> dict[str, Any]:
+        """Public preflight hook: verify the frozen dataset ON DISK.
+
+        P1-04 calls this before submitting the first job. A shared
+        ``dataset_version`` label in JSON is not evidence that every split
+        file is the one the manifest describes.
+        """
+        path = Path(base_config)
+        if not path.is_absolute():
+            path = self.project_dir / path
+        if not path.is_file():
+            raise CandidateConfigError(f"baseline config not found: {path}")
+        try:
+            config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (yaml.YAMLError, UnicodeDecodeError, OSError) as exc:
+            raise CandidateConfigError(f"invalid baseline YAML: {exc}") from exc
+        if not isinstance(config, dict):
+            raise CandidateConfigError("baseline config must be a YAML mapping")
+        return self._verify_frozen_dataset(config, dataset_version)
+
     # -------------------------------------------------------------- build
     def build(self, *, base_config: str | Path, campaign_id: str,
               candidate_id: str, hypothesis_id: str, seed: int,

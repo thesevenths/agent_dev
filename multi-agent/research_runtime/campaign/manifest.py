@@ -57,7 +57,7 @@ def build_campaign_result(record: CampaignRecord, *,
     for trial in record.trials:
         arms.setdefault(trial.arm_id, {})[f"seed_{trial.seed}"] = _trial_fact(trial)
     spec_dict = (run_spec.model_dump() if isinstance(run_spec, CampaignRunSpec)
-                 else dict(run_spec or {}))
+                 else dict(run_spec or record.run_spec or {}))
     return {
         "schema_version": MANIFEST_VERSION,
         "campaign_id": record.campaign_id,

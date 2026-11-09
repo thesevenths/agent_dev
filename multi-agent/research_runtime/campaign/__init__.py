@@ -29,11 +29,16 @@ from .schemas import (
     TrialRecord,
 )
 from .campaign_store import CampaignStore
+from .runner import CampaignRunner
+from .scheduler import ScheduleItem, build_schedule, make_job_id, trial_id_for
+from .trial_runner import TrialRunner
 
 __all__ = [
     "CampaignRecord", "CampaignRunSpec", "TrialRecord",
     "CAMPAIGN_TERMINAL_STATUSES", "TRIAL_TERMINAL_STATUSES",
     "CampaignStore", "CampaignPolicy",
+    "CampaignRunner", "TrialRunner",
+    "build_schedule", "make_job_id", "trial_id_for", "ScheduleItem",
     "build_campaign_result", "write_manifest",
     "CampaignError", "CampaignPreflightError", "CampaignIntegrityError",
     "CampaignStoreError", "RecoverableCampaignError",
