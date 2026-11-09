@@ -349,7 +349,7 @@ def build_experiment_plan(*, plan_id: str, objective_id: str,
                           primary_metric: str,
                           metric_direction: str = "minimize",
                           paired_seeds: Sequence[int] = (42, 43, 44),
-                          guardrails: dict[str, dict[str, float]] | None = None,
+                          guardrails: dict[str, dict[str, Any]] | None = None,
                           max_parallel: int = 1) -> ExperimentPlan:
     """Pure planner: approved hypotheses -> one paired ExperimentPlan.
 

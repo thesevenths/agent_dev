@@ -387,7 +387,12 @@ class ExperimentPlan(BaseModel):
     primary_metric: str = Field(..., min_length=1)
     metric_direction: Literal["minimize", "maximize"] = "minimize"
     paired_seeds: list[int] = Field(..., min_length=1)
-    guardrails: dict[str, dict[str, float]] = Field(default_factory=dict)
+    # Guardrail rules are domain policy, not protocol constants. Values were
+    # widened from ``dict[str, float]`` to ``dict[str, Any]`` in P1-05 because
+    # a RELATIVE regression rule must declare its own metric direction (a
+    # string); guessing direction from a metric name is explicitly forbidden.
+    # Older ``{"metric": {"min": 0.8}}`` rules remain valid unchanged.
+    guardrails: dict[str, dict[str, Any]] = Field(default_factory=dict)
     # Concurrency is a DEPLOYMENT policy for the campaign runner, not a data
     # protocol constant (a 4 GB GPU here, a cluster elsewhere). The protocol
     # only guarantees >=1 and defaults to serial execution.
@@ -410,10 +415,18 @@ class ExperimentPlan(BaseModel):
 
 
 class ComparisonReport(BaseModel):
-    """P1-05 will fill this in. Defined now so the decision contract is fixed.
+    """The paired-comparison decision contract (P1-01 protocol, P1-05 payload).
 
     ``accepted_for_confirmation`` is NOT promotion: it only means the candidate
-    earned a final independent evaluation on the reserved split.
+    earned a final independent evaluation on the reserved split. Promotion
+    belongs to P1-06 and never happens in this module.
+
+    P1-05 extends this class BACKWARD-COMPATIBLY: every new field has a
+    default, so all P1-01 callers keep constructing valid reports. The
+    original validator (equal, NON-EMPTY arrays) is deliberately untouched --
+    ``comparison.schemas.PairedComparisonReport`` is the subclass that relaxes
+    it for the "zero valid pairs" case, where the decision must be
+    ``inconclusive``.
     """
     comparison_id: str = Field(..., min_length=1)
     plan_id: str = Field(..., min_length=1)
@@ -428,6 +441,36 @@ class ComparisonReport(BaseModel):
     guardrail_violations: list[str] = Field(default_factory=list)
     decision: Literal["accepted_for_confirmation", "rejected", "inconclusive"]
     notes: list[str] = Field(default_factory=list)
+
+    # ---- P1-05 additions (all optional => no breakage) -------------------
+    campaign_id: str = ""
+    metric_direction: Literal["minimize", "maximize"] = "minimize"
+    delta_convention: Literal["positive_is_better"] = "positive_is_better"
+    n_planned: int = 0
+    n_pairs: int = 0
+    std_delta: float | None = None
+    interval_method: str | None = None
+    confidence_level: float = 0.95
+    # The interval actually used for the decision. It equals ci95 for one
+    # candidate; with Holm correction it is WIDER, so the ci95 field is never
+    # mislabelled with a non-95% interval.
+    decision_confidence_interval: tuple[float, float] | None = None
+    practical_effect_threshold: float = 0.0
+    practical_effect_mode: Literal["absolute", "relative"] = "absolute"
+    decision_rule: str | None = None
+    multiple_comparison: dict[str, Any] = Field(default_factory=dict)
+    guardrail_results: list[dict[str, Any]] = Field(default_factory=list)
+    missing_pairs: list[dict[str, Any]] = Field(default_factory=list)
+    paired_observations: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    comparison_algorithm_version: str = ""
+    baseline_config_sha256: str | None = None
+    candidate_config_sha256: str | None = None
+    dataset_version: str | None = None
+    evaluation_split: str | None = None
+    dataset_split_hashes: dict[str, str] | None = None
+    report_sha256: str | None = None
+    created_at: str = Field(default_factory=_now)
 
     @model_validator(mode="after")
     def validate_pairs(self) -> "ComparisonReport":
