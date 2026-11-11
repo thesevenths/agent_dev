@@ -233,8 +233,15 @@ RESEARCH_TOOLS = [
 # reserved frozen final split.
 @lru_cache(maxsize=1)
 def _service():
+    from .domain_registry import default_registry
     from .research_environment import build_default_research_service
-    return build_default_research_service()
+    # ARR 0.1 / R2: a domain is selected by name, never by editing the generic
+    # service. ARR_DOMAIN is an opt-in escape hatch; unknown values fall back to
+    # the default SciNet bundle so the agent tool surface is unchanged.
+    domain_name = os.environ.get("ARR_DOMAIN", "scinet")
+    if not default_registry.contains(domain_name):
+        domain_name = "scinet"
+    return build_default_research_service(domain_name=domain_name)
 
 
 def _from_service(payload: Any) -> str:
