@@ -53,10 +53,22 @@ def build_scinet_domain_bundle() -> DomainBundle:
         max_jobs=domain.max_jobs,
     )
 
+    # ARR 0.1 / R2: the bundle's engine handle. A single local reference is
+    # used both for the advertised ``adapter_factory`` field AND for the runner,
+    # so the engine that actually executes experiments is the one the registry
+    # advertises -- never an accidental second implementation.
+    adapter_factory = SciNetAdapter
+
     def runner_factory():
+        # The bundle's adapter must actually participate in experiment
+        # execution, not merely sit on the bundle as metadata. We pass it
+        # explicitly so the runner (and the ExperimentManager it builds) uses
+        # the SAME adapter the registry advertises -- a swapped domain would
+        # swap the engine here.
+        bundle_adapter = adapter_factory()
         return build_scinet_campaign_runner(
             store=campaign_store, config_builder=config_builder,
-            policy=campaign_policy,
+            policy=campaign_policy, adapter=bundle_adapter,
         )
 
     def comparator_factory():
@@ -71,13 +83,13 @@ def build_scinet_domain_bundle() -> DomainBundle:
     return DomainBundle(
         name="scinet",
         policy_factory=scinet_research_policy,
-        adapter_factory=SciNetAdapter,
         campaign_store=campaign_store,
         report_store=report_store,
         campaign_runner_factory=runner_factory,
         comparator_factory=comparator_factory,
         dataset_verifier=dataset_verifier,
         campaign_root=str(DEFAULT_SCINET_DIR / domain.campaign_root),
+        adapter_factory=adapter_factory,
         description=(
             "SciNet++ Pendulum / robotics world-model research (P1-06 / P2-02)."
         ),
@@ -118,4 +130,5 @@ def build_default_research_service(domain_name: str = "scinet"):
         comparator_factory=bundle.comparator_factory,
         dataset_verifier=bundle.dataset_verifier,
         campaign_root=bundle.campaign_root,
+        adapter=bundle.adapter_factory(),
     ))

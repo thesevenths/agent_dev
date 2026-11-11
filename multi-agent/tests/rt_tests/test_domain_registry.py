@@ -16,6 +16,7 @@ from research_runtime.domain_registry import (
     get_domain,
     register_domain,
 )
+from research_runtime.adapters.base import ModelAdapter
 from research_runtime.research_environment import (
     build_default_research_service,
     build_scinet_domain_bundle,
@@ -77,6 +78,17 @@ class TestScinetBundle(unittest.TestCase):
         tail = os.path.normpath(bundle.campaign_root).split(os.sep)[-2:]
         self.assertEqual(tail, ["outputs", "research_campaigns"])
 
+    def test_scinet_bundle_adapter_is_real_model_adapter(self):
+        # R2: the adapter is not dead metadata. The bundle must advertise a real
+        # engine handle that is a genuine ModelAdapter (a callable factory).
+        bundle = build_scinet_domain_bundle()
+        adapter = bundle.adapter_factory()
+        self.assertIsInstance(adapter, ModelAdapter)
+        # The runner built by the bundle's own factory must use the SAME class.
+        runner = bundle.campaign_runner_factory()
+        self.assertIsInstance(runner.manager.adapter, ModelAdapter)
+        self.assertIs(runner.manager.adapter.__class__, adapter.__class__)
+
 
 class TestServiceFromRegistry(unittest.TestCase):
     def test_default_service_uses_scinet_bundle(self):
@@ -85,6 +97,17 @@ class TestServiceFromRegistry(unittest.TestCase):
         bundle = get_domain("scinet")
         self.assertEqual(svc.deps.campaign_root, bundle.campaign_root)
         self.assertEqual(svc.deps.domain.domain, "pendulum_world_model")
+
+    def test_default_service_exposes_real_adapter(self):
+        # R2: the assembled generic service must expose a real engine adapter,
+        # not None. The whole point of the bundle is that the generic runtime
+        # sees the domain's adapter without naming an engine itself.
+        svc = build_default_research_service()
+        self.assertIsInstance(svc.adapter, ModelAdapter)
+        self.assertIs(svc.adapter, svc.deps.adapter)
+        # The adapter the service exposes is the bundle's advertised handle.
+        bundle = get_domain("scinet")
+        self.assertIs(svc.adapter.__class__, bundle.adapter_factory().__class__)
 
     def test_service_from_swapped_domain(self):
         # A wholly different domain (policy + stores + runner) is assembled

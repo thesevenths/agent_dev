@@ -120,6 +120,7 @@ class ResearchDependencies:
     evidence_provider: EvidenceProvider | None = None
     dataset_verifier: DatasetVerifier | None = None
     campaign_root: str = ""
+    adapter: Any = None  # ARR 0.1 / R2: the domain's engine adapter (ModelAdapter)
 
 
 BINDING_NAMESPACE = uuid.UUID("6f2a1c94-7b3d-4e18-9c62-1d8e5a0b7f43")
@@ -145,6 +146,16 @@ class ResearchService:
     @property
     def domain(self) -> ResearchDomainPolicy:
         return self.deps.domain
+
+    @property
+    def adapter(self) -> Any:
+        """The domain's engine adapter (ModelAdapter), wired from the bundle.
+
+        ARR 0.1 / R2: the generic runtime never names an engine, but the
+        selected domain's adapter is a first-class, observable part of the
+        assembled service -- not an unused field on the bundle.
+        """
+        return self.deps.adapter
 
     def _evidence_resolver(self) -> Callable[[str], "Any | None"]:
         """Resolve an experiment_id to its REAL recorded result, or None.
