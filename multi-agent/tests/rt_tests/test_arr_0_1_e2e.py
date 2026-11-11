@@ -28,6 +28,7 @@ LLMProposer is exercised separately in test_research_proposer.py.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +43,14 @@ from tests.rt_tests.research_fakes import (
     SOURCE_EXPERIMENT_ID,
     Harness,
 )
+
+
+# Env vars that, if set, make the autonomous proposer attempt the REAL LLM path
+# (research_runtime.llm_client). The E2E must be deterministic and CI-safe, so
+# it exercises the deterministic RuleBasedProposer fallback -- the realistic
+# path when no LLM is configured. We isolate these in setUp/tearDown so the
+# test is robust regardless of any other test's env mutations in the same run.
+_LLM_ENV_KEYS = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL", "LLM_VERIFY_SSL")
 
 
 class StubModelAdapter(ModelAdapter):
@@ -64,6 +73,12 @@ class StubModelAdapter(ModelAdapter):
 
 class Arr01DualLoopE2E(unittest.TestCase):
     def setUp(self):
+        # Isolate LLM env so the autonomous proposer uses the deterministic
+        # RuleBasedProposer (the realistic no-LLM path), independent of any
+        # other test in the same session that may set LLM_* variables.
+        self._saved_llm_env = {k: os.environ.get(k) for k in _LLM_ENV_KEYS}
+        for k in _LLM_ENV_KEYS:
+            os.environ.pop(k, None)
         # Default Harness already wires fake_evidence + fake_dataset_verifier.
         self.harness = Harness()
         # R2: the assembled service exposes a REAL ModelAdapter instance.
@@ -71,6 +86,14 @@ class Arr01DualLoopE2E(unittest.TestCase):
         self.harness.service = ResearchService(self.harness.deps)
         # Drive the inner loop ONCE; reuse the report for the outer-loop tests.
         self.report = self._run_inner_loop()
+
+    def tearDown(self):
+        # Restore the LLM env exactly as it was before this test.
+        for k, v in self._saved_llm_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     # ----------------------------------------------------------- inner loop
     def _run_inner_loop(self) -> dict:
