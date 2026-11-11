@@ -30,6 +30,7 @@ promotes a model and never evaluates on the reserved final split.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -40,7 +41,7 @@ from .campaign.schemas import CAMPAIGN_TERMINAL_STATUSES, CampaignRunSpec
 from .evidence_store import EvidenceStore
 from .failure_diagnoser import FailureDiagnoser
 from .hypothesis_critic import HypothesisCritic
-from .hypothesis_manager import HypothesisManager, RuleBasedProposer
+from .hypothesis_manager import HypothesisManager, LLMProposer, RuleBasedProposer
 from .research_policy import ResearchDomainPolicy
 from .research_store import ResearchStores, plan_sha256
 from .research_store.schemas import CampaignBinding, ResearchReport
@@ -52,6 +53,14 @@ from .schemas import (
     Hypothesis,
     ResearchObjective,
 )
+
+# Safe at import time: research_runtime.llm_client only imports langchain_openai
+# lazily, inside its functions -- never at module load. This keeps the generic
+# runtime free of an SDK/network dependency unless the LLM path is actually used.
+from . import llm_client
+
+
+logger = logging.getLogger(__name__)
 
 
 class ResearchGateError(Exception):
@@ -121,6 +130,10 @@ class ResearchDependencies:
     dataset_verifier: DatasetVerifier | None = None
     campaign_root: str = ""
     adapter: Any = None  # ARR 0.1 / R2: the domain's engine adapter (ModelAdapter)
+    llm_generate: Callable[[str], Any] | None = None  # ARR 0.1 / R3: injected
+    # generate(prompt)->str|dict|list for autonomous hypothesis proposals. When
+    # None, the service builds one from the shared LLM_* gateway if configured,
+    # else falls back to the deterministic RuleBasedProposer.
 
 
 BINDING_NAMESPACE = uuid.UUID("6f2a1c94-7b3d-4e18-9c62-1d8e5a0b7f43")
@@ -180,11 +193,42 @@ class ResearchService:
         if self.deps.hypothesis_manager_factory is not None:
             return self.deps.hypothesis_manager_factory()
         return HypothesisManager(
-            proposer=RuleBasedProposer(
-                intervention_policy=dict(self.domain.intervention_policy)),
+            proposer=self._autonomous_proposer(),
             critic=HypothesisCritic(evidence_resolver=self._evidence_resolver(),
                                     strict=True),
         )
+
+    def _autonomous_proposer(self):
+        """ARR 0.1 / R3: the proposer used on the autonomous (no manual
+        ``hypotheses_json``) path.
+
+        Priority:
+          1. An explicitly injected ``llm_generate`` (test double or caller-
+             supplied callable) -> ``LLMProposer`` with the domain's config
+             whitelist as the allowed intervention keys, so the model cannot
+             invent config fields the domain does not permit.
+          2. If no injection but the shared ``LLM_*`` gateway is configured,
+             build a real ``LLMProposer`` from it.
+          3. Otherwise fall back to the deterministic ``RuleBasedProposer``.
+
+        The deterministic ``HypothesisCritic`` (wired in ``_manager``) remains
+        the only approval gate in every case -- an LLM can never approve.
+        """
+        allowed_keys = tuple(self.domain.allowed_config_keys)
+        if self.deps.llm_generate is not None:
+            return LLMProposer(generate=self.deps.llm_generate,
+                               allowed_intervention_keys=allowed_keys)
+        if llm_client.is_configured():
+            try:
+                return LLMProposer(
+                    generate=llm_client.make_generate(),
+                    allowed_intervention_keys=allowed_keys)
+            except Exception as exc:  # gateway misconfigured -> stay deterministic
+                logger.warning(
+                    "ARR LLM proposer unavailable (%s); using RuleBasedProposer",
+                    exc)
+        return RuleBasedProposer(
+            intervention_policy=dict(self.domain.intervention_policy))
 
     def _session(self, session_id: str, objective_id: str = ""):
         session = (self.stores.sessions.get_session(session_id)
@@ -297,6 +341,12 @@ class ResearchService:
             proposer = getattr(manager, "proposer", None)
             skip_reasons = list(getattr(proposer, "skipped_reasons", []) or [])
             skip_reasons += [str(item) for item in (manager.rejections or [])]
+            # Surface an untrusted proposer's own rejections (LLMProposer keeps
+            # them on itself, distinct from the manager's validation rejections)
+            # so the caller can see WHY zero hypotheses were produced.
+            if proposer is not None:
+                skip_reasons += [str(item) for item in
+                                (getattr(proposer, "rejections", []) or [])]
 
         saved = [self.stores.hypotheses.save(h) for h in proposals]
         failure_refs = []
