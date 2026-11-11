@@ -146,13 +146,32 @@ class ResearchService:
     def domain(self) -> ResearchDomainPolicy:
         return self.deps.domain
 
+    def _evidence_resolver(self) -> Callable[[str], "Any | None"]:
+        """Resolve an experiment_id to its REAL recorded result, or None.
+
+        R1: the critic uses this to reject evidence references that point at a
+        non-existent experiment or a metric that the real run never produced.
+        Failures (missing/garbled evidence) yield None rather than raising, so
+        the critic turns them into a deterministic rejection.
+        """
+        provider = self.deps.evidence_provider or default_evidence_provider
+
+        def resolve(experiment_id: str):
+            try:
+                result, _ = provider(experiment_id)
+                return result
+            except Exception:
+                return None
+
+        return resolve
+
     def _manager(self) -> HypothesisManager:
         if self.deps.hypothesis_manager_factory is not None:
             return self.deps.hypothesis_manager_factory()
         return HypothesisManager(
             proposer=RuleBasedProposer(
                 intervention_policy=dict(self.domain.intervention_policy)),
-            critic=HypothesisCritic(),
+            critic=HypothesisCritic(evidence_resolver=self._evidence_resolver()),
         )
 
     def _session(self, session_id: str, objective_id: str = ""):

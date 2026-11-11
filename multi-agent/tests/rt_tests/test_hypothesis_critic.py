@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -11,6 +12,79 @@ if str(_ROOT) not in sys.path:
 
 from research_runtime.hypothesis_critic import HypothesisCritic
 from research_runtime.schemas import Hypothesis, MetricPrediction
+
+
+def _real_result(**overrides):
+    """A duck-typed stand-in for a persisted ExperimentResult."""
+    data = dict(metrics={"latent_mse@3": 0.1, "cosine@1": 0.9},
+                evaluation_split="validation", dataset_version="ds_frozen_v1",
+                run_id="run_42")
+    data.update(overrides)
+    return types.SimpleNamespace(**data)
+
+
+class TestEvidenceIntegrity(unittest.TestCase):
+    """ARR 0.1 / R1: evidence references must be grounded in REAL results."""
+
+    def _critic(self, store: dict[str, object] | None = None):
+        # The default ``hypothesis()`` fixture cites ``exp_baseline_001``.
+        db = store if store is not None else {"exp_baseline_001": _real_result()}
+        def resolver(experiment_id: str):
+            return db.get(experiment_id)
+        return HypothesisCritic(evidence_resolver=resolver)
+
+    def test_real_metric_is_accepted(self):
+        ok, errors = self._critic().review(hypothesis())
+        self.assertTrue(ok, errors)
+
+    def test_fabricated_metric_is_rejected(self):
+        h = hypothesis(evidence_refs=[
+            "experiment:exp_baseline_001:metric:fake_metric@9"])
+        ok, errors = self._critic().review(h)
+        self.assertFalse(ok)
+        self.assertTrue(any("fake_metric@9" in e and "not present" in e
+                            for e in errors))
+
+    def test_unknown_experiment_is_rejected(self):
+        h = hypothesis(evidence_refs=[
+            "experiment:exp_missing:metric:latent_mse@3"])
+        ok, errors = self._critic().review(h)
+        self.assertFalse(ok)
+        self.assertTrue(any("unknown experiment_id" in e for e in errors))
+
+    def test_existence_only_ref_accepted(self):
+        h = hypothesis(evidence_refs=["experiment:exp_baseline_001"])
+        ok, errors = self._critic().review(h)
+        self.assertTrue(ok, errors)
+
+    def test_split_mismatch_is_rejected(self):
+        h = hypothesis(evidence_refs=[
+            "experiment:exp_baseline_001:metric:latent_mse@3:split:test"])
+        ok, errors = self._critic().review(h)
+        self.assertFalse(ok)
+        self.assertTrue(any("split" in e and "test" in e for e in errors))
+
+    def test_dataset_mismatch_is_rejected(self):
+        h = hypothesis(evidence_refs=[
+            "experiment:exp_baseline_001:dataset:ds_wrong"])
+        ok, errors = self._critic().review(h)
+        self.assertFalse(ok)
+        self.assertTrue(any("dataset_version" in e for e in errors))
+
+    def test_run_mismatch_is_rejected(self):
+        h = hypothesis(evidence_refs=[
+            "experiment:exp_baseline_001:run:run_999"])
+        ok, errors = self._critic().review(h)
+        self.assertFalse(ok)
+        self.assertTrue(any("run_id" in e for e in errors))
+
+    def test_no_resolver_keeps_backward_compatible(self):
+        # Without a resolver the runtime does NOT invent a metric check, so a
+        # non-existent metric cannot be rejected on those grounds alone.
+        h = hypothesis(evidence_refs=[
+            "experiment:exp_baseline_001:metric:fake_metric@9"])
+        ok, _ = HypothesisCritic().review(h)
+        self.assertTrue(ok)
 
 
 def hypothesis(**kw) -> Hypothesis:
