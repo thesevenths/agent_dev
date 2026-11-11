@@ -171,7 +171,8 @@ class ResearchService:
         return HypothesisManager(
             proposer=RuleBasedProposer(
                 intervention_policy=dict(self.domain.intervention_policy)),
-            critic=HypothesisCritic(evidence_resolver=self._evidence_resolver()),
+            critic=HypothesisCritic(evidence_resolver=self._evidence_resolver(),
+                                    strict=True),
         )
 
     def _session(self, session_id: str, objective_id: str = ""):

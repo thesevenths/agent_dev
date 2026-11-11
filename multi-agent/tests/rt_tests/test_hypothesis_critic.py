@@ -1,7 +1,12 @@
-"""P1-02: the reviewer is deterministic and an LLM advisor cannot overrule it."""
+"""P1-02: the reviewer is deterministic and an LLM advisor cannot overrule it.
+ARR 0.1 / R1: evidence references are grounded in REAL results, with explicit
+MATCH / MISMATCH / UNKNOWN / UNRESOLVED verdicts.
+"""
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -10,7 +15,11 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from research_runtime.hypothesis_critic import HypothesisCritic
+from research_runtime.hypothesis_critic import (
+    EvidenceVerdict,
+    HypothesisCritic,
+    verify_evidence_ref,
+)
 from research_runtime.schemas import Hypothesis, MetricPrediction
 
 
@@ -18,7 +27,7 @@ def _real_result(**overrides):
     """A duck-typed stand-in for a persisted ExperimentResult."""
     data = dict(metrics={"latent_mse@3": 0.1, "cosine@1": 0.9},
                 evaluation_split="validation", dataset_version="ds_frozen_v1",
-                run_id="run_42")
+                run_id="run_42", artifacts=[], result_path=None)
     data.update(overrides)
     return types.SimpleNamespace(**data)
 
@@ -26,12 +35,12 @@ def _real_result(**overrides):
 class TestEvidenceIntegrity(unittest.TestCase):
     """ARR 0.1 / R1: evidence references must be grounded in REAL results."""
 
-    def _critic(self, store: dict[str, object] | None = None):
-        # The default ``hypothesis()`` fixture cites ``exp_baseline_001``.
+    def _critic(self, store: dict[str, object] | None = None,
+                strict: bool = True):
         db = store if store is not None else {"exp_baseline_001": _real_result()}
         def resolver(experiment_id: str):
             return db.get(experiment_id)
-        return HypothesisCritic(evidence_resolver=resolver)
+        return HypothesisCritic(evidence_resolver=resolver, strict=strict)
 
     def test_real_metric_is_accepted(self):
         ok, errors = self._critic().review(hypothesis())
@@ -50,7 +59,8 @@ class TestEvidenceIntegrity(unittest.TestCase):
             "experiment:exp_missing:metric:latent_mse@3"])
         ok, errors = self._critic().review(h)
         self.assertFalse(ok)
-        self.assertTrue(any("unknown experiment_id" in e for e in errors))
+        self.assertTrue(any("unknown experiment_id" in e
+                            or EvidenceVerdict.UNRESOLVED in e for e in errors))
 
     def test_existence_only_ref_accepted(self):
         h = hypothesis(evidence_refs=["experiment:exp_baseline_001"])
@@ -85,6 +95,98 @@ class TestEvidenceIntegrity(unittest.TestCase):
             "experiment:exp_baseline_001:metric:fake_metric@9"])
         ok, _ = HypothesisCritic().review(h)
         self.assertTrue(ok)
+
+
+class TestEvidenceVerdicts(unittest.TestCase):
+    """ARR 0.1 / R1 hardening: UNKNOWN != PASS, artifact identity, malformed."""
+
+    def _resolver(self, store):
+        def r(eid):
+            return store.get(eid)
+        return r
+
+    def test_unknown_field_is_unverifiable_and_rejected_in_strict(self):
+        # Real result never recorded a split, yet the ref claims one -> UNKNOWN.
+        res = _real_result(evaluation_split=None)
+        h = hypothesis(evidence_refs=[
+            "experiment:exp_baseline_001:metric:latent_mse@3:split:validation"])
+        ok, errors = HypothesisCritic(
+            evidence_resolver=self._resolver({"exp_baseline_001": res})).review(h)
+        self.assertFalse(ok)
+        self.assertTrue(any(EvidenceVerdict.UNKNOWN in e for e in errors))
+
+    def test_unknown_field_passes_in_non_strict_legacy_mode(self):
+        res = _real_result(evaluation_split=None)
+        h = hypothesis(evidence_refs=[
+            "experiment:exp_baseline_001:metric:latent_mse@3:split:validation"])
+        ok, _ = HypothesisCritic(
+            evidence_resolver=self._resolver({"exp_baseline_001": res}),
+            strict=False).review(h)
+        self.assertTrue(ok, "non-strict legacy path must not reject UNKNOWN")
+
+    def test_verify_evidence_ref_returns_explicit_verdicts(self):
+        res = _real_result()
+        v = verify_evidence_ref(
+            "experiment:exp_baseline_001:metric:latent_mse@3",
+            self._resolver({"exp_baseline_001": res}))
+        self.assertEqual(v.verdict, EvidenceVerdict.MATCH)
+        v2 = verify_evidence_ref(
+            "experiment:exp_missing:metric:x", self._resolver({}))
+        self.assertEqual(v2.verdict, EvidenceVerdict.UNRESOLVED)
+
+    def test_artifact_missing_on_disk_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            res = _real_result(artifacts=["ckpt.pt"],
+                               result_path=os.path.join(d, "report.json"))
+            h = hypothesis(evidence_refs=[
+                "experiment:exp_baseline_001:artifact:ckpt.pt"])
+            ok, errors = HypothesisCritic(
+                evidence_resolver=self._resolver({"exp_baseline_001": res}),
+            ).review(h)
+            self.assertFalse(ok)
+            self.assertTrue(any("artifact" in e and "missing" in e
+                                for e in errors))
+
+    def test_artifact_sha256_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            import hashlib
+            p = Path(d) / "ckpt.pt"
+            p.write_bytes(b"original weights")
+            good = hashlib.sha256(b"original weights").hexdigest()
+            bad = "0" * 64
+            res = _real_result(artifacts=["ckpt.pt"],
+                               result_path=os.path.join(d, "report.json"))
+            # cited hash differs from actual -> MISMATCH
+            h = hypothesis(evidence_refs=[
+                f"experiment:exp_baseline_001:artifact:ckpt.pt@{bad}"])
+            ok, errors = HypothesisCritic(
+                evidence_resolver=self._resolver({"exp_baseline_001": res}),
+            ).review(h)
+            self.assertFalse(ok)
+            self.assertTrue(any("SHA-256 mismatch" in e for e in errors))
+            # correct hash -> MATCH
+            h2 = hypothesis(evidence_refs=[
+                f"experiment:exp_baseline_001:artifact:ckpt.pt@{good}"])
+            ok2, _ = HypothesisCritic(
+                evidence_resolver=self._resolver({"exp_baseline_001": res}),
+            ).review(h2)
+            self.assertTrue(ok2)
+
+    def test_malformed_reference_is_rejected(self):
+        h = hypothesis(evidence_refs=["this reference has no key value pairs"])
+        ok, errors = HypothesisCritic(
+            evidence_resolver=self._resolver({})).review(h)
+        self.assertFalse(ok)
+        self.assertTrue(any("malformed" in e for e in errors))
+
+    def test_resolver_failure_is_treated_as_unresolved(self):
+        def boom(eid):
+            raise RuntimeError("evidence store offline")
+        h = hypothesis(evidence_refs=[
+            "experiment:exp_baseline_001:metric:latent_mse@3"])
+        ok, errors = HypothesisCritic(evidence_resolver=boom).review(h)
+        self.assertFalse(ok)
+        self.assertTrue(any(EvidenceVerdict.UNRESOLVED in e for e in errors))
 
 
 def hypothesis(**kw) -> Hypothesis:
