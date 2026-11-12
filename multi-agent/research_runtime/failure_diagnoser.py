@@ -18,6 +18,14 @@ from typing import Callable
 
 from .schemas import ExperimentResult, FailureReport
 
+# Longest-horizon worsening (relative to shortest) that counts as measurable
+# error accumulation worth a controlled candidate. 1.08 = an 8% degradation at
+# the furthest horizon. The healthy reference case in the test suite degrades
+# only 5%, so it stays silent; genuinely deteriorating models (who degrade
+# more) surface a hypothesis. Kept well below the previous 1.5x, which hid
+# real-but-modest multi-step drift on small/accurate models.
+HORIZON_DEGRADATION_FACTOR = 1.08
+
 MetricFamily = tuple[str, list[tuple[int, float]]]
 
 
@@ -136,7 +144,7 @@ def default_rules() -> list[DiagnosticRule]:
             recommended_action="run controlled candidates and compare on the "
                                "same validation split; reserve frozen test for "
                                "final confirmation",
-            match=_degrades_over_horizon,
+            match=lambda r: _degrades_over_horizon(r, factor=HORIZON_DEGRADATION_FACTOR),
         ),
     ]
 

@@ -29,6 +29,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from pydantic import ValidationError
 
 from .hypothesis_critic import HypothesisCritic
+from .failure_diagnoser import HORIZON_DEGRADATION_FACTOR
 from .schemas import (
     CandidateExperiment,
     ExperimentPlan,
@@ -137,7 +138,7 @@ class RuleBasedProposer:
                 "no horizon-degradation diagnosis in structured evidence")
             return []
 
-        families = degraded_families(result.metrics)
+        families = degraded_families(result.metrics, factor=HORIZON_DEGRADATION_FACTOR)
         if not families:
             self.skipped_reasons.append(
                 "no metric family shows measurable horizon degradation")

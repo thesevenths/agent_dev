@@ -32,6 +32,17 @@ class TestFailureDiagnoser(unittest.TestCase):
                             "cosine@1": 0.9, "cosine@3": 0.89})
         self.assertIsNone(self.diag.diagnose(r))
 
+    def test_real_smoke_metrics_surface_horizon(self):
+        # Real SciNet++ pendulum_smoke eval: latent_mse grows 0.0240 -> 0.0262
+        # (~9% at the longest horizon) -- a genuine but modest error
+        # accumulation the production detector must surface. It sits just above
+        # the 1.08 threshold, whereas the 5%-healthy reference above stays silent.
+        r = result(metrics={"latent_mse@1": 0.02402379, "latent_mse@3": 0.02618079,
+                            "cosine@1": 0.58712, "cosine@3": 0.50824})
+        reports = self.diag.diagnose_all(r, layer="model")
+        self.assertTrue(any(x.category == "dynamics_error_accumulation"
+                            for x in reports))
+
     def test_runtime_vs_model_layers_are_separate(self):
         r = result(status="failed", error_type="timeout")
         reports = self.diag.diagnose_all(r)
