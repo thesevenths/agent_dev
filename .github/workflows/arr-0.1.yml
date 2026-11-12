@@ -55,6 +55,12 @@ jobs:
         python-version: ["3.11", "3.12", "3.13"]
     env:
       RESEARCH_SKIP_E2E: "1"
+      # tools.py builds a SQLAlchemy engine at import time (module-level).
+      # create_engine is lazy and create_all failures are caught, so this dummy
+      # DSN lets the legacy agent-stack tests IMPORT in CI without a real DB.
+      # load_dotenv() does not override an existing env var, and no test issues
+      # a DB query in this suite. No secret is involved.
+      PG_CONN_STR: "postgresql+psycopg://ci:ci@127.0.0.1:5432/ci"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,13 +70,24 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install minimal test dependencies
-        # Only what the ARR 0.1 suites import at module load:
-        # pydantic, PyYAML, python-dotenv (langchain_openai is imported lazily
-        # by research_runtime.llm_client and never triggered in CI).
+      - name: Install test dependencies
+        # Verified in a clean venv with exactly this set: 753 passed, 10 skipped,
+        # 6 deselected, 0 failed. The earlier "minimal" set (pytest/pydantic/
+        # PyYAML/dotenv only) was WRONG: tests/rt_tests/test_agent_integration.py
+        # and test_research_tools.py import `agents` -> `llm` -> `tools` -> `hitl`,
+        # which require the LangChain 1.x stack at MODULE level, e.g.
+        #   hitl.py:28  from langchain.agents.middleware import HumanInTheLoopMiddleware
+        #   llm.py:28   from langchain_openai import ChatOpenAI
+        #   tools.py:25 from langchain_experimental.utilities import PythonREPL
+        # LangChain is NOT imported lazily here. Installing it makes those tests
+        # actually RUN (rather than deselecting or skipping them = hiding them).
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "pytest>=8.0" "pydantic>=2.7.4" "PyYAML>=6.0" "python-dotenv>=1.0.0"
+          python -m pip install \
+            "pytest>=8.0" "pydantic>=2.7.4" "PyYAML>=6.0" "python-dotenv>=1.0.0" \
+            "langchain>=1.0" "langchain-core>=1.0" "langgraph>=1.0" \
+            "langchain-openai>=1.0" "langchain-experimental" "langchain-tavily" \
+            "sqlalchemy>=2.0" "requests>=2.0" "psycopg[binary]>=3.1"
 
       - name: Run ARR 0.1 integration suite
         run: |
