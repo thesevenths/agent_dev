@@ -22,9 +22,10 @@ from adaptive_runtime.evolution_spaces import (
     CandidateType, namespaced_fingerprint,
 )
 
-#: Module-level (NOT an Enum member) ordered lifecycle, used by the state
-#: machine below. Kept outside the Enum so the enum machinery never treats it as
-#: a member or a reserved name.
+#: Module-level (NOT an Enum member) ordered lifecycle, kept for reference and
+#: reporting. The actual state machine is the explicit whitelist below, NOT this
+#: ordering: comparison against it would wrongly allow skipping stages and
+#: reversing terminal decisions.
 _LIFECYCLE_ORDER = ("proposed", "critic_approved", "sandboxed", "evaluated",
                    "accepted", "rejected", "inconclusive")
 
@@ -46,17 +47,36 @@ class CandidateStatus(Enum):
                         CandidateStatus.INCONCLUSIVE, CandidateStatus.VERSIONED)
 
     def can_transition_to(self, other: "CandidateStatus") -> bool:
-        """A candidate must move forward; only VERSIONED may follow a terminal
-        decision, and it may never be reached from a non-terminal state."""
+        """Return True iff ``other`` is an explicitly permitted next state.
+
+        A candidate must move through the lifecycle in order; only VERSIONED may
+        follow a terminal decision, and it is a sink (no outgoing edges). This is
+        enforced by the :data:`_TRANSITIONS` whitelist -- not by lifecycle index
+        ordering, which would have allowed skipping stages or reversing terminal
+        decisions.
+        """
         if self is other:
             return True
-        if other is CandidateStatus.VERSIONED:
-            return self.is_terminal()
-        try:
-            return (_LIFECYCLE_ORDER.index(other.value)
-                    >= _LIFECYCLE_ORDER.index(self.value))
-        except ValueError:
-            return False
+        return other in _TRANSITIONS.get(self, set())
+
+
+#: Explicit legal transitions. Declared AFTER the enum so the names resolve. Any
+#: transition not listed here is FORBIDDEN, so a candidate can never skip a
+#: mandatory stage (e.g. PROPOSED -> EVALUATED) nor reverse a terminal decision
+#: (e.g. ACCEPTED -> REJECTED). VERSIONED is a true sink reachable exactly once,
+#: only from a terminal decision.
+_TRANSITIONS: dict["CandidateStatus", set["CandidateStatus"]] = {
+    CandidateStatus.PROPOSED: {CandidateStatus.CRITIC_APPROVED},
+    CandidateStatus.CRITIC_APPROVED: {CandidateStatus.SANDBOXED},
+    CandidateStatus.SANDBOXED: {CandidateStatus.EVALUATED},
+    CandidateStatus.EVALUATED: {CandidateStatus.ACCEPTED,
+                               CandidateStatus.REJECTED,
+                               CandidateStatus.INCONCLUSIVE},
+    CandidateStatus.ACCEPTED: {CandidateStatus.VERSIONED},
+    CandidateStatus.REJECTED: {CandidateStatus.VERSIONED},
+    CandidateStatus.INCONCLUSIVE: {CandidateStatus.VERSIONED},
+    CandidateStatus.VERSIONED: set(),
+}
 
 
 @dataclass

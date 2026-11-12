@@ -12,6 +12,7 @@ campaign.
 from __future__ import annotations
 
 import importlib
+import math
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,6 +35,46 @@ _DOMAIN_MODULES = {
 def domain_whitelist(domain: str) -> tuple[tuple[str, ...], dict[str, Any]]:
     mod = importlib.import_module(_DOMAIN_MODULES[domain])
     return tuple(getattr(mod, "ALLOWED_KEYS", ())), dict(getattr(mod, "VALUE_RULES", {}))
+
+
+#: Canonical fallback so the evaluation direction is always defined even if a
+#: domain module has not yet exported it. The domain modules
+#: (embodied/quant/scinet) are the SINGLE SOURCE OF TRUTH and expose
+#: ``PRIMARY_METRIC`` / ``METRIC_DIRECTION``; this table only guards against a
+#: missing export.
+_METRIC_FALLBACK: dict[str, tuple[str, str]] = {
+    "embodied": ("state_mse@1", "minimize"),
+    "quant": ("net_return_after_cost", "maximize"),
+    "scinet": ("latent_mse@1", "minimize"),
+}
+
+
+def domain_metric(domain: str) -> tuple[str, str]:
+    """Return ``(primary_metric, direction)`` for a domain.
+
+    ``direction`` is ``"minimize"`` or ``"maximize"``. It is read from the
+    domain module's exported ``PRIMARY_METRIC`` / ``METRIC_DIRECTION`` so the
+    optimization goal lives in exactly one place and is shared by the research
+    task, the engine runner and the dual-layer RRSI decision.
+    """
+    mod = importlib.import_module(_DOMAIN_MODULES[domain])
+    pm = getattr(mod, "PRIMARY_METRIC", None)
+    md = getattr(mod, "METRIC_DIRECTION", None)
+    if pm and md:
+        return str(pm), str(md)
+    return _METRIC_FALLBACK.get(domain, ("unknown", "maximize"))
+
+
+def _is_finite(x: Any) -> bool:
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def _std(values: list[float]) -> float:
+    n = len(values)
+    if n < 2:
+        return 0.0
+    m = sum(values) / n
+    return math.sqrt(sum((v - m) ** 2 for v in values) / (n - 1))
 
 
 def _coerce(raw: Any) -> Any:
@@ -128,33 +169,71 @@ def evaluate_domain_candidate(*, domain: str, candidate: DomainModelCandidate,
                               campaign_id: str, seeds: tuple[int, ...],
                               dataset_version: str,
                               runner: DomainRunner | None = None,
-                              require_frozen_manifest: bool = True
+                              require_frozen_manifest: bool = True,
+                              holdout_seeds: tuple[int, ...] = (),
+                              min_valid_seeds: int = 2
                               ) -> dict[str, Any]:
     """Paired Base/Candidate experiment for ONE domain candidate on fixed seeds.
 
     Engine execution is injected via ``runner`` so it reuses the existing domain
     campaign. When ``runner`` is None a clear error is raised: a fabricated
     metric is NEVER accepted as real evidence.
+
+    The reported ``improvements`` are DIRECTION-NORMALIZED so that a strictly
+    positive value always means the candidate is better than baseline, regardless
+    of whether the domain metric is minimized (``state_mse@1``) or maximized
+    (``net_return_after_cost``). Raw ``deltas`` (cand - base) are kept for
+    traceability only; the decision is made on ``improvements``.
+
+    Evidence hygiene (no fabricated verdicts):
+      * NaN / Inf / None / missing metrics are NOT treated as a real delta. They
+        increment ``n_invalid``; a candidate with any invalid run, or with fewer
+        than ``min_valid_seeds`` valid paired runs, is INCONCLUSIVE -- never
+        silently ACCEPTED or counted as genuine REJECTION.
+      * An optional independent ``holdout_seeds`` set is evaluated; if it clearly
+        contradicts the paired improvement, the decision is downgraded to
+        INCONCLUSIVE (the gain is not trustworthy on unseen data).
     """
     if runner is None:
         raise NotImplementedError(
             "evaluate_domain_candidate requires an injected domain engine "
             "runner (the existing domain campaign). A fabricated metric is "
             "never accepted as real evidence.")
-    base_Q: list[float] = []
-    cand_Q: list[float] = []
-    for seed in seeds:
-        arts = materialize_domain_candidate(
-            domain=domain, candidate=candidate, base_config=base_config,
-            project_dir=project_dir, campaign_id=campaign_id, seed=seed,
-            dataset_version=dataset_version,
-            require_frozen_manifest=require_frozen_manifest)
-        base_Q.append(runner(arts["base"]))
-        cand_Q.append(runner(arts["candidate"]))
-    deltas = [round(c - b, 6) for b, c in zip(base_Q, cand_Q)]
-    return {
+    primary_metric, direction = domain_metric(domain)
+    # sign: +1 -> larger (cand - base) is better (maximize);
+    #       -1 -> smaller (cand - base) is better (minimize).
+    sign = -1.0 if direction == "minimize" else 1.0
+
+    def _run_on(run_seeds: tuple[int, ...]) -> tuple[list[float], list[float]]:
+        bQ: list[float] = []
+        cQ: list[float] = []
+        for seed in run_seeds:
+            arts = materialize_domain_candidate(
+                domain=domain, candidate=candidate, base_config=base_config,
+                project_dir=project_dir, campaign_id=campaign_id, seed=seed,
+                dataset_version=dataset_version,
+                require_frozen_manifest=require_frozen_manifest)
+            bQ.append(runner(arts["base"]))
+            cQ.append(runner(arts["candidate"]))
+        return bQ, cQ
+
+    base_Q, cand_Q = _run_on(seeds)
+    valid = [(b, c) for b, c in zip(base_Q, cand_Q)
+             if _is_finite(b) and _is_finite(c)]
+    n_invalid = len(base_Q) - len(valid)
+    improvements = [sign * (c - b) for (b, c) in valid]
+    if valid:
+        mean_improvement = sum(improvements) / len(improvements)
+        std_improvement = _std(improvements)
+    else:
+        mean_improvement = None
+        std_improvement = None
+
+    rec: dict[str, Any] = {
         "candidate_type": CandidateType.DOMAIN_MODEL.value,
         "domain": domain,
+        "primary_metric": primary_metric,
+        "metric_direction": direction,
         "target": candidate.target,
         "old": candidate.old,
         "new": candidate.new,
@@ -162,7 +241,28 @@ def evaluate_domain_candidate(*, domain: str, candidate: DomainModelCandidate,
         "hyp_fingerprint": candidate.hyp_fingerprint,
         "base_Q": base_Q,
         "cand_Q": cand_Q,
-        "deltas": deltas,
-        "mean_delta": round(sum(deltas) / max(1, len(deltas)), 6),
+        # Raw (cand - base) deltas, kept for traceability only.
+        "deltas": [round(c - b, 6) for b, c in zip(base_Q, cand_Q)],
+        # Direction-normalized: positive == candidate is BETTER.
+        "improvements": [round(x, 6) for x in improvements],
+        "mean_improvement": (round(mean_improvement, 6)
+                             if mean_improvement is not None else None),
+        "std_improvement": (round(std_improvement, 6)
+                            if std_improvement is not None else None),
         "n_seeds": len(seeds),
+        "n_valid": len(valid),
+        "n_invalid": n_invalid,
+        "min_valid_seeds": min_valid_seeds,
     }
+    if holdout_seeds:
+        ho_base, ho_cand = _run_on(holdout_seeds)
+        ho_valid = [(b, c) for b, c in zip(ho_base, ho_cand)
+                    if _is_finite(b) and _is_finite(c)]
+        if ho_valid:
+            ho_imp = [sign * (c - b) for (b, c) in ho_valid]
+            rec["holdout_improvement"] = round(sum(ho_imp) / len(ho_imp), 6)
+            rec["holdout_n_valid"] = len(ho_valid)
+        else:
+            rec["holdout_improvement"] = None
+            rec["holdout_n_valid"] = 0
+    return rec

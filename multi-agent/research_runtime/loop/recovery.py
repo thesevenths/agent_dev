@@ -25,6 +25,34 @@ class LoopRecoveryError(Exception):
     """Raised when a checkpoint is present but cannot be safely resumed."""
 
 
+def _assert_compatible(existing: LoopState, config: dict[str, Any],
+                       state_path: str | Path) -> None:
+    """Raise if a resume would run a DIFFERENT task on a prior run's checkpoint.
+
+    Comparing the requested task config against what was checkpointed prevents a
+    misleading "resume" that silently reuses another domain's / dataset's /
+    baseline's / seed-set's state. On mismatch the old checkpoint is archived (so
+    no evidence is destroyed) and a clear error is raised.
+    """
+    checks = [
+        ("domain", existing.domain, str(config.get("domain", ""))),
+        ("baseline_config_path", existing.baseline_config_path,
+         str(config.get("baseline_config_path", ""))),
+        ("max_rounds", existing.max_rounds, int(config.get("max_rounds", 1))),
+        ("dataset_version", existing.dataset_version,
+         str(config.get("dataset_version", ""))),
+        ("domain_seeds", list(existing.domain_seeds),
+         list(config.get("domain_seeds") or ())),
+    ]
+    mismatches = [f"{k}: checkpoint={a!r} != requested={b!r}"
+                  for k, a, b in checks if a != b]
+    if mismatches:
+        _archive(state_path)
+        raise LoopRecoveryError(
+            "refusing to resume with mismatched configuration: "
+            + "; ".join(mismatches))
+
+
 def load_or_init(*, state_path: str | Path, config: dict[str, Any]
                  ) -> tuple[LoopState, bool]:
     """Return ``(state, resumed)``.
@@ -36,6 +64,8 @@ def load_or_init(*, state_path: str | Path, config: dict[str, Any]
     existing = load(state_path)
     if existing is not None:
         if existing.status == "running" and existing.current_round <= existing.max_rounds:
+            # Resume only if the requested task matches the checkpoint exactly.
+            _assert_compatible(existing, config, state_path)
             return existing, True
         if existing.status in ("completed", "failed"):
             # Finished loop: do not re-run. Caller decides what to do next.
@@ -49,6 +79,8 @@ def load_or_init(*, state_path: str | Path, config: dict[str, Any]
         baseline_config_path=str(config.get("baseline_config_path", "")),
         base_harness_tag=str(config.get("base_harness_tag", "")),
         loop_id=str(config.get("loop_id", "")),
+        dataset_version=str(config.get("dataset_version", "")),
+        domain_seeds=list(config.get("domain_seeds") or ()),
     )
     save(state, state_path)
     return state, False

@@ -17,6 +17,7 @@ from pathlib import Path
 import yaml
 
 from research_runtime.loop import run_loop
+from research_runtime.loop.loop_state import LoopState, save
 
 
 def _payload(*, domain_accepted=(), harness_accepted=()):
@@ -163,7 +164,8 @@ class TestCheckpointResume(unittest.TestCase):
             pre = LoopState(
                 loop_id="loop_resume", domain="embodied", max_rounds=3,
                 current_round=2, status="running",
-                baseline_config_path=str(cfg))
+                baseline_config_path=str(cfg),
+                dataset_version="test-v1", domain_seeds=[50])
             save(pre, state_path)
 
             report = run_loop(
@@ -178,6 +180,31 @@ class TestCheckpointResume(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertEqual(report["status"], "completed")
             self.assertEqual(report["rounds_completed"], 2)
+
+
+class TestRecoveryMismatch(unittest.TestCase):
+    def test_resume_refuses_different_domain_checkpoint(self):
+        from research_runtime.loop.recovery import LoopRecoveryError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "base.yaml"
+            cfg.write_text("seed: 0\ntrain:\n  lr: 0.01\ndata: {}\n", encoding="utf-8")
+            state_path = Path(tmp) / "loop_state.json"
+            # An OLD checkpoint from a DIFFERENT task (quant, not embodied).
+            pre = LoopState(
+                loop_id="old", domain="quant", max_rounds=3,
+                current_round=1, status="running",
+                baseline_config_path=str(cfg),
+                dataset_version="robot_sim_v1", domain_seeds=[50])
+            save(pre, state_path)
+            with self.assertRaises(LoopRecoveryError):
+                run_loop(
+                    state_path=state_path,
+                    domain="embodied", baseline_config_path=str(cfg),
+                    project_dir=tmp, max_rounds=3, dataset_version="test-v1",
+                    domain_seeds=(50,), domain_runner=None,
+                    domain_require_frozen_manifest=False,
+                    harness_evolve=None, run_dual_layer_fn=lambda **kw: {})
 
 
 if __name__ == "__main__":

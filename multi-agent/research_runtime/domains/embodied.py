@@ -64,6 +64,12 @@ ALLOWED_KEYS = (
     "model.drift_correction",
 )
 
+#: Single source of truth for this domain's evaluation metric and its optimization
+#: direction. Consumed by the dual-layer RRSI (Package F/G) so a candidate that
+#: LOWERS ``state_mse@1`` is correctly treated as an improvement (minimize).
+PRIMARY_METRIC = "state_mse@1"
+METRIC_DIRECTION = "minimize"
+
 
 def _num_rule(low: float, high: float) -> ValueRule:
     def rule(value: Any) -> bool | str:

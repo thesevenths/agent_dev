@@ -40,6 +40,7 @@ def run_loop(*, state_path: str | Path,
              domain_seeds: tuple[int, ...] = (50, 51),
              domain_runner: Callable[[dict[str, Any]], float] | None = None,
              domain_require_frozen_manifest: bool = False,
+             domain_holdout_seeds: tuple[int, ...] = (),
              harness_evolve: Callable[..., dict[str, Any]] | None = None,
              harness_inherit_fn: Callable[[list[dict[str, Any]], Any], Any]
              | None = None,
@@ -64,7 +65,9 @@ def run_loop(*, state_path: str | Path,
         config={"domain": domain, "max_rounds": max_rounds,
                 "baseline_config_path": str(baseline_config_path),
                 "base_harness_tag": "" if base_harness_tag is None else "",
-                "loop_id": loop_id})
+                "loop_id": loop_id,
+                "dataset_version": dataset_version,
+                "domain_seeds": list(domain_seeds)})
     if base_harness_tag is not None and not resumed:
         state.base_harness_tag = base_harness_tag
 
@@ -85,9 +88,12 @@ def run_loop(*, state_path: str | Path,
                 dataset_version=dataset_version, domain_seeds=domain_seeds,
                 domain_runner=domain_runner,
                 domain_require_frozen_manifest=domain_require_frozen_manifest,
+                domain_holdout_seeds=domain_holdout_seeds,
                 harness_evolve=harness_evolve, extra=extra)
             _record_payload_sha(state, payload)
 
+            # Ingest this round's accepted results (bakes domain overrides into a
+            # new baseline; threads harness patches) BEFORE advancing the counter.
             state, record, _next_baseline = derive_next_version(
                 state=state, payload=payload, project_dir=project_dir,
                 harness_inherit_fn=inherit)
@@ -98,17 +104,19 @@ def run_loop(*, state_path: str | Path,
             state.n_harness_accepted = sum(
                 len(v.accepted_harness_targets) for v in state.version_history)
 
-            # Checkpoint AFTER the round is fully ingested -- this is the atomic
-            # boundary that makes resume safe.
+            # The round is now FULLY ingested (including the inherited version).
+            # Advance to the next round and atomically persist. The checkpoint
+            # therefore always points at the NEXT round to run, so a crash during
+            # round N+1 re-runs N+1 -- never the already-completed, already-
+            # -inherited round N.
+            state.last_completed_round = state.current_round
+            state.current_round += 1
             save(state, state_path)
 
             if stop_on_no_accept and record is None:
                 # No-gain stop: a complete round accepted nothing. End the loop
                 # rather than spin. The checkpoint still records the attempt.
-                state.last_round_payload_sha256 = state.last_round_payload_sha256
                 break
-
-            state.current_round += 1
 
         mark_completed(state, state_path)
     except Exception as exc:  # noqa: BLE001 -- record the failure, do not hang

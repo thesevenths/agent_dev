@@ -68,6 +68,12 @@ ALLOWED_KEYS = (
     "strategy.signal_window", "strategy.signal_smoothing",
 )
 
+#: Single source of truth for this domain's evaluation metric and its optimization
+#: direction. Consumed by the dual-layer RRSI (Package F/G): a candidate that
+#: RAISES ``net_return_after_cost`` is an improvement (maximize).
+PRIMARY_METRIC = "net_return_after_cost"
+METRIC_DIRECTION = "maximize"
+
 
 def _num_rule(low: float, high: float) -> ValueRule:
     def rule(value: Any) -> bool | str:

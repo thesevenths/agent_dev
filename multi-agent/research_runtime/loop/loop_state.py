@@ -67,6 +67,11 @@ class LoopState:
     status: str = "running"          # running | completed | failed
     baseline_config_path: str = ""
     base_harness_tag: str = ""       # opaque tag the harness layer carries round->round
+    dataset_version: str = ""        # frozen dataset the loop must run against
+    domain_seeds: list[int] = field(default_factory=list)
+    # The round whose result has been fully ingested + checkpointed. Used purely
+    # for reporting; the authoritative "next round to run" is ``current_round``.
+    last_completed_round: int = 0
     accepted_domain_overrides: dict[str, Any] = field(default_factory=dict)
     version_history: list[VersionRecord] = field(default_factory=list)
     started_at: str = ""
@@ -85,6 +90,9 @@ class LoopState:
             "status": self.status,
             "baseline_config_path": self.baseline_config_path,
             "base_harness_tag": self.base_harness_tag,
+            "dataset_version": self.dataset_version,
+            "domain_seeds": list(self.domain_seeds),
+            "last_completed_round": self.last_completed_round,
             "accepted_domain_overrides": dict(self.accepted_domain_overrides),
             "version_history": [v.to_dict() for v in self.version_history],
             "started_at": self.started_at,
@@ -104,6 +112,9 @@ class LoopState:
             status=str(d.get("status", "running")),
             baseline_config_path=str(d.get("baseline_config_path", "")),
             base_harness_tag=str(d.get("base_harness_tag", "")),
+            dataset_version=str(d.get("dataset_version", "")),
+            domain_seeds=list(d.get("domain_seeds") or []),
+            last_completed_round=int(d.get("last_completed_round", 0)),
             accepted_domain_overrides=dict(d.get("accepted_domain_overrides") or {}),
             version_history=[VersionRecord.from_dict(v)
                             for v in (d.get("version_history") or [])],
@@ -137,11 +148,15 @@ def load(state_path: str | Path) -> LoopState | None:
 
 
 def new_state(*, domain: str, max_rounds: int, baseline_config_path: str,
-             base_harness_tag: str = "", loop_id: str = "") -> LoopState:
+             base_harness_tag: str = "", loop_id: str = "",
+             dataset_version: str = "", domain_seeds: list[int] | tuple[int, ...] = ()
+             ) -> LoopState:
     return LoopState(
         loop_id=loop_id or ("loop_" + uuid.uuid4().hex[:12]),
         domain=domain, max_rounds=max_rounds, current_round=1,
         baseline_config_path=baseline_config_path,
         base_harness_tag=base_harness_tag,
+        dataset_version=dataset_version,
+        domain_seeds=list(domain_seeds),
         started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )

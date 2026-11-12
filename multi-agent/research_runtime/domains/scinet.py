@@ -45,6 +45,15 @@ def read_frozen_dataset_version(project_dir: str | Path | None = None) -> str:
     return str(version)
 
 
+#: Single source of truth for this domain's evaluation metric and its optimization
+#: direction. Consumed by the dual-layer RRSI (Package F/G): a candidate that
+#: LOWERS ``latent_mse@1`` is an improvement (minimize). SciNet++ exposes no
+#: ALLOWED_KEYS, so it produces no DOMAIN_MODEL candidates -- its loop runs only
+#: the harness layer -- but the metric definition still lives here for reuse.
+PRIMARY_METRIC = "latent_mse@1"
+METRIC_DIRECTION = "minimize"
+
+
 def scinet_research_policy(*, project_dir: str | Path | None = None,
                            epochs: int = 1,
                            paired_seeds: tuple[int, ...] = PAIRED_SEEDS,

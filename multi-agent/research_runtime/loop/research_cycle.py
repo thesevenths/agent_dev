@@ -24,6 +24,7 @@ def run_research_cycle(*, round_no: int, state: Any,
                         domain_seeds: tuple[int, ...],
                         domain_runner: Callable[[dict[str, Any]], float] | None,
                         domain_require_frozen_manifest: bool,
+                        domain_holdout_seeds: tuple[int, ...] = (),
                         harness_evolve: Callable[..., dict[str, Any]] | None,
                         extra: dict[str, Any] | None = None) -> dict[str, Any]:
     """Execute one round and return the dual-layer payload.
@@ -46,6 +47,7 @@ def run_research_cycle(*, round_no: int, state: Any,
         "dataset_version": dataset_version,
         "domain_seeds": domain_seeds,
         "domain_require_frozen_manifest": domain_require_frozen_manifest,
+        "domain_holdout_seeds": domain_holdout_seeds,
         "domain_runner": domain_runner,
     }
     if harness_evolve is not None:

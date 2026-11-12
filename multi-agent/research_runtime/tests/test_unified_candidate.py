@@ -45,6 +45,43 @@ class TestCandidateLifecycle(unittest.TestCase):
         self.assertFalse(
             CandidateStatus.PROPOSED.can_transition_to(CandidateStatus.VERSIONED))
 
+    def test_skip_stage_is_forbidden(self):
+        # The whitelist forbids jumping over a mandatory stage.
+        self.assertFalse(
+            CandidateStatus.PROPOSED.can_transition_to(CandidateStatus.EVALUATED))
+        self.assertFalse(
+            CandidateStatus.CRITIC_APPROVED.can_transition_to(
+                CandidateStatus.EVALUATED))
+
+    def test_terminal_states_cannot_be_reversed(self):
+        # A decision is final; terminal states must not convert into each other.
+        self.assertFalse(
+            CandidateStatus.ACCEPTED.can_transition_to(CandidateStatus.REJECTED))
+        self.assertFalse(
+            CandidateStatus.REJECTED.can_transition_to(CandidateStatus.ACCEPTED))
+        self.assertFalse(
+            CandidateStatus.INCONCLUSIVE.can_transition_to(
+                CandidateStatus.ACCEPTED))
+
+    def test_versioned_is_a_sink(self):
+        # VERSIONED is reachable exactly once and has no outgoing edges.
+        self.assertFalse(
+            CandidateStatus.VERSIONED.can_transition_to(CandidateStatus.ACCEPTED))
+        self.assertFalse(
+            CandidateStatus.VERSIONED.can_transition_to(
+                CandidateStatus.PROPOSED))
+
+    def test_registry_rejects_illegal_transition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = CandidateRegistry(log_path=Path(tmp) / "reg.jsonl")
+            c = DomainModelCandidate(
+                candidate_id="x", domain="embodied",
+                target="model.rollout_horizon", old=2.0, new=5.0,
+                taxonomy="DECISION_UNCERTAINTY")
+            reg.register(c)
+            with self.assertRaises(ValueError):
+                reg.transition(c.hyp_fingerprint, CandidateStatus.EVALUATED)
+
 
 class TestDomainCandidate(unittest.TestCase):
     def test_fingerprint_is_namespaced(self):
@@ -158,20 +195,29 @@ class TestEvaluateDomain(unittest.TestCase):
             c = DomainModelCandidate(
                 candidate_id="e2", domain="embodied", target="train.lr",
                 old=0.01, new=0.005, taxonomy="DECISION_UNCERTAINTY")
-            # A real (injected) runner: lower lr -> small positive reward.
+            # A real (injected) runner. Embodied's primary metric is state_mse@1
+            # (minimize): the candidate arm (lr=0.005) yields a LOWER (=better)
+            # value, the baseline arm (lr=0.01) a higher (=worse) value. The
+            # improvement must be reported as POSITIVE despite the raw cand-base
+            # delta being negative.
             def runner(art):
                 import yaml
                 cc = yaml.safe_load(
                     Path(art["config_path"]).read_text(encoding="utf-8"))
-                return 0.9 if cc["train"]["lr"] == 0.005 else 0.8
+                return 0.7 if cc["train"]["lr"] == 0.005 else 0.9
             rec = evaluate_domain_candidate(
                 domain="embodied", candidate=c, base_config=str(cfg),
                 project_dir=tmp, campaign_id="t", seeds=(50, 51),
                 dataset_version="test-v1", runner=runner,
                 require_frozen_manifest=False)
-            self.assertEqual(rec["base_Q"], [0.8, 0.8])
-            self.assertEqual(rec["cand_Q"], [0.9, 0.9])
-            self.assertGreater(rec["mean_delta"], 0.0)
+            self.assertEqual(rec["base_Q"], [0.9, 0.9])
+            self.assertEqual(rec["cand_Q"], [0.7, 0.7])
+            self.assertEqual(rec["n_valid"], 2)
+            self.assertEqual(rec["n_invalid"], 0)
+            # Direction-normalized improvement > 0 for a lower (better) metric.
+            self.assertGreater(rec["mean_improvement"], 0.0)
+            # Raw delta (cand - base) is negative; kept for traceability only.
+            self.assertLess(rec["deltas"][0], 0.0)
 
 
 class TestDualLayerSeparation(unittest.TestCase):
@@ -198,7 +244,7 @@ class TestDualLayerSeparation(unittest.TestCase):
                 project_dir=tmp, dataset_version="test-v1",
                 domain_seeds=(50, 51),
                 domain_require_frozen_manifest=False,
-                domain_runner=lambda art: 0.9 if "baseline" not in art["directory"] else 0.8,
+                domain_runner=lambda art: 0.7 if "baseline" not in art["directory"] else 0.9,
                 harness_evolve=self._harness_stub)
             self.assertIn("harness_layer", payload)
             self.assertIn("domain_layer", payload)
@@ -210,11 +256,12 @@ class TestDualLayerSeparation(unittest.TestCase):
             for r in dom["records"]:
                 self.assertTrue(
                     r["hyp_fingerprint"].startswith("domain_model::"))
-                # The injected runner returns a strictly higher metric for the
-                # candidate arm -> a positive mean delta -> ACCEPTED. This proves
-                # the decision is computed from the REAL metric, not fabricated.
+                # The injected runner yields a strictly LOWER (better) minimize
+                # metric for the candidate arm -> positive normalized improvement
+                # -> ACCEPTED. This proves the decision is computed from the REAL
+                # direction-aware metric, not a fabricated pass.
                 self.assertEqual(r["decision"], "accepted")
-                self.assertGreater(r["mean_delta"], 0.0)
+                self.assertGreater(r["mean_improvement"], 0.0)
             # Harness layer's fingerprint lives in a different namespace.
             hfp = payload["harness_layer"]["records"][0]["candidate"]["hyp_fingerprint"]
             self.assertTrue(hfp.startswith("research_harness::"))
@@ -222,6 +269,87 @@ class TestDualLayerSeparation(unittest.TestCase):
             self.assertTrue(payload["version_inheritance"]["inheritable_next_round"])
             self.assertEqual(payload["version_inheritance"]["domain_accepted"],
                              len(dom["records"]))
+
+
+class TestDomainDecision(unittest.TestCase):
+    """Black-box checks that the dual-layer DOMAIN decision is correct and honest.
+
+    These exercise ``run_dual_layer`` (real evaluate + real decide) with injected
+    engine runners -- no FakeRunner, no fabricated metric.
+    """
+
+    def _harness_stub(self, **kw):
+        return {
+            "schema_version": "stub",
+            "dominant_failure": "DECISION_UNCERTAINTY",
+            "records": [{"candidate": {"hyp_fingerprint": "research_harness::a",
+                                       "target": "planner.strategy"},
+                         "decision": "ACCEPT"}],
+            "accepted": [{"candidate": {"hyp_fingerprint": "research_harness::a"}}],
+            "n_accepted": 1,
+        }
+
+    def _run(self, runner):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "base.yaml"
+            cfg.write_text(
+                "seed: 0\ntrain:\n  lr: 0.01\ndata: {}\n", encoding="utf-8")
+            payload = run_dual_layer(
+                base_harness=None, tasks=[], heldout_task=None,
+                run_root=tmp, repo_root=tmp, rounds=1, max_minutes=1.0,
+                domain="embodied", domain_base_config=str(cfg),
+                project_dir=tmp, dataset_version="test-v1",
+                domain_seeds=(50, 51),
+                domain_require_frozen_manifest=False,
+                domain_runner=runner, harness_evolve=self._harness_stub)
+            return payload["domain_layer"]["records"]
+
+    def test_minimize_direction_accepts_real_improvement(self):
+        # Embodied metric is minimized: candidate lower -> better -> ACCEPTED.
+        recs = self._run(lambda art: 0.7 if "baseline" not in art["directory"] else 0.9)
+        self.assertTrue(recs)
+        for r in recs:
+            self.assertEqual(r["decision"], "accepted")
+            self.assertGreater(r["mean_improvement"], 0.0)
+
+    def test_minimize_direction_rejects_real_degradation(self):
+        # Candidate HIGHER (worse) for a minimize metric must be REJECTED, never
+        # ACCEPTED -- this is the exact inversion the review flagged.
+        recs = self._run(lambda art: 0.9 if "baseline" not in art["directory"] else 0.8)
+        self.assertTrue(recs)
+        for r in recs:
+            self.assertEqual(r["decision"], "rejected")
+            self.assertLess(r["mean_improvement"], 0.0)
+
+    def test_failed_run_is_inconclusive_not_rejected(self):
+        # NaN (engine failure / missing metric) must become INCONCLUSIVE, never a
+        # fabricated REJECT that would pretend the candidate was genuinely worse.
+        recs = self._run(lambda art: float("nan"))
+        self.assertTrue(recs)
+        for r in recs:
+            self.assertEqual(r["decision"], "inconclusive")
+            self.assertEqual(r["n_invalid"], 2)
+
+    def test_single_seed_is_inconclusive(self):
+        # One paired run cannot separate signal from noise -> INCONCLUSIVE.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "base.yaml"
+            cfg.write_text(
+                "seed: 0\ntrain:\n  lr: 0.01\ndata: {}\n", encoding="utf-8")
+            payload = run_dual_layer(
+                base_harness=None, tasks=[], heldout_task=None,
+                run_root=tmp, repo_root=tmp, rounds=1, max_minutes=1.0,
+                domain="embodied", domain_base_config=str(cfg),
+                project_dir=tmp, dataset_version="test-v1",
+                domain_seeds=(50,),
+                domain_require_frozen_manifest=False,
+                domain_runner=lambda art: 0.7 if "baseline" not in art["directory"] else 0.9,
+                harness_evolve=self._harness_stub)
+            recs = payload["domain_layer"]["records"]
+            self.assertTrue(recs)
+            for r in recs:
+                self.assertEqual(r["decision"], "inconclusive")
+                self.assertEqual(r["n_valid"], 1)
 
 
 if __name__ == "__main__":

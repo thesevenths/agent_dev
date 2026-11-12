@@ -467,9 +467,14 @@ def build_parser() -> argparse.ArgumentParser:
     lp.add_argument("--require-frozen-manifest", action="store_true",
                     default=False,
                     help="require the frozen dataset manifest to verify on disk")
+    lp.add_argument("--holdout-seeds", nargs="*", type=int, default=[],
+                    help="independent seeds for holdout confirmation of domain "
+                         "candidates (a clear contradiction downgrades to "
+                         "INCONCLUSIVE)")
     lp.add_argument("--state-path", default="",
-                    help="loop checkpoint path; resume an interrupted loop "
-                         "automatically when present")
+                    help="loop checkpoint path; defaults to "
+                         "<project-dir>/state/loop_state.json; resume an "
+                         "interrupted loop automatically when present")
     lp.set_defaults(func=cmd_loop)
     return p
 
@@ -483,18 +488,19 @@ def _build_real_domain_runner(domain: str):
     frozen dataset is unavailable, this raises rather than faking a number.
     """
     if domain == "embodied":
-        from .domains.embodied import embodied_compute
+        from .domains.embodied import embodied_compute, PRIMARY_METRIC
         compute = embodied_compute
-        primary_metric = "state_mse@1"
     elif domain == "quant":
-        from .domains.quant import quant_compute
+        from .domains.quant import quant_compute, PRIMARY_METRIC
         compute = quant_compute
-        primary_metric = "net_return_after_cost"
     else:
         raise SystemExit(
             f"no real engine runner wired for domain {domain!r}; the loop must "
             f"run the REAL engine, so scinet requires the SciNet++ engine to be "
             f"connected first (no FakeRunner is allowed)")
+    # Single source of truth: the domain module defines PRIMARY_METRIC, shared by
+    # the research task, the engine runner and the dual-layer RRSI decision.
+    primary_metric = PRIMARY_METRIC
     from pathlib import Path as _P
     import tempfile as _tf
     import yaml as _yaml
@@ -531,9 +537,14 @@ def cmd_loop(args: argparse.Namespace) -> int:
     """
     from .loop import run_loop
     from adaptive_runtime.harness_evolution import evolve
+    # A safe default checkpoint location: a dedicated file under the project dir,
+    # never the CWD (an empty --state-path previously resolved to the working
+    # directory, which is unsafe and easy to clobber).
+    state_path = args.state_path or str(
+        Path(args.project_dir) / "state" / "loop_state.json")
     runner = _build_real_domain_runner(args.domain)
     report = run_loop(
-        state_path=args.state_path,
+        state_path=state_path,
         domain=args.domain,
         baseline_config_path=args.baseline_config,
         project_dir=args.project_dir,
@@ -542,6 +553,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
         domain_seeds=tuple(args.seeds),
         domain_runner=runner,
         domain_require_frozen_manifest=args.require_frozen_manifest,
+        domain_holdout_seeds=tuple(args.holdout_seeds),
         harness_evolve=evolve,
         base_harness_tag=None,
     )

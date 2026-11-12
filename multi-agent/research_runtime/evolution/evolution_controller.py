@@ -17,6 +17,7 @@ accepted baseline.
 """
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -31,18 +32,38 @@ from .domain_evolver import (
 DomainRunner = Callable[[dict[str, Any]], float]
 
 
-def _decide_domain(rec: dict[str, Any]) -> CandidateStatus:
-    """Fixed, transparent decision for a single-knob domain candidate.
+#: Minimum number of VALID paired (base/candidate) runs required before a domain
+#: candidate can be ACCEPTED or REJECTED. Fewer than this is statistically
+#: meaningless (a single paired run cannot separate signal from noise) and is
+#: therefore INCONCLUSIVE -- never a fabricated verdict.
+MIN_VALID_SEEDS = 2
 
-    Missing runs never manufacture a gain (INCONCLUSIVE). A strictly positive
-    mean delta is ACCEPTED; otherwise REJECTED. The gate is outside the
-    candidate (F4) -- it never reads the candidate's own config.
+
+def _decide_domain(rec: dict[str, Any]) -> CandidateStatus:
+    """Fixed, transparent, direction-aware decision for one domain candidate.
+
+    Evidence hygiene (no fabricated verdicts):
+      * Any NaN / Inf / None / missing run (``n_invalid > 0``) is INCONCLUSIVE --
+        a failed or missing experiment is NOT "real degradation".
+      * Fewer than ``MIN_VALID_SEEDS`` valid paired runs is INCONCLUSIVE.
+      * Otherwise the sign of the DIRECTION-NORMALIZED ``mean_improvement`` decides
+        (positive == candidate is better). An independent holdout that clearly
+        contradicts the paired gain downgrades to INCONCLUSIVE.
+    A genuine negative improvement is REJECTED; it is never silently dropped.
     """
-    if any(d is None for d in rec["deltas"]):
+    n_valid = rec.get("n_valid") or 0
+    n_invalid = rec.get("n_invalid") or 0
+    if n_invalid > 0 or n_valid < MIN_VALID_SEEDS:
         return CandidateStatus.INCONCLUSIVE
-    if rec["mean_delta"] > 0.0:
-        return CandidateStatus.ACCEPTED
-    return CandidateStatus.REJECTED
+    mean = rec.get("mean_improvement")
+    if mean is None or not math.isfinite(mean):
+        return CandidateStatus.INCONCLUSIVE
+    # Independent holdout contradiction: the paired gain is not confirmed on
+    # unseen seeds -> the improvement is not trustworthy -> INCONCLUSIVE.
+    ho = rec.get("holdout_improvement")
+    if ho is not None and math.isfinite(ho) and mean > 0 and ho < -abs(mean) * 0.5:
+        return CandidateStatus.INCONCLUSIVE
+    return CandidateStatus.ACCEPTED if mean > 0 else CandidateStatus.REJECTED
 
 
 def _version_inheritance(harness_payload: dict[str, Any],
@@ -71,6 +92,7 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
                    domain_seeds: tuple[int, ...] = (42, 43),
                    domain_runner: DomainRunner | None = None,
                    domain_require_frozen_manifest: bool = True,
+                   domain_holdout_seeds: tuple[int, ...] = (),
                    harness_evolve: Callable[..., dict[str, Any]] = _harness_evolve
                    ) -> dict[str, Any]:
     """Run the two RRSI layers and return a combined, auditable payload."""
@@ -101,7 +123,8 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
                 project_dir=project_dir, campaign_id="dual_layer",
                 seeds=domain_seeds, dataset_version=dataset_version,
                 runner=domain_runner,
-                require_frozen_manifest=domain_require_frozen_manifest)
+                require_frozen_manifest=domain_require_frozen_manifest,
+                holdout_seeds=domain_holdout_seeds)
             registry.transition(c.hyp_fingerprint, CandidateStatus.EVALUATED,
                                record=rec)
             decision = _decide_domain(rec)
