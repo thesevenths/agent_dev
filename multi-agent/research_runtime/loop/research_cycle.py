@@ -49,6 +49,10 @@ def run_research_cycle(*, round_no: int, state: Any,
         "domain_require_frozen_manifest": domain_require_frozen_manifest,
         "domain_holdout_seeds": domain_holdout_seeds,
         "domain_runner": domain_runner,
+        # Each round is an isolated experiment: namespace the domain campaign dir
+        # by round so a changed baseline across rounds (domain overrides baked in)
+        # never collides with the previous round's baseline/candidate artifacts.
+        "domain_campaign_id": f"dual_layer_r{round_no}",
     }
     if harness_evolve is not None:
         kwargs["harness_evolve"] = harness_evolve

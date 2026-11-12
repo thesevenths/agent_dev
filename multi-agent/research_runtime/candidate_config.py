@@ -336,7 +336,14 @@ class CandidateConfigBuilder:
             if candidate["data"]["dataset_seed"] != baseline["data"]["dataset_seed"]:
                 raise CandidateConfigError("data.dataset_seed must not change")
 
-        # Isolated output directory; never overwrite an existing experiment.
+        # Isolated output directory. A genuine experiment is never overwritten,
+        # but a candidate is fully determined by (baseline config, overrides,
+        # seed): re-requesting the SAME inputs is legitimate and must reuse the
+        # existing directory. Two real cases demand this: (a) a multi-round loop
+        # that re-evaluates an identical domain candidate because its round-N
+        # REJECTION left the baseline unchanged, and (b) paired runs that share
+        # the same seeds. A *different* config at the same path is a genuine
+        # collision and is still rejected.
         campaign_base = (self.project_dir / self.campaign_root).resolve()
         directory = (campaign_base / campaign_id
                      / f"{candidate_id}_seed_{seed}").resolve()
@@ -345,15 +352,40 @@ class CandidateConfigBuilder:
         except ValueError as exc:
             raise CandidateConfigError(
                 "candidate directory escapes the campaign root") from exc
-        if directory.exists():
-            raise CandidateConfigError(
-                f"candidate directory already exists, refusing to overwrite: "
-                f"{directory}")
-        directory.mkdir(parents=True, exist_ok=False)
 
         config_bytes = yaml.safe_dump(
             candidate, sort_keys=False, allow_unicode=True
         ).encode("utf-8")
+        candidate_sha = sha256_bytes(config_bytes)
+
+        if directory.exists():
+            meta_path = directory / "metadata.json"
+            if not meta_path.is_file():
+                raise CandidateConfigError(
+                    f"candidate directory exists without metadata, refusing to "
+                    f"reuse: {directory}")
+            try:
+                existing = json.loads(
+                    meta_path.read_text(encoding="utf-8"))
+            except (ValueError, OSError) as exc:
+                raise CandidateConfigError(
+                    f"unreadable candidate metadata: {exc}") from exc
+            if existing.get("candidate_config_sha256") != candidate_sha:
+                raise CandidateConfigError(
+                    f"candidate directory exists with a different config "
+                    f"(hash mismatch), refusing to overwrite: {directory}")
+            out_config = directory / "config.yaml"
+            return CandidateArtifact(
+                directory=directory,
+                config_path=out_config,
+                config_relpath=out_config.relative_to(self.project_dir).as_posix(),
+                metadata_path=meta_path,
+                baseline_config_sha256=existing["baseline_config_sha256"],
+                candidate_config_sha256=existing["candidate_config_sha256"],
+                metadata=existing,
+            )
+        directory.mkdir(parents=True, exist_ok=False)
+
         out_config = directory / "config.yaml"
         out_config.write_bytes(config_bytes)
 
@@ -370,7 +402,7 @@ class CandidateConfigBuilder:
             "forbidden_roots": sorted(self.forbidden_roots),
             "baseline_config_path": baseline_relpath.as_posix(),
             "baseline_config_sha256": sha256_bytes(baseline_bytes),
-            "candidate_config_sha256": sha256_bytes(config_bytes),
+            "candidate_config_sha256": candidate_sha,
             "data_section_unchanged": True,
             "frozen_dataset": frozen,
         }

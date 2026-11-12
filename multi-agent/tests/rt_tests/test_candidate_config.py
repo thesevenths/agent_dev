@@ -227,8 +227,24 @@ class TestRejectedBuilds(CandidateConfigTestBase):
     def test_duplicate_directory_is_not_overwritten(self):
         first = self.build()
         before = first.config_path.read_bytes()
-        self._assert_rejected()
-        self.assertEqual(first.config_path.read_bytes(), before)
+        # Re-requesting the SAME deterministic candidate must REUSE the existing
+        # experiment (never overwrite it). The on-disk config must stay
+        # byte-identical and the returned artifact must point at the same
+        # directory. This mirrors build_baseline's idempotency and lets a
+        # multi-round loop (and a crash-resumed round) re-request an identical
+        # candidate without clobbering prior evidence. A *different* config at the
+        # same path still raises -- see test_collision_with_different_config.
+        second = self.build()
+        self.assertEqual(second.config_path.read_bytes(), before)
+        self.assertEqual(second.directory, first.directory)
+        self.assertEqual(second.candidate_config_sha256,
+                         first.candidate_config_sha256)
+
+    def test_collision_with_different_config(self):
+        # The same (campaign_id, candidate_id, seed) but a DIFFERENT override must
+        # still be rejected: it is a genuine collision, not a legitimate reuse.
+        self.build()
+        self._assert_rejected(overrides={"train.lr": 0.0005})
 
     def test_dataset_version_mismatch_is_rejected(self):
         self._assert_rejected(dataset_version="some-other-version")

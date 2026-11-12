@@ -93,6 +93,7 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
                    domain_runner: DomainRunner | None = None,
                    domain_require_frozen_manifest: bool = True,
                    domain_holdout_seeds: tuple[int, ...] = (),
+                   domain_campaign_id: str = "dual_layer",
                    harness_evolve: Callable[..., dict[str, Any]] = _harness_evolve
                    ) -> dict[str, Any]:
     """Run the two RRSI layers and return a combined, auditable payload."""
@@ -120,7 +121,7 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
             registry.transition(c.hyp_fingerprint, CandidateStatus.SANDBOXED)
             rec = evaluate_domain_candidate(
                 domain=domain, candidate=c, base_config=domain_base_config,
-                project_dir=project_dir, campaign_id="dual_layer",
+                project_dir=project_dir, campaign_id=domain_campaign_id,
                 seeds=domain_seeds, dataset_version=dataset_version,
                 runner=domain_runner,
                 require_frozen_manifest=domain_require_frozen_manifest,
