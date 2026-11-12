@@ -47,6 +47,7 @@ from .local_engine import (
     checkpoint_for_run,
     load_split,
     read_frozen_manifest,
+    record_checkpoint,
     sha256_bytes,
 )
 
@@ -198,6 +199,12 @@ def embodied_compute(config: dict[str, Any], spec: dict[str, Any],
         blob = json.dumps(checkpoint, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ckpt_path = job_dir / "checkpoint.json"
         ckpt_path.write_bytes(blob)
+        # Register the trained checkpoint so a later evaluate stage can resolve it
+        # by run_id (checkpoint_for_run) without scanning every job dir. Without
+        # this index the direct train->evaluate handoff (used by the dual-layer
+        # RRSI runner) cannot find the checkpoint and the round fails.
+        record_checkpoint(job_dir, run_id=str(spec.get("run_id") or job_dir.name),
+                         checkpoint_path=ckpt_path)
         return {
             "status": "succeeded",
             "metrics": {"train_mse": float(bias["train_mse"]),

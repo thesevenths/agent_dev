@@ -60,6 +60,12 @@ def run_loop(*, state_path: str | Path,
     rdl = run_dual_layer_fn or run_dual_layer
     inherit = harness_inherit_fn or default_harness_inherit
 
+    # A safe default checkpoint location: a dedicated file under the project dir.
+    # An empty/None path must never resolve to the CWD (which is unsafe and easy
+    # to clobber) -- this mirrors the CLI's default and protects library callers.
+    if not state_path:
+        state_path = str(Path(project_dir) / "state" / "loop_state.json")
+
     state, resumed = load_or_init(
         state_path=state_path,
         config={"domain": domain, "max_rounds": max_rounds,
