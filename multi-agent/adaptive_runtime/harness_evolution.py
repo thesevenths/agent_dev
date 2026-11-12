@@ -471,15 +471,19 @@ def evolve(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
             limit=4)
         if not candidates:
             break
-        # Append a DEGENERATE control in the first round. It is evaluated by
-        # the exact same paired protocol and must produce a real REJECT, so the
-        # artifact proves the loop is not rigged to accept. It is deliberately
-        # NOT counted toward the no-gain stop (it is not an improvement
-        # attempt), and is never confused with a genuine candidate.
+        # A DEGENERATE control in the first round, evaluated by the exact same
+        # paired protocol and MUST produce a real REJECT, so the artifact proves
+        # the loop is not rigged to accept. It is deliberately NOT counted toward
+        # the no-gain stop (it is not an improvement attempt) and is never
+        # confused with a genuine candidate.
+        # NB: PREPEND (not append). The no-gain stop can break the loop right
+        # after the last regular candidate, which would silently skip a trailing
+        # control and hide the falsification evidence. Evaluating it first
+        # guarantees it is always scored and surfaces as a real REJECT record.
         if round_no == 1 and include_degenerate_control:
-            candidates = list(candidates) + [
+            candidates = [
                 degenerate_control_candidate(base_harness=base_harness,
-                                             dominant=dominant)]
+                                             dominant=dominant)] + list(candidates)
         for candidate in candidates:
             if (time.time() - started) / 60.0 > max_minutes:
                 break
@@ -567,11 +571,14 @@ def evolve(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
     }
     blob = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False,
                       default=str).encode("utf-8")
-    payload["artifact_sha256"] = hashlib.sha256(blob).hexdigest()
-    name = (f"harness_evolution_{dominant}_"
-            f"{payload['artifact_sha256'][:12]}.json")
+    sha = hashlib.sha256(blob).hexdigest()
+    payload["artifact_sha256"] = sha
+    name = f"harness_evolution_{dominant}_{sha[:12]}.json"
     out = run_root / name
-    out.write_bytes(blob)
+    # Persist the FULL payload (incl. artifact_sha256) so downstream `verify`
+    # can read the provenance hash directly from the file, not just in-memory.
+    out.write_bytes(json.dumps(payload, indent=2, sort_keys=True,
+                               ensure_ascii=False, default=str).encode("utf-8"))
     payload["artifact_path"] = str(out)
     return payload
 
