@@ -36,14 +36,20 @@ def _assert_compatible(existing: LoopState, config: dict[str, Any],
     """
     checks = [
         ("domain", existing.domain, str(config.get("domain", ""))),
-        ("baseline_config_path", existing.baseline_config_path,
-         str(config.get("baseline_config_path", ""))),
         ("max_rounds", existing.max_rounds, int(config.get("max_rounds", 1))),
         ("dataset_version", existing.dataset_version,
          str(config.get("dataset_version", ""))),
         ("domain_seeds", list(existing.domain_seeds),
          list(config.get("domain_seeds") or ())),
+        ("base_harness_tag", existing.base_harness_tag,
+         str(config.get("base_harness_tag", ""))),
     ]
+    # NOTE: ``baseline_config_path`` is intentionally NOT checked here. The
+    # checkpoint's baseline_config_path is the INHERITED baseline (advanced by
+    # every accepted round via version inheritance), so it legitimately differs
+    # from the original baseline passed at loop start. On resume the loop uses the
+    # checkpoint's own baseline_config_path; the freshly-passed argument is only
+    # the seed value for a fresh start and must not reject a valid resume.
     mismatches = [f"{k}: checkpoint={a!r} != requested={b!r}"
                   for k, a, b in checks if a != b]
     if mismatches:
