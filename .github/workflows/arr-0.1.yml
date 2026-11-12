@@ -90,10 +90,25 @@ jobs:
             "sqlalchemy>=2.0" "requests>=2.0" "psycopg[binary]>=3.1"
 
       - name: Run ARR 0.1 integration suite
+        # Capture the log and re-publish failure lines as workflow annotations:
+        # job logs require repo admin to download, so without this a red matrix
+        # is undiagnosable from the public API. On success this is a no-op.
         run: |
+          set +e
           python -m pytest tests/rt_tests/ adaptive_runtime/tests/ -q \
             -p no:cacheprovider \
             --deselect adaptive_runtime/tests/test_selftest_e2e.py \
             --deselect "adaptive_runtime/tests/test_benchmark.py::TestFakeDoesNotPollute::test_real_mode_does_write" \
             --deselect "adaptive_runtime/tests/test_evolution_version.py::TestRC3StallForcedL3::test_dominant_l1_exhausted_forces_l3" \
-            --deselect "adaptive_runtime/tests/test_landing_roundtrip.py::TestLiveValue::test_falls_back_to_user_area_when_absent"
+            --deselect "adaptive_runtime/tests/test_landing_roundtrip.py::TestLiveValue::test_falls_back_to_user_area_when_absent" \
+            > arr_pytest.log 2>&1
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            grep -E "^(FAILED |ERROR |E   |[0-9]+ failed)|ModuleNotFoundError|ImportError|AssertionError" arr_pytest.log \
+              | tail -40 \
+              | while IFS= read -r line; do echo "::error::$line"; done
+            tail -60 arr_pytest.log
+          else
+            tail -5 arr_pytest.log
+          fi
+          exit "$rc"
