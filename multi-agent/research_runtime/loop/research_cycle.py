@@ -26,6 +26,9 @@ def run_research_cycle(*, round_no: int, state: Any,
                         domain_require_frozen_manifest: bool,
                         domain_holdout_seeds: tuple[int, ...] = (),
                         harness_evolve: Callable[..., dict[str, Any]] | None,
+                        base_harness: Any = None,
+                        harness_tasks: list[Any] | None = None,
+                        harness_heldout_task: Any = None,
                         extra: dict[str, Any] | None = None) -> dict[str, Any]:
     """Execute one round and return the dual-layer payload.
 
@@ -34,9 +37,12 @@ def run_research_cycle(*, round_no: int, state: Any,
     starting point so version inheritance is visible end-to-end.
     """
     kwargs: dict[str, Any] = {
-        "base_harness": state.base_harness_tag or None,
-        "tasks": [],
-        "heldout_task": None,
+        # The harness layer runs the REAL research-harness evolution. A genuine
+        # run supplies a concrete base_harness object and real research tasks plus
+        # an independent held-out task; a recording-only / stub caller passes None.
+        "base_harness": base_harness,
+        "tasks": list(harness_tasks) if harness_tasks else [],
+        "heldout_task": harness_heldout_task,
         "run_root": str(Path(project_dir) / f"round_{round_no}"),
         "repo_root": str(Path(project_dir)),
         "rounds": 1,

@@ -532,8 +532,12 @@ def cmd_loop(args: argparse.Namespace) -> int:
     Runs the dual-layer RRSI for ``--rounds`` rounds; the next round inherits the
     version the previous round ACCEPTED (domain config baked into a new baseline,
     harness patches applied via the real patch primitive), and a crashed process
-    resumes from the last completed round. The domain engine is REAL -- a missing
-    frozen dataset or engine fails loudly, never silently.
+    resumes from the last completed round. BOTH layers run REAL experiments:
+      * DOMAIN MODEL -- the real engine (Embodied simulator / Quant backtest).
+      * RESEARCH HARNESS -- the real ``adaptive_runtime.harness_evolution.evolve``
+        on genuine research tasks, with an independent held-out task that never
+        participates in candidate selection. A missing frozen dataset or engine
+        fails loudly, never silently.
     """
     from .loop import run_loop
     from adaptive_runtime.harness_evolution import evolve
@@ -543,6 +547,17 @@ def cmd_loop(args: argparse.Namespace) -> int:
     state_path = args.state_path or str(
         Path(args.project_dir) / "state" / "loop_state.json")
     runner = _build_real_domain_runner(args.domain)
+    # Genuine harness layer: real base harness + real research tasks + an
+    # independent held-out task (cross-domain, so a harness improvement that only
+    # helps THIS domain cannot be accepted on the held-out evidence).
+    from .arr_runtime import BASE_HARNESS, NEGATIVE_HARNESS
+    heldout_domain = "quant" if args.domain != "quant" else "embodied"
+    tasks = [_task_for(args.domain, seeds=[42, 43, 44]),
+             _task_for(args.domain, seeds=[50, 51, 52])]
+    for t in tasks:
+        t.budget["experiments"] = 4
+    heldout = _task_for(heldout_domain, seeds=[60, 61, 62])
+    heldout.budget["experiments"] = 4
     report = run_loop(
         state_path=state_path,
         domain=args.domain,
@@ -555,7 +570,12 @@ def cmd_loop(args: argparse.Namespace) -> int:
         domain_require_frozen_manifest=args.require_frozen_manifest,
         domain_holdout_seeds=tuple(args.holdout_seeds),
         harness_evolve=evolve,
-        base_harness_tag=None,
+        base_harness=BASE_HARNESS,
+        harness_tasks=tasks,
+        harness_heldout_task=heldout,
+        base_harness_tag=BASE_HARNESS.fingerprint(),
+        extra={"rounds": 1, "max_minutes": 1.0,
+               "negative_harness": NEGATIVE_HARNESS},
     )
     print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
     return 0 if report.get("status") == "completed" else 1
