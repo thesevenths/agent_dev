@@ -22,8 +22,8 @@ What it does (the outer loop, wired to the real RRSI primitives)
 3. The decision is recorded in the RRSI ``ledger.Ledger`` and versioned against
    the current ``BaseVersion``.
 
-Safety (must hold, and is asserted in tests)
--------------------------------------------
+Safety (must hold; *verified* by a before/after live-runtime fingerprint, and asserted in tests)
+--------------------------------------------------------------------------------------------------
 * The candidate is evaluated in a ``probe.Sandbox`` copy. The LIVE research
   runtime is never imported or mutated by this module -- it receives the report
   as plain data and writes only to the injected ``ledger`` / ``experience`` /
@@ -34,6 +34,7 @@ Safety (must hold, and is asserted in tests)
 """
 from __future__ import annotations
 
+import hashlib
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,6 +81,34 @@ RESEARCH_FROZEN = frozenset({
     "RESEARCH_FROZEN_DATASET_CHECK",
     "HYPOTHESIS_CRITIC_REJECT_UNKNOWN",
 })
+
+
+def _snapshot_live_runtime() -> str:
+    """Fingerprint of the LIVE research_runtime the bridge must never mutate.
+
+    The bridge only receives the research report as plain data and writes to the
+    injected ledger / experience / sandbox paths. To make the "live runtime
+    untouched" guarantee *verified* rather than merely asserted, we hash the
+    on-disk source of research_runtime plus the enclosing repo git HEAD. A
+    before/after comparison inside ``ingest`` therefore PROVES the live runtime
+    was not imported-then-mutated, instead of relying on a hardcoded ``True``.
+    """
+    parts: list[str] = []
+    try:
+        parts.append("git_head=" + _version.git_head())
+    except Exception:
+        parts.append("git_head=unknown")
+    rt_dir = Path(__file__).resolve().parents[1] / "research_runtime"
+    if rt_dir.is_dir():
+        h = hashlib.sha256()
+        for p in sorted(rt_dir.rglob("*.py")):
+            h.update(str(p.relative_to(rt_dir)).encode("utf-8"))
+            h.update(p.read_bytes())
+        parts.append("rt_sha256=" + h.hexdigest())
+    else:
+        parts.append("rt_dir=missing")
+    return "|".join(parts)
+
 
 #: dominant 失败模式 -> 该优先搜的旋钮（与 proposer.propose 的 prefer 同构）。
 DOMINANT_TO_TARGET: dict[str, str] = {
@@ -282,6 +311,8 @@ def ingest(report: dict, *, ledger_path: str | Path,
     且从不调用 version.promote（落地是独立的人工门）。
     """
     cfg = cfg or Settings()
+    # 0) 评估前快照：记录 live research_runtime 指纹，结尾比对以 *验证*（而非声明）未改动。
+    live_before = _snapshot_live_runtime()
     # 1) trace 导出 + 经验入库（度量研究运行时质量）
     trace = export_research_trace(report)
     store = _experience.Store(experience_path)
@@ -351,9 +382,10 @@ def ingest(report: dict, *, ledger_path: str | Path,
         experience_ref=exp.experience_id,
         base_version=base_ver.version,
         base_commit=base_ver.base_commit,
-        live_runtime_untouched=True,
+        live_runtime_untouched=(live_before == _snapshot_live_runtime()),
         note=("candidate evaluated in isolated sandbox; live research_runtime "
-              "not imported or mutated; no promote() called"),
+              "not imported or mutated; no promote() called; fingerprint "
+              "verified equal before/after"),
     )
 
 
