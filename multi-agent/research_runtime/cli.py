@@ -190,23 +190,115 @@ def _latest(pattern: str) -> str:
     return str(files[-1])
 
 
+def _base_state() -> dict:
+    p = WORKSPACE_ROOT / "experiments" / "base_state.json"
+    if p.is_file():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _discover_artifact(*, role: str, explicit: str, bundle_dir: str,
+                       preferred_sha: str | None) -> tuple[str, str]:
+    """Robust artifact discovery (P0-3): prefer an explicit path, then the
+    committed evidence bundle, then base_state.json's referenced path, then a
+    broad glob. Returns (path, source_label). Raises if nothing is found."""
+    candidates: list[tuple[str, str]] = []
+    if explicit:
+        candidates.append((explicit, "explicit"))
+    if bundle_dir:
+        pat = f"{bundle_dir}/raw/*{role}*.json"
+        hits = sorted(WORKSPACE_ROOT.glob(pat), key=lambda x: x.stat().st_mtime,
+                      reverse=True)
+        for h in hits:
+            candidates.append((str(h), "evidence-bundle"))
+    # base_state.json referenced committed path (P0-3 fix).
+    for f in (_base_state().get("evidence_bundle_files") or []):
+        if f.get("role") == role and f.get("committed_path"):
+            candidates.append((str(WORKSPACE_ROOT / f["committed_path"]),
+                              "base_state.json"))
+    # Broad glob catches both arr_1_0_evolve/ and arr_1_0_evolve_r3/.
+    glob_pat = (f"experiments/arr_1_0_benchmark*/{role}_*.json" if role == "benchmark"
+                else f"experiments/arr_1_0_evolve*/{role}_*.json")
+    hits = sorted(WORKSPACE_ROOT.glob(glob_pat), key=lambda x: x.stat().st_mtime,
+                  reverse=True)
+    for h in hits:
+        candidates.append((str(h), f"glob:{glob_pat}"))
+
+    if not candidates:
+        raise SystemExit(f"no {role} artifact found under {WORKSPACE_ROOT}")
+    # If a preferred sha is known, prefer the candidate whose content matches.
+    for path, src in candidates:
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if preferred_sha and data.get("artifact_sha256") == preferred_sha:
+            return path, src
+    # Otherwise the first existing, parseable candidate (most recent preferred).
+    for path, src in candidates:
+        if Path(path).is_file():
+            return path, src
+    raise SystemExit(f"no readable {role} artifact among {len(candidates)} candidates")
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Check the 13 ARR 1.0 acceptance criteria against REAL artifacts.
 
     Nothing is declared from memory: every row is derived from a saved
     benchmark / evolution / CI artifact, and a missing artifact fails loudly.
+    Artifact discovery is robust (P0-3): explicit path > committed evidence
+    bundle > base_state.json reference > broad glob. A P0-3 row also confirms
+    the canonical artifact referenced by base_state.json is actually present
+    and its SHA-256 matches.
     """
-    bench = json.loads(Path(args.benchmark or _latest(
-        "experiments/arr_1_0_benchmark/arr_1_0_benchmark_*.json")).read_text(
-            encoding="utf-8"))
-    evo = json.loads(Path(args.evolution or _latest(
-        "experiments/arr_1_0_evolve/harness_evolution_*.json")).read_text(
-            encoding="utf-8"))
+    bundle_dir = args.bundle or ""
+    pref_sha = None
+    bs = _base_state()
+    for f in (bs.get("evidence_bundle_files") or []):
+        if f.get("role") == "evolution" and f.get("sha256"):
+            pref_sha = f["sha256"]
+            break
+
+    bench_path, bench_src = _discover_artifact(
+        role="benchmark", explicit=args.benchmark, bundle_dir=bundle_dir,
+        preferred_sha=None)
+    evo_path, evo_src = _discover_artifact(
+        role="evolution", explicit=args.evolution, bundle_dir=bundle_dir,
+        preferred_sha=pref_sha)
+    bench = json.loads(Path(bench_path).read_text(encoding="utf-8"))
+    evo = json.loads(Path(evo_path).read_text(encoding="utf-8"))
     results = {r.get("domain"): r for r in bench.get("results", [])
                if isinstance(r, dict)}
     recs = evo.get("records", [])
     accepted = [r for r in recs if r.get("decision") == "ACCEPT"]
     rejected = [r for r in recs if r.get("decision") == "REJECT"]
+
+    # ---- P0-3: the canonical artifact referenced by base_state.json must be
+    # retrievable on disk AND its on-disk SHA-256 must match the committed hash
+    # (no silent substitution; the artifact is now committed in the bundle). ----
+    retrievable = Path(evo_path).is_file()
+    from research_runtime.evidence_verifier import sha256_file
+    on_disk_sha = sha256_file(evo_path)
+    sha_ok = retrievable and (pref_sha is None or on_disk_sha == pref_sha)
+    # ---- D4: if a committed evidence bundle is referenced, verify its internal
+    # self-consistency (every file in evidence_hashes.json matches on disk). ----
+    bundle_ok = True
+    bundle_note = "no evidence bundle referenced"
+    if bs.get("evidence_bundle"):
+        from research_runtime.evidence_verifier import EvidenceVerifier
+        bpath = WORKSPACE_ROOT / bs["evidence_bundle"]
+        if bpath.is_dir():
+            vr = EvidenceVerifier().verify_bundle_integrity(bpath)
+            bundle_ok = vr.all_passed()
+            vd = vr.as_dict()
+            bundle_note = (f"{vd['n_passed']}/{vd['n_checks']} bundle files match"
+                           if bundle_ok else "bundle hash mismatch")
+        else:
+            bundle_ok = False
+            bundle_note = "evidence bundle dir missing"
 
     def _domain_ok(name: str) -> bool:
         r = results.get(name) or {}
@@ -278,12 +370,20 @@ def cmd_verify(args: argparse.Namespace) -> int:
         ci_note = line[-1].strip()[-120:] if line else "no pytest summary found"
     checks.append(("13 CI 通过，真实/Fake 分明", ci_ok, ci_note))
 
+    # ---- P0-3 + D4: evidence retrievability & bundle integrity (not a numbered
+    # acceptance row but a guard the user explicitly required). These precede the
+    # CI row so a missing/corrupt canonical artifact fails the whole verify. ----
+    checks.insert(0, ("P0-3 基线证据可检索且 SHA 一致",
+                      bool(retrievable and sha_ok),
+                      f"evo_src={evo_src} sha_match={sha_ok}"))
+    checks.insert(1, ("D4 证据包自洽", bool(bundle_ok), bundle_note))
+
     for label, ok, note in checks:
         print(f"[{'PASS' if ok else 'FAIL'}] {label} -- {note}")
     n_pass = sum(1 for _, ok, _ in checks if ok)
     print(f"\nARR 1.0 acceptance: {n_pass}/{len(checks)} "
-          f"from real artifacts (benchmark={bench.get('artifact_sha256', '')[:12]}, "
-          f"evolution={evo.get('artifact_sha256', '')[:12]})")
+          f"from real artifacts (benchmark={bench.get('artifact_sha256', '')[:12]}"
+          f"@{bench_src}, evolution={evo.get('artifact_sha256', '')[:12]}@{evo_src})")
     return 0 if n_pass == len(checks) else 1
 
 
@@ -348,6 +448,9 @@ def build_parser() -> argparse.ArgumentParser:
     ver = sub.add_parser("verify", help="check the 13 acceptance criteria")
     ver.add_argument("--benchmark", default="")
     ver.add_argument("--evolution", default="")
+    ver.add_argument("--bundle", default="",
+                     help="path to a committed evidence bundle dir "
+                          "(e.g. experiments/releases/arr_1_0_r1)")
     ver.add_argument("--ci-log", default="")
     ver.set_defaults(func=cmd_verify)
     return p

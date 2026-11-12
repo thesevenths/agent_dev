@@ -37,6 +37,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Protocol, runtime_checkable
 
+from .evidence_verifier import EvidenceVerifier
+
 QUALITY_PROTOCOL_VERSION = "arr-1.0-quality-v1"
 
 #: Fields a Harness / Domain candidate may NEVER modify. The evaluation
@@ -265,6 +267,16 @@ class DefaultResearchQualityEvaluator:
                 for r in results)
         else:
             checks["engine_results_have_real_metrics"] = False
+        # D3/P0-2: recompute hashes from ACTUAL content instead of trusting the
+        # mere presence of a hash field. Only checks that actually recomputed
+        # something are folded in, so legacy hash-only reports stay green while
+        # every new artifact is upgraded to real verification (and tampering is
+        # caught when raw content is present but the hash does not match).
+        if ev.report:
+            vr = EvidenceVerifier().verify_report(ev.report,
+                                                 only_verifiable=True)
+            for c in vr.checks:
+                checks[f"V.{c.name}"] = bool(c.passed)
         return _fraction(checks.values()), checks
 
     def _reproducibility(self, ev: QualityEvidence) -> tuple[float, dict[str, bool]]:

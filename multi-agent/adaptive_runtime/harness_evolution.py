@@ -335,12 +335,19 @@ def evaluate_candidate(*, base_harness: Any, cand_harness: Any,
         value = (run.get("quality") or {}).get("Q")
         return float(value) if isinstance(value, (int, float)) else None
 
-    # A FAILED arm is incomplete evidence, never a silently imputed zero.
-    incomplete_arms = sum(
-        1 for r in (base_results + cand_results) if _q(r) is None)
-    base_Q = [_q(r) if _q(r) is not None else 0.0 for r in base_results]
-    cand_Q = [_q(r) if _q(r) is not None else 0.0 for r in cand_results]
-    deltas = [round(c - b, 6) for b, c in zip(base_Q, cand_Q)]
+    # D2 (P0-1): NEVER impute a missing experiment metric as zero. A failed /
+    # missing arm is incomplete evidence, not a silently zero-scored run. We
+    # keep None so the gate's evidence_complete / min_tasks checks fail CLOSED,
+    # and so a Base/Candidate arm that crashed cannot manufacture a fake gain.
+    incomplete_arms = sum(1 for r in (base_results + cand_results)
+                          if _q(r) is None)
+    base_Q = [_q(r) for r in base_results]
+    cand_Q = [_q(r) for r in cand_results]
+    # Deltas ONLY over COMPLETE pairs; task_deltas feeds the paired t-test and
+    # must never contain imputed zeros (a None pair would drag the mean toward
+    # zero and manufacture a spurious improvement).
+    deltas = [round(c - b, 6) for b, c in zip(base_Q, cand_Q)
+              if b is not None and c is not None]
     record.base_Q, record.cand_Q, record.task_deltas = base_Q, cand_Q, deltas
 
     # Independent held-out task: NEVER part of gate_b's task_deltas.
@@ -350,13 +357,16 @@ def evaluate_candidate(*, base_harness: Any, cand_harness: Any,
                          experience_path=experience_path)
     hold_base_q, hold_cand_q = _q(hold_base), _q(hold_cand)
     incomplete_arms += sum(1 for q in (hold_base_q, hold_cand_q) if q is None)
-    h_delta = round((hold_cand_q or 0.0) - (hold_base_q or 0.0), 6)
+    # D2: holdout delta is None when either arm is missing -- a missing holdout
+    # is NOT a confirmed improvement and must NOT pass the holdout gate.
+    h_delta = (round(hold_cand_q - hold_base_q, 6)
+               if hold_base_q is not None and hold_cand_q is not None else None)
     record.holdout = {
         "task_id": heldout_task.task_id, "domain": heldout_task.domain,
         "base_Q": hold_base_q,
         "cand_Q": hold_cand_q,
         "delta": h_delta,
-        "confirmed": h_delta > 0.0,
+        "confirmed": h_delta is not None and h_delta > 0.0,
         "holdout_used_for_selection": False,
         "base_result_path": hold_base["provenance"].get("result_path"),
         "cand_result_path": hold_cand["provenance"].get("result_path"),
@@ -368,11 +378,24 @@ def evaluate_candidate(*, base_harness: Any, cand_harness: Any,
                        experience_path=experience_path)
         neg_q = _q(neg)
         incomplete_arms += 1 if neg_q is None else 0
-        neg_delta = round((neg_q or 0.0) - (hold_base_q or 0.0), 6)
+        # D1/P0-1: keep None when the negative arm is missing; never impute zero.
+        neg_delta = (round(neg_q - hold_base_q, 6)
+                     if neg_q is not None and hold_base_q is not None else None)
+        # A negative control is GENUINELY rejected only when it shows real,
+        # non-trivial degradation versus Base. INCONCLUSIVE (missing, or within
+        # noise) MUST NOT be counted as a successful rejection; an ACCEPTED
+        # negative control means the loop is rigged and must fail closed.
+        NEG_REJECT_MARGIN = 0.01
+        NEG_ACCEPT_MARGIN = 0.01
         record.negative_control = {
             "harness_sha256": negative_harness.fingerprint(),
             "Q": neg_q, "delta_vs_base": neg_delta,
-            "not_accepted": neg_delta <= 0.0,
+            "rejected": (neg_delta is not None
+                         and neg_delta < -NEG_REJECT_MARGIN),
+            "accepted": (neg_delta is not None
+                         and neg_delta > NEG_ACCEPT_MARGIN),
+            "not_accepted": (neg_q is None or hold_base_q is None
+                             or neg_delta <= 0.0),
             "outcome": neg["outcome"],
         }
 
@@ -401,19 +424,31 @@ def evaluate_candidate(*, base_harness: Any, cand_harness: Any,
     # A candidate that wins the paired test but FAILS the independent held-out
     # task (or where the negative control was accepted) is NOT accepted.
     holdout_ok = bool(record.holdout.get("confirmed"))
-    negative_ok = (not record.negative_control
-                   or bool(record.negative_control.get("not_accepted")))
+    # D1/P0-1: the negative / degenerate control must NOT have been genuinely
+    # ACCEPTED. An accepted negative control proves the loop is rigged, so the
+    # candidate cannot be accepted (fail closed). INCONCLUSIVE is NOT treated as
+    # a successful rejection -- it merely leaves the loop-integrity claim
+    # unproven for THIS candidate (the run-level negative_controls_rejected
+    # count requires a genuine REJECT from the degenerate-control record).
+    negative_ok = not bool(record.negative_control.get("accepted"))
     if dec_b.accepted and holdout_ok and negative_ok:
         record.decision = "ACCEPT"
         record.reason = "paired improvement confirmed on independent task"
     elif dec_b.accepted and (not holdout_ok or not negative_ok):
         record.decision = "INCONCLUSIVE"
         record.reason = ("paired improvement did not survive holdout / "
-                         "negative control")
+                         "negative control was accepted (loop integrity broken)")
     else:
-        record.decision = "REJECT" if any(
-            d < 0 and abs(d) > 0.01 for d in deltas) else "INCONCLUSIVE"
-        record.reason = gate.explain(dec_b)
+        # dec_b was rejected. If evidence is INCOMPLETE (a missing/failed arm)
+        # we cannot conclude a genuine regression -- that is INCONCLUSIVE, not a
+        # refutation. Only a complete, negatively-signed result is a REJECT.
+        if missing > 0:
+            record.decision = "INCONCLUSIVE"
+            record.reason = "incomplete evidence; inconclusive, not refuted"
+        else:
+            record.decision = "REJECT" if any(
+                d < 0 and abs(d) > 0.01 for d in deltas) else "INCONCLUSIVE"
+            record.reason = gate.explain(dec_b)
     record.ledger_fingerprint = candidate.hyp_fingerprint
     record.evidence = {
         "A_base": A_base, "A_cand": A_cand,
