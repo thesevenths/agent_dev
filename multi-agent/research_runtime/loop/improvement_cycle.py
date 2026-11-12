@@ -27,7 +27,8 @@ from .version_inheritance import bake_baseline
 def derive_next_version(*, state: LoopState, payload: dict[str, Any],
                         project_dir: str | Path,
                         harness_inherit_fn: Callable[[list[dict[str, Any]], Any], Any]
-                        | None = None
+                        | None = None,
+                        base_harness_object: Any = None
                         ) -> tuple[LoopState, VersionRecord | None, str | None]:
     """Update ``state`` with the accepted version and return (state, record, next_baseline).
 
@@ -44,7 +45,7 @@ def derive_next_version(*, state: LoopState, payload: dict[str, Any],
         harness_layer.get("accepted") or [])
 
     if not accepted_domain and not accepted_harness:
-        return state, None, None
+        return state, None, None, None
 
     # ---- accumulate domain overrides (union; later rounds stack on earlier) ----
     new_overrides: dict[str, Any] = {}
@@ -54,9 +55,20 @@ def derive_next_version(*, state: LoopState, payload: dict[str, Any],
     # ---- harness inheritance (real, via injected fn) ----
     next_base_harness = state.base_harness_tag
     accepted_harness_targets: list[str] = []
+    patched_object: Any = None
     if accepted_harness and harness_inherit_fn is not None:
-        next_base_harness = harness_inherit_fn(accepted_harness,
-                                              state.base_harness_tag)
+        # Prefer the concrete in-memory harness object (the loop tracks it across
+        # rounds); fall back to the persisted string tag for recording-only /
+        # stub callers that never supplied a real harness.
+        inherit_src = (base_harness_object
+                       if base_harness_object is not None else state.base_harness_tag)
+        patched = harness_inherit_fn(accepted_harness, inherit_src)
+        patched_object = patched  # returned to the controller for in-memory threading
+        # The inherit fn returns either the concrete patched harness object (real
+        # harnesses) or a string tag (recording-only). Persist a stable string
+        # identifier for recovery / reporting.
+        next_base_harness = (patched.fingerprint() if hasattr(patched, "fingerprint")
+                             else str(patched))
         accepted_harness_targets = [
             (rec.get("candidate") or {}).get("target", "") for rec in accepted_harness]
 
@@ -92,4 +104,4 @@ def derive_next_version(*, state: LoopState, payload: dict[str, Any],
     state.version_history.append(record)
     if next_baseline is not None:
         state.baseline_config_path = next_baseline
-    return state, record, next_baseline
+    return state, record, next_baseline, patched_object
