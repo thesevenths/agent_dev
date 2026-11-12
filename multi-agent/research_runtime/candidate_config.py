@@ -455,9 +455,39 @@ class CandidateConfigBuilder:
             raise CandidateConfigError(
                 "baseline directory escapes the campaign root") from exc
         if directory.exists():
-            raise CandidateConfigError(
-                f"baseline directory already exists, refusing to overwrite: "
-                f"{directory}")
+            # A baseline is deterministic given (baseline config, seed); it is
+            # legitimately shared across every candidate in a campaign and may
+            # therefore be requested more than once (e.g. a dual-layer RRSI run
+            # that evaluates several domain candidates against the same seeds).
+            # Reuse it ONLY when its recorded source hash proves it was produced
+            # from the SAME baseline config -- a different baseline at this path
+            # is a genuine collision and is still rejected.
+            meta_path = directory / "metadata.json"
+            if not meta_path.is_file():
+                raise CandidateConfigError(
+                    f"baseline directory exists without metadata, refusing to "
+                    f"reuse: {directory}")
+            try:
+                existing = json.loads(
+                    meta_path.read_text(encoding="utf-8"))
+            except (ValueError, OSError) as exc:
+                raise CandidateConfigError(
+                    f"unreadable baseline metadata: {exc}") from exc
+            if existing.get("baseline_config_sha256") != sha256_bytes(baseline_bytes):
+                raise CandidateConfigError(
+                    f"baseline directory exists with a different baseline "
+                    f"config (hash mismatch), refusing to overwrite: "
+                    f"{directory}")
+            out_config = directory / "config.yaml"
+            return CandidateArtifact(
+                directory=directory,
+                config_path=out_config,
+                config_relpath=out_config.relative_to(self.project_dir).as_posix(),
+                metadata_path=meta_path,
+                baseline_config_sha256=existing["baseline_config_sha256"],
+                candidate_config_sha256=existing["candidate_config_sha256"],
+                metadata=existing,
+            )
         directory.mkdir(parents=True, exist_ok=False)
 
         config_bytes = yaml.safe_dump(
