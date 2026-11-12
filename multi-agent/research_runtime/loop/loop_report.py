@@ -13,6 +13,11 @@ from .loop_state import LoopState
 
 def build_loop_report(state: LoopState) -> dict[str, Any]:
     n_rounds = len(state.version_history)
+    # rounds_completed == number of rounds that produced an ACCEPTED version
+    # (the version history only records accepted rounds). rounds_executed counts
+    # EVERY round that actually ran (including honest REJECT/INCONCLUSIVE), read
+    # from the checkpoint's last_completed_round -- so a rejected round is still a
+    # completed round, not silently dropped or inflated.
     return {
         "schema_version": "arr-1.1-loop-report-v1",
         "loop_id": state.loop_id,
@@ -20,6 +25,7 @@ def build_loop_report(state: LoopState) -> dict[str, Any]:
         "status": state.status,
         "rounds_requested": state.max_rounds,
         "rounds_completed": n_rounds,
+        "rounds_executed": state.last_completed_round,
         "final_baseline_config_path": state.baseline_config_path,
         "final_accepted_domain_overrides": dict(state.accepted_domain_overrides),
         "n_domain_accepted_total": state.n_domain_accepted,
