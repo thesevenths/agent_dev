@@ -44,6 +44,9 @@ def run_loop(*, state_path: str | Path,
              harness_evolve: Callable[..., dict[str, Any]] | None = None,
              harness_inherit_fn: Callable[[list[dict[str, Any]], Any], Any]
              | None = None,
+             base_harness: Any = None,
+             harness_tasks: list[Any] | None = None,
+             harness_heldout_task: Any = None,
              stop_on_no_accept: bool = True,
              base_harness_tag: Any = None,
              loop_id: str = "",
@@ -66,11 +69,18 @@ def run_loop(*, state_path: str | Path,
     if not state_path:
         state_path = str(Path(project_dir) / "state" / "loop_state.json")
 
+    # Derive a stable string identifier for the harness layer from a supplied
+    # concrete harness object (the loop tracks the object in memory; only its
+    # fingerprint is persisted for recovery checks).
+    if base_harness_tag is None and base_harness is not None and hasattr(
+            base_harness, "fingerprint"):
+        base_harness_tag = base_harness.fingerprint()
+
     state, resumed = load_or_init(
         state_path=state_path,
         config={"domain": domain, "max_rounds": max_rounds,
                 "baseline_config_path": str(baseline_config_path),
-                "base_harness_tag": "" if base_harness_tag is None else "",
+                "base_harness_tag": "" if base_harness_tag is None else str(base_harness_tag),
                 "loop_id": loop_id,
                 "dataset_version": dataset_version,
                 "domain_seeds": list(domain_seeds)})
@@ -86,6 +96,11 @@ def run_loop(*, state_path: str | Path,
     project_dir = Path(project_dir)
     project_dir.mkdir(parents=True, exist_ok=True)
 
+    # Concrete base harness object, tracked in memory across rounds (JSON state
+    # stores only its fingerprint string). None means a recording-only / stub
+    # caller -- harness inheritance then stays a string tag.
+    current_base_harness = base_harness
+
     try:
         while state.current_round <= state.max_rounds:
             payload = run_research_cycle(
@@ -95,14 +110,26 @@ def run_loop(*, state_path: str | Path,
                 domain_runner=domain_runner,
                 domain_require_frozen_manifest=domain_require_frozen_manifest,
                 domain_holdout_seeds=domain_holdout_seeds,
-                harness_evolve=harness_evolve, extra=extra)
+                harness_evolve=harness_evolve,
+                base_harness=current_base_harness,
+                harness_tasks=harness_tasks,
+                harness_heldout_task=harness_heldout_task,
+                extra=extra)
             _record_payload_sha(state, payload)
 
             # Ingest this round's accepted results (bakes domain overrides into a
             # new baseline; threads harness patches) BEFORE advancing the counter.
-            state, record, _next_baseline = derive_next_version(
+            state, record, _next_baseline, next_harness_obj = derive_next_version(
                 state=state, payload=payload, project_dir=project_dir,
-                harness_inherit_fn=inherit)
+                harness_inherit_fn=inherit,
+                base_harness_object=current_base_harness)
+            # Genuine harness inheritance: carry the concrete patched harness
+            # object returned by derive_next_version into the next round (never a
+            # phantom / recording-only tag). The inherit fn is invoked exactly
+            # ONCE per round, inside derive_next_version -- we must not call it
+            # again here.
+            if record is not None and next_harness_obj is not None:
+                current_base_harness = next_harness_obj
             # Tally accepted totals for the report (recomputed from the version
             # history so a resume does not double-count).
             state.n_domain_accepted = sum(
