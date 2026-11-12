@@ -329,16 +329,32 @@ class TestNegativeControlAndMissingData(unittest.TestCase):
         self.assertGreaterEqual(rec.evidence["missing_runs"], 1)
 
     def test_inconclusive_negative_control_is_not_a_reject(self):
-        """P0-1 / D1: INCONCLUSIVE must NEVER count as a successful rejection."""
+        """D-Fix / Problem A: INCONCLUSIVE must NEVER count as a rejection, and
+        an inconclusive control must FORBID acceptance of a paired-improving
+        candidate (loop integrity is left unproven, so accept is forbidden)."""
         with tempfile.TemporaryDirectory() as tmp:
             rec = self._eval(0.85, 0.90, 0.85, tmp=tmp)  # neg == base
         nc = rec.negative_control
         self.assertEqual(nc["rejected"], False)
         self.assertEqual(nc["accepted"], False)
         self.assertEqual(nc["not_accepted"], True)
-        # The loop-integrity claim is simply left UNPROVEN for this candidate;
-        # a genuinely improving candidate may still ACCEPT on the holdout.
         self.assertNotEqual(nc["rejected"], True)
+        # D-Fix: the candidate must NOT be accepted when its negative control
+        # was inconclusive (within noise) -- that is the core hardening.
+        self.assertNotEqual(rec.decision, "ACCEPT")
+        self.assertEqual(rec.decision, "INCONCLUSIVE")
+
+    def test_missing_negative_control_forbids_accept(self):
+        """D-Fix / Problem A: with no negative control supplied we cannot prove
+        the loop is not rigged, so a paired-improving candidate must NOT accept
+        (it may still be INCONCLUSIVE on its own merits)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            # with_neg=False -> negative_harness=None -> no control available.
+            rec = self._eval(0.85, 0.90, 0.85, with_neg=False, tmp=tmp)
+        # No negative control dict is populated for this candidate.
+        self.assertFalse(rec.negative_control.get("rejected"))
+        self.assertNotEqual(rec.decision, "ACCEPT")
+        self.assertEqual(rec.decision, "INCONCLUSIVE")
 
     def test_genuine_negative_control_is_rejected(self):
         """P0-1 / D1: a real degradation must be recorded as a genuine REJECT."""

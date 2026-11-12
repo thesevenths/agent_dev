@@ -247,10 +247,13 @@ def build_bundle(*, benchmark_path: Path, evolution_path: Path,
     _write_json(bundle_dir / "evolution_summary.json", evo_s)
     _write_json(bundle_dir / "verification.json", verification)
 
-    # 2) evidence_hashes: SHA-256 of EVERY bundle file (incl. raw artifacts).
+    # 2) evidence_hashes: SHA-256 of EVERY bundle PAYLOAD file. The
+    #    evidence_hashes.json index itself is excluded -- it is the manifest of
+    #    hashes, not a hashed payload, so including its own (changing) hash would
+    #    make every regenerated bundle self-inconsistent (D-Fix / Problem C).
     bundle_files: dict[str, str] = {}
     for p in sorted(bundle_dir.rglob("*")):
-        if p.is_file():
+        if p.is_file() and p.name != "evidence_hashes.json":
             rel = p.relative_to(bundle_dir).as_posix()
             bundle_files[rel] = sha256_file(p)
     _write_json(bundle_dir / "evidence_hashes.json",

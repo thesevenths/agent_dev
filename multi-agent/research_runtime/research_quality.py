@@ -277,6 +277,20 @@ class DefaultResearchQualityEvaluator:
                                                  only_verifiable=True)
             for c in vr.checks:
                 checks[f"V.{c.name}"] = bool(c.passed)
+        # D-Fix / Problem B (P0): also recompute dataset-manifest hashes from
+        # ACTUAL split rows / manifest body when a manifest is present. Only
+        # checks that actually recomputed something are folded in, so reports
+        # without a manifest stay green (the capability is wired, not forced).
+        manifests: list[dict] = []
+        if isinstance(ev.report, dict) and ev.report.get("dataset_manifest"):
+            manifests.append(ev.report["dataset_manifest"])
+        for c in (ev.comparison_reports or []):
+            if isinstance(c, dict) and c.get("dataset_manifest"):
+                manifests.append(c["dataset_manifest"])
+        for m in manifests:
+            vr_m = EvidenceVerifier().verify_dataset_manifest(m)
+            for c in vr_m.checks:
+                checks[f"V.{c.name}"] = bool(c.passed)
         return _fraction(checks.values()), checks
 
     def _reproducibility(self, ev: QualityEvidence) -> tuple[float, dict[str, bool]]:

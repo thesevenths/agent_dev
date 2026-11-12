@@ -207,9 +207,15 @@ class EvidenceVerifier:
     def verify_bundle_integrity(self, bundle_dir: Any) -> VerificationResult:
         """Verify a portable evidence bundle is internally self-consistent.
 
-        Checks that ``evidence_hashes.json`` lists every bundle file with a hash
-        that matches the file on disk, so a third party can confirm the bundle
-        was not tampered after publication.
+        * Every file declared in ``evidence_hashes.json`` must exist on disk
+          with a matching SHA-256 (declared -> actual).
+        * No extra (undeclared) files may exist on disk (actual -> declared).
+        * Declared names must be relative, with no path traversal and no
+          absolute paths.
+        * No file on disk may be a symbolic link.
+
+        Returns explicit pass/fail per check so a third party can confirm the
+        bundle was neither tampered with nor padded with unverified content.
         """
         root = Path(bundle_dir)
         res = VerificationResult()
@@ -220,9 +226,34 @@ class EvidenceVerifier:
             return res
         declared = json.loads(hashes_path.read_text(encoding="utf-8"))
         declared_files = declared.get("bundle_files") or {}
+
+        # Path safety: relative names only, no traversal / absolute paths.
+        for name in declared_files:
+            safe = (isinstance(name, str) and bool(name)
+                    and not name.startswith("/") and not name.startswith("\\")
+                    and ".." not in name.replace("\\", "/").split("/"))
+            res.add(f"bundle_path_safe:{name}", safe,
+                    "" if safe else "absolute path or traversal in declared name")
+        if not all(c.passed for c in res.checks):
+            return res
+
+        # Declared -> actual: every declared file must exist with matching hash.
         for name, expected in declared_files.items():
             actual = sha256_file(root / name)
             res.add(f"bundle_file:{name}",
                     actual is not None and actual == expected,
                     "" if actual == expected else "hash mismatch or missing")
+
+        # Actual -> declared: no extra (undeclared) files on disk, no symlinks.
+        actual_files: set[str] = set()
+        for p in sorted(root.rglob("*")):
+            if p == hashes_path or not p.is_file():
+                continue
+            rel = p.relative_to(root).as_posix()
+            actual_files.add(rel)
+            res.add(f"bundle_no_symlink:{rel}", not p.is_symlink(),
+                    "" if not p.is_symlink() else "symbolic link not allowed")
+        extra = sorted(actual_files - set(declared_files))
+        res.add("bundle_no_extra_files", not extra,
+                "" if not extra else f"undeclared files present: {extra}")
         return res

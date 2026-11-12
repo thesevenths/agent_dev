@@ -422,22 +422,32 @@ def evaluate_candidate(*, base_harness: Any, cand_harness: Any,
     record.decision_a = gate.explain(dec_a)
     record.decision_b = gate.explain(dec_b)
     # A candidate that wins the paired test but FAILS the independent held-out
-    # task (or where the negative control was accepted) is NOT accepted.
+    # task, or where the negative control was not genuinely rejected, is NOT
+    # accepted.
     holdout_ok = bool(record.holdout.get("confirmed"))
-    # D1/P0-1: the negative / degenerate control must NOT have been genuinely
-    # ACCEPTED. An accepted negative control proves the loop is rigged, so the
-    # candidate cannot be accepted (fail closed). INCONCLUSIVE is NOT treated as
-    # a successful rejection -- it merely leaves the loop-integrity claim
-    # unproven for THIS candidate (the run-level negative_controls_rejected
-    # count requires a genuine REJECT from the degenerate-control record).
-    negative_ok = not bool(record.negative_control.get("accepted"))
+    # D-Fix / Problem A (P0): the negative / degenerate control must be GENUINELY
+    # REJECTED -- real, non-trivial degradation versus Base -- for the run to
+    # claim loop integrity. We therefore require its explicit ``rejected`` flag:
+    #
+    #   * genuinely REJECTED  -> negative_ok = True  (loop not rigged to accept)
+    #   * INCONCLUSIVE        -> negative_ok = False (within noise or missing;
+    #                           an inconclusive control does NOT prove the loop
+    #                           can reject a bad Harness, so accept is forbidden)
+    #   * ACCEPTED            -> negative_ok = False (the loop is rigged -> fail
+    #                           closed)
+    #   * no negative control -> negative_ok = False (cannot prove integrity;
+    #                           acceptance is forbidden -- the candidate may
+    #                           still be marked INCONCLUSIVE on its own merits)
+    neg = record.negative_control
+    negative_ok = bool(neg and neg.get("rejected"))
     if dec_b.accepted and holdout_ok and negative_ok:
         record.decision = "ACCEPT"
         record.reason = "paired improvement confirmed on independent task"
     elif dec_b.accepted and (not holdout_ok or not negative_ok):
         record.decision = "INCONCLUSIVE"
         record.reason = ("paired improvement did not survive holdout / "
-                         "negative control was accepted (loop integrity broken)")
+                         "negative control was not genuinely rejected "
+                         "(missing, accepted, or inconclusive)")
     else:
         # dec_b was rejected. If evidence is INCOMPLETE (a missing/failed arm)
         # we cannot conclude a genuine regression -- that is INCONCLUSIVE, not a
@@ -592,7 +602,7 @@ def evolve(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
             1 for r in records if r.evidence.get("is_negative_control")),
         "negative_controls_rejected": sum(
             1 for r in records if r.evidence.get("is_negative_control")
-            and r.decision == "REJECT"),
+            and bool(r.negative_control.get("rejected"))),
         "evaluation_substrate_unchanged": substrate_before == substrate_after,
         "evaluation_substrate_sha256": substrate_after,
         "promotion": {

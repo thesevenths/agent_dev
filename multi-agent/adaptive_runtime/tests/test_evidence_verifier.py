@@ -144,6 +144,72 @@ class TestBundleIntegrity(unittest.TestCase):
             vr = EvidenceVerifier().verify_bundle_integrity(root)
             self.assertFalse(vr.all_passed())
 
+    def test_bundle_extra_undeclared_file_detected(self):
+        """D-Fix / Problem C: an undeclared file on disk must fail the check."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "arr_1_0_r1"
+            root.mkdir()
+            (root / "manifest.json").write_text(
+                json.dumps({"a": 1}, sort_keys=True), encoding="utf-8")
+            hashes = {"bundle_files": {
+                "manifest.json": sha256_file(root / "manifest.json")}}
+            (root / "evidence_hashes.json").write_text(
+                json.dumps(hashes, sort_keys=True), encoding="utf-8")
+            (root / "stowaway.txt").write_text("evil", encoding="utf-8")
+            vr = EvidenceVerifier().verify_bundle_integrity(root)
+            self.assertFalse(vr.all_passed())
+            self.assertFalse(any(c.name == "bundle_no_extra_files" and c.passed
+                                 for c in vr.checks))
+
+    def test_bundle_path_traversal_rejected(self):
+        """D-Fix / Problem C: a declared name with '..' must fail path safety."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "arr_1_0_r1"
+            root.mkdir()
+            (root / "manifest.json").write_text(
+                json.dumps({"a": 1}, sort_keys=True), encoding="utf-8")
+            hashes = {"bundle_files": {
+                "../escape.json": "0" * 64,
+                "manifest.json": sha256_file(root / "manifest.json")}}
+            (root / "evidence_hashes.json").write_text(
+                json.dumps(hashes, sort_keys=True), encoding="utf-8")
+            vr = EvidenceVerifier().verify_bundle_integrity(root)
+            self.assertFalse(vr.all_passed())
+            self.assertFalse(any(
+                c.name == "bundle_path_safe:../escape.json" and c.passed
+                for c in vr.checks))
+
+
+class TestDatasetManifestWiredIntoQuality(unittest.TestCase):
+    """D-Fix / Problem B: verify_dataset_manifest is wired into the Evidence (E)
+    dimension of the quality evaluator, not just available as a standalone
+    method. A tampered split hash must drop the Evidence dimension."""
+
+    def _evaluator(self):
+        from research_runtime.research_quality import (
+            DefaultResearchQualityEvaluator, QualityEvidence)
+        return DefaultResearchQualityEvaluator(), QualityEvidence
+
+    def test_tampered_manifest_fails_evidence_integrity(self):
+        ev_cls = self._evaluator()[1]
+        rows = [{"x": 1}, {"x": 2}]
+        manifest = {"splits": {"train": {"rows": rows, "sha256": "0" * 64}}}
+        ev = ev_cls(report={"dataset_manifest": manifest})
+        evaluator = self._evaluator()[0]
+        _, checks = evaluator._evidence_integrity(ev)
+        self.assertIn("V.split_sha256:train", checks)
+        self.assertFalse(checks["V.split_sha256:train"])
+
+    def test_valid_manifest_passes_when_wired(self):
+        ev_cls = self._evaluator()[1]
+        rows = [{"x": 1}, {"x": 2}]
+        manifest = {"splits": {"train": {
+            "rows": rows, "sha256": sha256_of(rows)}}}
+        ev = ev_cls(report={"dataset_manifest": manifest})
+        evaluator = self._evaluator()[0]
+        _, checks = evaluator._evidence_integrity(ev)
+        self.assertTrue(checks["V.split_sha256:train"])
+
 
 if __name__ == "__main__":
     unittest.main()
