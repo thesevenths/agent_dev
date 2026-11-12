@@ -128,7 +128,15 @@ class TestLiveValue(LandingBase):
             self.assertEqual(landing.live_value("K", self.root), "process")
 
     def test_falls_back_to_user_area_when_absent(self):
-        self.assertEqual(landing.live_value("LLM_MODEL", self.root), "qwen")
+        # ARR 1.0 / D4: the legacy ``config.py`` calls load_dotenv() at import
+        # time, and tests/rt_tests/test_agent_integration.py imports that stack.
+        # In the FULL suite this leaks LLM_MODEL from .env into os.environ, so
+        # the "when absent" precondition was silently violated (the test passed
+        # alone but failed in CI). Isolate the ambient env explicitly instead
+        # of deselecting the test -- that is the test-isolation defect itself.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("LLM_MODEL", None)
+            self.assertEqual(landing.live_value("LLM_MODEL", self.root), "qwen")
         self.assertIsNone(landing.live_value("NOT_THERE_AT_ALL", self.root))
 
     def test_blank_process_env_does_not_shadow(self):

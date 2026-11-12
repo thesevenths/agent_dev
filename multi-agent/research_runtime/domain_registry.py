@@ -50,6 +50,14 @@ class DomainBundle:
     campaign_root: str = ""
     description: str = ""
 
+    # ARR 1.0 / D1 + D3: additive, optional. A domain may inject its OWN
+    # research-quality evaluation protocol and metric interpretation. The
+    # generic runtime never touches these; the unified task driver reads them
+    # to score a ResearchReport with the domain's own scientific rules.
+    # Defaults keep every pre-ARR DomainBundle construction valid unchanged.
+    quality_evaluator: Any = None
+    metric_interpreter: dict[str, Any] | None = None
+
 
 class DomainRegistry:
     def __init__(self) -> None:

@@ -31,23 +31,115 @@ def _report(outcome: str = "inconclusive", n_inconclusive: int = 3) -> dict:
     }
 
 
+def _evidenced(decision: str) -> tuple[dict, dict]:
+    """A report with REAL structural evidence, for a given verdict."""
+    h_sha = "a" * 64
+    report = {
+        "objective_id": "obj_evidenced", "outcome": decision,
+        "report_sha256": "b" * 64,
+        "domain": "scinet",
+        "evidence_refs": [f"experiment:exp_{i}:result:j{i}" for i in range(2)],
+        "experience_refs": ["exp_abc"],
+        "promotion": "not_requested",
+        "frozen_test_used": False,
+        "hypotheses": [
+            {"hypothesis_id": "h1", "content_sha256": h_sha, "statement": "s1"},
+            {"hypothesis_id": "h2", "content_sha256": "c" * 64, "statement": "s2"},
+        ],
+        "reviews": [
+            {"review_id": "r1", "hypothesis_id": "h1",
+             "hypothesis_sha256": h_sha, "passed": True},
+            {"review_id": "r2", "hypothesis_id": "h2",
+             "hypothesis_sha256": "c" * 64, "passed": True},
+        ],
+        "plans": [{"plan_id": "p1", "plan_sha256": "d" * 64, "version": 1}],
+        "approvals": [{"approval_id": "ap1", "resource_sha256": "e" * 64,
+                       "source": "human", "status": "granted"}],
+        "campaigns": [{"campaign_id": "c1", "status": "completed"}],
+        "comparisons": [
+            {"comparison_id": "cmp1", "candidate_id": "cand_A",
+             "decision": decision, "decision_rule": "practical_effect_confirmed",
+             "n_pairs": 5, "mean_delta": -0.02, "guardrail_violations": []},
+            {"comparison_id": "cmp2", "candidate_id": "cand_B",
+             "decision": decision, "decision_rule": "confidence_interval_regression",
+             "n_pairs": 5, "mean_delta": -0.01, "guardrail_violations": []},
+        ],
+    }
+    comp = {
+        "comparison_id": "cmp1", "candidate_id": "cand_A",
+        "baseline_config_sha256": "1" * 64, "candidate_config_sha256": "2" * 64,
+        "dataset_version": "frozen-v1", "evaluation_split": "validation",
+        "n_pairs": 5, "n_planned": 5, "missing_pairs": [],
+        "dataset_split_hashes": {"train": "3" * 64, "validation": "4" * 64},
+        "guardrail_violations": [],
+        "paired_observations": [{"seed": s, "delta": -0.02} for s in range(5)],
+    }
+    evidence = {
+        "comparison_reports": [comp],
+        "experiment_results": [{"metrics": {"cosine@1": 0.59,
+                                            "latent_mse@1": 0.024,
+                                            "physics_consistency": 0.0}}],
+        "telemetry": {"missing_runs": 0, "timeout_runs": 0,
+                      "total_trials": 15, "succeeded_trials": 15,
+                      "jobs_used": 30, "elapsed_seconds": 120.0,
+                      "budget": {"max_jobs": 30, "max_total_seconds": 3600.0},
+                      "ood": {"confirmed": True}},
+        "holdout": {"holdout_deltas": [-0.02] * 3,
+                    "holdout_direction_agreement": 1.0,
+                    "holdout_used_for_decision": False},
+    }
+    return report, evidence
+
+
 class TestExportTrace(unittest.TestCase):
-    def test_quality_score_and_dominant(self):
+    def test_quality_is_not_acceptance_rate(self):
+        """D1: the old `accepted/n` scalar is gone; inconclusive is not 0.0."""
         trace = bridge.export_research_trace(_report())
         self.assertEqual(trace["objective_id"], "obj_p106")
         self.assertEqual(trace["n_decisions"], 3)
-        self.assertEqual(trace["quality_score"], 0.0)  # no accepted
+        self.assertEqual(trace["accepted_rate"], 0.0)
+        self.assertNotEqual(trace["quality_score"], 0.0)
+        self.assertLess(trace["quality_score"], 0.35)  # hard constraint caps it
+        self.assertTrue(trace["hard_violations"])
+        self.assertFalse(trace["gate_eligible"])
+        self.assertIn("components", trace["quality"])
         self.assertEqual(trace["dominant_signal"], "DECISION_UNCERTAINTY")
 
-    def test_robust_decision_signal(self):
+    def test_bare_acceptance_is_not_a_perfect_score(self):
+        """D1 Goodhart guard: ACCEPT without evidence cannot score 1.0."""
         report = {
             "objective_id": "o2", "outcome": "accepted_for_confirmation",
             "comparisons": [{"decision": "accepted_for_confirmation"},
                             {"decision": "accepted_for_confirmation"}],
         }
         trace = bridge.export_research_trace(report)
-        self.assertEqual(trace["quality_score"], 1.0)
+        self.assertLess(trace["quality_score"], 0.35)
+        self.assertEqual(trace["accepted_rate"], 1.0)
         self.assertEqual(trace["dominant_signal"], "ROBUST_DECISION")
+
+    def test_falsification_with_evidence_scores_high(self):
+        """D1 core: rejecting a wrong hypothesis is a valuable discovery."""
+        rep_rejected, ev = _evidenced("rejected")
+        rep_accepted, _ = _evidenced("accepted_for_confirmation")
+        rejected = bridge.export_research_trace(rep_rejected, domain="scinet",
+                                                evidence=ev)
+        accepted = bridge.export_research_trace(rep_accepted, domain="scinet",
+                                                evidence=ev)
+        self.assertGreaterEqual(rejected["quality_score"],
+                                accepted["quality_score"])
+        self.assertGreater(rejected["quality"]["components"]["D"], 0.7)
+        self.assertFalse(rejected["hard_violations"])
+        self.assertTrue(rejected["gate_eligible"])
+
+    def test_missing_evidence_never_defaults_to_pass(self):
+        """E/R dimensions must DEGRADE when provenance is absent."""
+        rep, ev = _evidenced("rejected")
+        full = bridge.export_research_trace(rep, domain="scinet", evidence=ev)
+        bare = bridge.export_research_trace(rep, domain="scinet")
+        self.assertGreater(full["quality"]["components"]["E"],
+                           bare["quality"]["components"]["E"])
+        self.assertGreater(full["quality_score"], bare["quality_score"])
+        self.assertTrue(bare["hard_violations"])
 
 
 class TestProposeResearchCandidate(unittest.TestCase):

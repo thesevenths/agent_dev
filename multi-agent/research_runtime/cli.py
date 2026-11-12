@@ -1,0 +1,362 @@
+"""ARR 1.0 -- unified product CLI.
+
+    python -m research_runtime.cli run --domain scinet|embodied|quant
+    python -m research_runtime.cli benchmark --all-domains
+    python -m research_runtime.cli evolve --target research_harness --rounds 2
+    python -m research_runtime.cli report --input <artifact.json>
+    python -m research_runtime.cli verify [--ci-log <pytest.log>]
+
+One entry point for research, benchmark and RRSI Harness evolution. Everything
+below is REAL: real engines, real frozen datasets, real paired campaigns, real
+comparisons, real quality evaluation. Fake profiles exist ONLY in the R4 unit
+tests and are never reachable from these commands.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RUN_ROOT = WORKSPACE_ROOT / "experiments" / "arr_1_0"
+
+
+def _harness(name: str):
+    from .arr_runtime import BASE_HARNESS, IMPROVED_HARNESS, NEGATIVE_HARNESS
+    return {"base": BASE_HARNESS, "improved": IMPROVED_HARNESS,
+            "negative": NEGATIVE_HARNESS}[name]
+
+
+def _task_for(domain: str, *, objective: str = "", seeds: list[int] | None = None):
+    from .research_task import ResearchTask
+    defaults = {
+        "scinet": ("Reduce multi-step latent dynamics prediction error on the "
+                   "frozen pendulum world model",
+                   {"primary_metric": "latent_mse@1",
+                    "metric_direction": "minimize",
+                    "decision_split": "validation",
+                    "reserved_final_split": "test"},
+                   {"independent_holdout": True, "holdout_split": "test",
+                    "ood_task": False,
+                    "paired_seeds": [42, 43, 44, 45, 46]}),
+        "embodied": ("Reduce long-horizon state prediction error of the simulated "
+                     "robot world model without violating safety constraints",
+                     {"primary_metric": "state_mse@1",
+                      "metric_direction": "minimize",
+                      "decision_split": "validation",
+                      "reserved_final_split": "test"},
+                     {"independent_holdout": True, "holdout_split": "test",
+                      "ood_task": True,
+                      "paired_seeds": [42, 43, 44, 45, 46]}),
+        "quant": ("Discover a robust market-neutral signal with positive "
+                  "out-of-sample net-of-cost return and bounded drawdown",
+                  {"primary_metric": "net_return_after_cost",
+                   "metric_direction": "maximize",
+                   "decision_split": "validation",
+                   "reserved_final_split": "test"},
+                  {"independent_holdout": True, "holdout_split": "test",
+                   "ood_task": True,
+                   "paired_seeds": [42, 43, 44, 45, 46]}),
+    }
+    if domain not in defaults:
+        raise SystemExit(f"unknown domain {domain!r}; choose from {sorted(defaults)}")
+    objective_text, protocol, holdout = defaults[domain]
+    if seeds:
+        holdout = dict(holdout, paired_seeds=list(seeds))
+    budget = {"experiments": 20, "max_jobs": 30,
+              "max_total_seconds": 3600.0, "epochs": 1}
+    return ResearchTask(domain=domain, objective=objective or objective_text,
+                        evaluation_protocol=protocol,
+                        heldout_policy=holdout, budget=budget)
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    from .arr_runtime import run_research_task
+    task = _task_for(args.domain, objective=args.objective, seeds=args.seeds)
+    if args.budget_experiments:
+        task.budget["experiments"] = args.budget_experiments
+    result = run_research_task(task, harness=_harness(args.harness),
+                               run_root=args.run_root)
+    out = {
+        "domain": result.domain, "task_id": result.task_id, "ok": result.ok,
+        "outcome": result.outcome, "quality": result.quality.get("Q"),
+        "components": result.quality.get("components"),
+        "hard_violations": result.quality.get("hard_violations"),
+        "n_hypotheses": len(result.hypotheses),
+        "trials": f"{result.campaign.get('succeeded_trials')}/"
+                  f"{result.campaign.get('total_trials')}",
+        "holdout": result.evidence.get("holdout"),
+        "ood": result.evidence.get("ood"),
+        "report_path": result.evidence.get("report_path"),
+        "result_path": result.provenance.get("result_path"),
+        "artifact_sha256": result.artifact_sha256,
+        "error": result.error,
+    }
+    print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
+    return 0 if result.ok else 1
+
+
+def cmd_benchmark(args: argparse.Namespace) -> int:
+    from .arr_runtime import run_research_task
+    from .domain_registry import default_registry, register_domain
+    from .research_environment import build_local_bundle
+    for name in ("embodied", "quant"):
+        if not default_registry.contains(name):
+            register_domain(build_local_bundle(name))
+    domains = args.domains or ["scinet", "embodied", "quant"]
+    results = []
+    for domain in domains:
+        task = _task_for(domain)
+        r = run_research_task(task, harness=_harness(args.harness),
+                              run_root=args.run_root)
+        results.append(r)
+        print(f"[benchmark] {domain}: ok={r.ok} outcome={r.outcome} "
+              f"Q={r.quality.get('Q')} trials="
+              f"{r.campaign.get('succeeded_trials')}/{r.campaign.get('total_trials')} "
+              f"err={r.error[:120]}")
+    summary = {
+        "schema_version": "arr-1.0-benchmark-v1",
+        "domains": domains,
+        "same_research_service": True,
+        "n_domains": len(results),
+        "n_ok": sum(1 for r in results if r.ok),
+        "results": [r.model_dump(mode="json") for r in results],
+    }
+    import hashlib
+    summary["artifact_sha256"] = hashlib.sha256(json.dumps(
+        summary, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    out = Path(args.run_root) / f"arr_1_0_benchmark_{summary['artifact_sha256'][:12]}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(summary, indent=2, sort_keys=True,
+                              ensure_ascii=False, default=str), encoding="utf-8")
+    print(f"[benchmark] summary: {out}")
+    return 0 if summary["n_ok"] == len(results) else 1
+
+
+def cmd_evolve(args: argparse.Namespace) -> int:
+    from adaptive_runtime.harness_evolution import evolve
+    from .arr_runtime import BASE_HARNESS, NEGATIVE_HARNESS
+    # Five INDEPENDENT selection tasks, each with DIFFERENT paired seeds =>
+    # different real bootstrap samples, not copies of one run. n=5 gives the
+    # paired t-test real statistical power (n=2 would be logically unable to
+    # distinguish "works on this task" from "works generally").
+    tasks = [
+        _task_for("embodied", seeds=[42, 43, 44, 45, 46]),
+        _task_for("embodied", seeds=[50, 51, 52, 53, 54]),
+        _task_for("embodied", seeds=[58, 59, 60, 61, 62]),
+        _task_for("embodied", seeds=[66, 67, 68, 69, 70]),
+        _task_for("embodied", seeds=[74, 75, 76, 77, 78]),
+    ]
+    # Held-out / OOD is a DIFFERENT DOMAIN. A Harness improvement that only
+    # helps Embodied must not be accepted; this is the strongest OOD check.
+    heldout = _task_for("quant", seeds=[60, 61, 62, 63, 64])
+    payload = evolve(
+        base_harness=BASE_HARNESS, tasks=tasks, heldout_task=heldout,
+        run_root=args.run_root, repo_root=WORKSPACE_ROOT,
+        rounds=args.rounds, max_minutes=args.max_minutes,
+        negative_harness=NEGATIVE_HARNESS,
+        include_degenerate_control=args.degenerate_control,
+        operator=args.operator or "")
+    print(json.dumps({
+        "dominant_failure": payload["dominant_failure"],
+        "n_accepted": payload["n_accepted"],
+        "n_rejected": payload["n_rejected"],
+        "n_inconclusive": payload["n_inconclusive"],
+        "n_negative_controls": payload["n_negative_controls"],
+        "negative_controls_rejected": payload["negative_controls_rejected"],
+        "evaluation_substrate_unchanged": payload["evaluation_substrate_unchanged"],
+        "promotion": payload["promotion"],
+        "elapsed_seconds": payload["elapsed_seconds"],
+        "artifact_path": payload["artifact_path"],
+        "artifact_sha256": payload["artifact_sha256"],
+        "records": [{
+            "target": r["candidate"]["target"],
+            "old": r["candidate"]["old"], "new": r["candidate"]["new"],
+            "decision": r["decision"], "mean_delta": r["evidence"]["mean_delta"],
+            "holdout_delta": r["holdout"].get("delta"),
+            "negative_control": r["negative_control"],
+            "substrate_unchanged": r["substrate_unchanged"],
+        } for r in payload["records"]],
+    }, indent=2, ensure_ascii=False, default=str))
+    return 0
+
+
+def _latest(pattern: str) -> str:
+    files = sorted(WORKSPACE_ROOT.glob(pattern))
+    if not files:
+        raise SystemExit(f"no artifact matches {pattern!r} under {WORKSPACE_ROOT}")
+    return str(files[-1])
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Check the 13 ARR 1.0 acceptance criteria against REAL artifacts.
+
+    Nothing is declared from memory: every row is derived from a saved
+    benchmark / evolution / CI artifact, and a missing artifact fails loudly.
+    """
+    bench = json.loads(Path(args.benchmark or _latest(
+        "experiments/arr_1_0_benchmark/arr_1_0_benchmark_*.json")).read_text(
+            encoding="utf-8"))
+    evo = json.loads(Path(args.evolution or _latest(
+        "experiments/arr_1_0_evolve/harness_evolution_*.json")).read_text(
+            encoding="utf-8"))
+    results = {r.get("domain"): r for r in bench.get("results", [])
+               if isinstance(r, dict)}
+    recs = evo.get("records", [])
+    accepted = [r for r in recs if r.get("decision") == "ACCEPT"]
+    rejected = [r for r in recs if r.get("decision") == "REJECT"]
+
+    def _domain_ok(name: str) -> bool:
+        r = results.get(name) or {}
+        rep = r.get("report") or {}
+        return bool(r.get("ok") and rep.get("hypotheses")
+                    and rep.get("report_sha256")
+                    and (r.get("campaign") or {}).get("status") == "completed")
+
+    def _autonomous(name: str) -> bool:
+        rep = (results.get(name) or {}).get("report") or {}
+        return bool(rep.get("hypotheses") and any(
+            "experiment:" in str(x) for x in rep.get("evidence_refs", [])))
+
+    quant_rep = (results.get("quant") or {}).get("report") or {}
+    checks: list[tuple[str, bool, str]] = [
+        ("1  SciNet++ 自主研究闭环", _domain_ok("scinet"),
+         "report hypotheses + campaign completed + report_sha256"),
+        ("2  Embodied 仿真研究闭环", _domain_ok("embodied"),
+         "real simulator, frozen robot_sim_v1"),
+        ("3  Quant 回测闭环", _domain_ok("quant") and not quant_rep.get(
+            "frozen_test_used", True),
+         "causal backtest, reserved test never used for selection"),
+        ("4  三域共用同一 Runtime",
+         bool(bench.get("same_research_service")) and bench.get("n_domains") == 3
+         and bench.get("n_ok") == 3,
+         f"n_ok={bench.get('n_ok')}/{bench.get('n_domains')}"),
+        ("5  无人工假设，证据驱动自主产生",
+         all(_autonomous(d) for d in ("scinet", "embodied", "quant")),
+         "every report cites a real experiment in evidence_refs"),
+        ("6  从真实轨迹发现流程缺陷",
+         bool(evo.get("dominant_failure"))
+         and bool((evo.get("analysis") or {}).get("counts")),
+         f"dominant={evo.get('dominant_failure')}"),
+        ("7  自动产生 Harness 候选",
+         bool(recs) and all((r.get("candidate") or {}).get(
+             "candidate_type") == "research_harness" for r in recs),
+         f"n_candidates={len(recs)}"),
+        ("8  候选在 Sandbox 中实际运行",
+         bool(recs) and all(((r.get("evidence") or {}).get("patch") or {}).get(
+             "config_changed") for r in recs),
+         "verified harness.json SHA changed in isolated sandbox"),
+        ("9  Base/Candidate 公平比较",
+         bool(recs) and all(len(r.get("task_deltas") or []) >= 3
+                            and r.get("substrate_unchanged") for r in recs),
+         "paired seeds + fixed evaluator substrate hash"),
+        ("10 独立任务上真实改善",
+         bool(accepted) and any((r.get("holdout") or {}).get("confirmed")
+                                and (r.get("holdout") or {}).get("delta", 0) > 0
+                                and not (r.get("holdout") or {}).get(
+                                    "holdout_used_for_selection", True)
+                                for r in accepted),
+         f"accepted={len(accepted)}, holdout confirmed"),
+        ("11 拒绝无效/退化候选",
+         bool(rejected) and evo.get("negative_controls_rejected", 0) >= 1,
+         f"rejected={len(rejected)}, "
+         f"controls_rejected={evo.get('negative_controls_rejected')}"),
+        ("12 决策可追溯、可回滚",
+         bool(evo.get("artifact_sha256")) and bool(evo.get("rollback_available"))
+         and evo.get("evaluation_substrate_unchanged")
+         and (evo.get("promotion") or {}).get("status") == "not_requested",
+         "SHA-256 artifact + no automatic promote"),
+    ]
+    # 13 is verified from the CI log when supplied, never self-declared.
+    ci_ok, ci_note = False, "no --ci-log supplied"
+    if args.ci_log:
+        text = Path(args.ci_log).read_text(encoding="utf-8", errors="replace")
+        line = [ln for ln in text.splitlines() if " passed" in ln]
+        ci_ok = bool(line) and " failed" not in line[-1] and " error" not in line[-1]
+        ci_note = line[-1].strip()[-120:] if line else "no pytest summary found"
+    checks.append(("13 CI 通过，真实/Fake 分明", ci_ok, ci_note))
+
+    for label, ok, note in checks:
+        print(f"[{'PASS' if ok else 'FAIL'}] {label} -- {note}")
+    n_pass = sum(1 for _, ok, _ in checks if ok)
+    print(f"\nARR 1.0 acceptance: {n_pass}/{len(checks)} "
+          f"from real artifacts (benchmark={bench.get('artifact_sha256', '')[:12]}, "
+          f"evolution={evo.get('artifact_sha256', '')[:12]})")
+    return 0 if n_pass == len(checks) else 1
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    data = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    if "records" in data:
+        print(f"ARR 1.0 Harness evolution: {data['dominant_failure']}")
+        print(f"  accepted={data['n_accepted']} rejected={data['n_rejected']} "
+              f"inconclusive={data['n_inconclusive']}")
+        for rec in data["records"]:
+            print(f"  - {rec['candidate']['target']} "
+                  f"{rec['candidate']['old']}->{rec['candidate']['new']}: "
+                  f"{rec['decision']} (mean_delta={rec['evidence']['mean_delta']})")
+    else:
+        print(json.dumps(data, indent=2, ensure_ascii=False, default=str)[:4000])
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="research_runtime.cli",
+                                description="ARR 1.0 unified research runtime")
+    p.add_argument("--run-root", default=str(DEFAULT_RUN_ROOT))
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    run = sub.add_parser("run", help="run ONE real research task")
+    run.add_argument("--domain", required=True,
+                     choices=["scinet", "embodied", "quant"])
+    run.add_argument("--objective", default="")
+    run.add_argument("--budget-experiments", type=int, default=0)
+    run.add_argument("--seeds", nargs="+", type=int)
+    run.add_argument("--harness", default="improved",
+                     choices=["base", "improved", "negative"])
+    run.set_defaults(func=cmd_run)
+
+    bench = sub.add_parser("benchmark", help="run all domains")
+    bench.add_argument("--all-domains", action="store_true")
+    bench.add_argument("--domains", nargs="+")
+    bench.add_argument("--harness", default="improved",
+                       choices=["base", "improved", "negative"])
+    bench.set_defaults(func=cmd_benchmark)
+
+    ev = sub.add_parser("evolve", help="real RRSI Harness self-improvement")
+    ev.add_argument("--target", default="research_harness",
+                    choices=["research_harness"])
+    ev.add_argument("--rounds", type=int, default=2)
+    ev.add_argument("--max-minutes", type=float, default=30.0)
+    ev.add_argument("--benchmark", default="research_benchmark_v1")
+    ev.add_argument("--degenerate-control", dest="degenerate_control",
+                    action="store_true", default=True,
+                    help="evaluate a deliberately degenerate Harness via the "
+                         "full paired protocol; it must be REJECTed")
+    ev.add_argument("--no-degenerate-control", dest="degenerate_control",
+                    action="store_false",
+                    help="skip the degenerate control (debugging only)")
+    ev.add_argument("--operator", default="")
+    ev.set_defaults(func=cmd_evolve)
+
+    rep = sub.add_parser("report", help="summarise a saved artifact")
+    rep.add_argument("--input", required=True)
+    rep.set_defaults(func=cmd_report)
+
+    ver = sub.add_parser("verify", help="check the 13 acceptance criteria")
+    ver.add_argument("--benchmark", default="")
+    ver.add_argument("--evolution", default="")
+    ver.add_argument("--ci-log", default="")
+    ver.set_defaults(func=cmd_verify)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

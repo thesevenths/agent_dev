@@ -546,27 +546,59 @@ def evaluate_research_runtime(arm: str, case: str | None = None, *,
 
 # ---------------------------------------------------------------- trace 导出
 
-def export_research_trace(report: dict) -> dict:
-    """把一份 research_runtime 研究报告 / 摘要转成 RRSI 的「轨迹」度量。
+def export_research_trace(report: dict, *, domain: str = "",
+                          evidence: dict | None = None,
+                          evaluator: Any = None) -> dict:
+    """把一份 ResearchReport 转成 RRSI 轨迹度量（ARR 1.0 / D1 协议）。
 
-    度量的是研究运行时的**自主研究质量**：在给定目标上，它产出了多少可被
-    接受的决定、证据完整性如何。这是 RRSI 优化研究运行时时的「任务得分」。
+    **不再用 ACCEPT 占比当科研质量**。旧实现 ``accepted/n`` 有严重 Goodhart
+    问题：证伪一个错误假设会得 0 分，而不可复现的「通过」反而得高分。
+    现在交给领域可注入的 ``ResearchQualityEvaluator``，按
+
+        E 证据完整性 / R 可复现性 / G 泛化 / D 发现价值 / C 成本
+
+    五维 + 非补偿硬约束计算；证伪（rejected）与保留负证据在 D 维是**正向**的。
+
+    ``evidence`` 可携带真实持久化证据：comparison_reports / experiment_results /
+    telemetry / holdout / provenance。缺省时只使用报告自身的结构化字段，缺失
+    证据会使对应维度降低（绝不默认为通过）。
     """
+    from research_runtime.research_quality import (
+        QualityEvidence, evaluate_research_quality,
+    )
+
     comparisons = list(report.get("comparisons") or report.get("decisions") or [])
     decisions = [c.get("decision") if isinstance(c, dict) else str(c)
                  for c in comparisons]
     n = max(1, len(decisions))
     accepted = sum(1 for d in decisions if d == "accepted_for_confirmation")
     rejected = sum(1 for d in decisions if d == "rejected")
-    quality = round(accepted / n, 4)
+    extra = evidence or {}
+    qe = QualityEvidence(
+        report=report,
+        comparison_reports=list(extra.get("comparison_reports") or []),
+        experiment_results=list(extra.get("experiment_results") or []),
+        telemetry=dict(extra.get("telemetry") or {}),
+        holdout=dict(extra.get("holdout") or {}),
+        provenance=dict(extra.get("provenance") or {}),
+    )
+    score = evaluate_research_quality(
+        qe, domain=domain or str(report.get("domain") or ""), evaluator=evaluator)
     return {
         "objective_id": report.get("objective_id") or report.get("session_id") or "",
         "outcome": report.get("outcome") or "",
         "n_decisions": len(decisions),
         "accepted_for_confirmation": accepted,
         "rejected": rejected,
-        # 研究运行时质量得分：被接受决定占比 + 证据完整性补偿。
-        "quality_score": quality,
+        # 诊断量，不是分数：仅用于观察接受率，绝不参与质量判定。
+        "accepted_rate": round(accepted / n, 4),
+        # ARR 1.0 质量分：领域可注入评价协议的结果。
+        "quality_score": round(score.Q, 4),
+        "quality": score.to_dict(),
+        "quality_protocol": score.protocol_version,
+        "quality_evaluator": score.evaluator_name,
+        "hard_violations": list(score.hard_violations),
+        "gate_eligible": score.gate_eligible,
         "dominant_signal": _dominant_signal(report, accepted, rejected, n),
         "exported_at": now_iso(),
     }
@@ -709,7 +741,11 @@ def ingest(report: dict, *, ledger_path: str | Path,
            paired_seeds: list[int] | None = None,
            decision_split: str = "validation",
            holdout_split: str | None = "test",
-           epochs: int = 1) -> IngestResult:
+           epochs: int = 1,
+           domain: str = "",
+           quality_evidence: dict | None = None,
+           quality_evaluator: Any = None,
+           candidate_type: str = "domain_model") -> IngestResult:
     """把一份**真实** ResearchReport 接入 RRSI 外层循环。
 
     ``real=False``（默认）：确定性 fake 评估，只用于门控链路单测 / CI，绝不碰引擎。
@@ -725,8 +761,11 @@ def ingest(report: dict, *, ledger_path: str | Path,
     cfg = cfg or Settings()
     # 0) 评估前快照：记录 live research_runtime 指纹，结尾比对以 *验证*（而非声明）未改动。
     live_before = _snapshot_live_runtime()
-    # 1) trace 导出 + 经验入库（度量研究运行时质量）
-    trace = export_research_trace(report)
+    # 1) trace 导出 + 经验入库（D1 领域可注入质量协议，而非 accept 占比）
+    trace = export_research_trace(
+        report, domain=domain, evidence=quality_evidence,
+        evaluator=quality_evaluator)
+    trace["candidate_type"] = candidate_type
     store = _experience.Store(experience_path)
     exp = store.create(
         problem=f"RESEARCH_RUNTIME|{trace['dominant_signal']}",
