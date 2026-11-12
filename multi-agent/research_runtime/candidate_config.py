@@ -370,10 +370,33 @@ class CandidateConfigBuilder:
             except (ValueError, OSError) as exc:
                 raise CandidateConfigError(
                     f"unreadable candidate metadata: {exc}") from exc
+            # Recompute the ACTUAL on-disk config file SHA-256. Relying only on
+            # the recorded metadata hash lets a tampered / corrupted config.yaml
+            # (with an intact metadata.json) be silently reused. The on-disk file
+            # must agree with BOTH the requested config and the recorded
+            # provenance before reuse is allowed.
+            on_disk_config = directory / "config.yaml"
+            if not on_disk_config.is_file():
+                raise CandidateConfigError(
+                    f"candidate directory exists without config.yaml, refusing "
+                    f"to reuse: {directory}")
+            on_disk_sha = sha256_file(on_disk_config)
+            if on_disk_sha != candidate_sha:
+                raise CandidateConfigError(
+                    f"candidate config.yaml on disk was modified (sha256 "
+                    f"mismatch), refusing to reuse: {directory}")
             if existing.get("candidate_config_sha256") != candidate_sha:
                 raise CandidateConfigError(
                     f"candidate directory exists with a different config "
-                    f"(hash mismatch), refusing to overwrite: {directory}")
+                    f"(metadata hash mismatch), refusing to overwrite: {directory}")
+            if existing.get("baseline_config_sha256") != sha256_bytes(baseline_bytes):
+                raise CandidateConfigError(
+                    f"candidate directory was built from a different baseline "
+                    f"(baseline hash mismatch), refusing to reuse: {directory}")
+            if existing.get("dataset_version") != dataset_version:
+                raise CandidateConfigError(
+                    f"candidate directory was built for a different dataset "
+                    f"version, refusing to reuse: {directory}")
             out_config = directory / "config.yaml"
             return CandidateArtifact(
                 directory=directory,
