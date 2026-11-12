@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
 
 from research_runtime.domain_registry import (
     DomainBundle,
@@ -27,6 +28,30 @@ from tests.rt_tests.research_fakes import (
     FakeCampaignStore,
     FakeComparisonReportStore,
     default_domain,
+)
+
+# ---------------------------------------------------------------------------
+# CI portability (ARR 0.1 / P0 follow-up)
+#
+# Building the REAL SciNet++ DomainBundle requires a real engine checkout:
+#   * scinet_research_policy() reads datasets/pendulum_smoke_v1/manifest.json
+#   * SciNetAdapter(strict=True) checks research_api/cli.py exists
+#   * CandidateConfigBuilder checks the project dir on disk
+# GitHub-hosted runners have no SciNet++ checkout. Rather than fabricate a
+# "fake engine" or add hardcoded --deselect entries (which hides the gap), we
+# use the repo's existing RESEARCH_SKIP_E2E convention: self-skip ONLY when the
+# checkout is genuinely absent. With a real SCINET_DIR (developer machine /
+# the real-engine E2E runs) every one of these tests still executes for real.
+_SCINET_ROOT = Path(os.getenv("SCINET_DIR", r"E:\LLM\SciNet++"))
+_SCINET_CHECKOUT = (
+    (_SCINET_ROOT / "research_api" / "cli.py").is_file()
+    and (_SCINET_ROOT / "datasets" / "pendulum_smoke_v1" / "manifest.json").is_file()
+    and (_SCINET_ROOT / "configs" / "pendulum_smoke.yaml").is_file()
+)
+needs_scinet_checkout = unittest.skipUnless(
+    _SCINET_CHECKOUT,
+    "requires a real SciNet++ checkout (SCINET_DIR); self-skips on CI runners "
+    "with no engine, so this is NOT a hidden/deselected failure",
 )
 
 
@@ -57,6 +82,7 @@ class TestDomainRegistry(unittest.TestCase):
                                       comparator_factory=lambda: None,
                                       dataset_verifier=lambda a, b: {}))
 
+    @needs_scinet_checkout
     def test_default_registry_has_scinet(self):
         # Registration is separate from the factory; the default service
         # performs the lazy registration, but the bundle is the unit here.
@@ -66,6 +92,7 @@ class TestDomainRegistry(unittest.TestCase):
         self.assertIs(get_domain("scinet"), bundle)
 
 
+@needs_scinet_checkout
 class TestScinetBundle(unittest.TestCase):
     def test_scinet_bundle_shape(self):
         bundle = build_scinet_domain_bundle()
@@ -90,6 +117,7 @@ class TestScinetBundle(unittest.TestCase):
         self.assertIs(runner.manager.adapter.__class__, adapter.__class__)
 
 
+@needs_scinet_checkout
 class TestServiceFromRegistry(unittest.TestCase):
     def test_default_service_uses_scinet_bundle(self):
         svc = build_default_research_service()  # no-arg -> "scinet"
@@ -139,6 +167,7 @@ class TestServiceFromRegistry(unittest.TestCase):
             build_default_research_service("does_not_exist")
 
 
+@needs_scinet_checkout
 class TestToolsDomainSelection(unittest.TestCase):
     def test_env_override_falls_back_when_unregistered(self):
         from research_runtime import tools
