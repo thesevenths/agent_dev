@@ -453,7 +453,100 @@ def build_parser() -> argparse.ArgumentParser:
                           "(e.g. experiments/releases/arr_1_0_r1)")
     ver.add_argument("--ci-log", default="")
     ver.set_defaults(func=cmd_verify)
+
+    lp = sub.add_parser("loop", help="autonomous multi-round research loop (G)")
+    lp.add_argument("--domain", required=True,
+                    choices=["embodied", "quant", "scinet"])
+    lp.add_argument("--baseline-config", required=True,
+                    help="path to the seed baseline config YAML")
+    lp.add_argument("--project-dir", required=True,
+                    help="root the loop writes isolated campaign artefacts under")
+    lp.add_argument("--rounds", type=int, default=3)
+    lp.add_argument("--dataset-version", default="robot_sim_v1")
+    lp.add_argument("--seeds", nargs="+", type=int, default=[50, 51])
+    lp.add_argument("--require-frozen-manifest", action="store_true",
+                    default=False,
+                    help="require the frozen dataset manifest to verify on disk")
+    lp.add_argument("--state-path", default="",
+                    help="loop checkpoint path; resume an interrupted loop "
+                         "automatically when present")
+    lp.set_defaults(func=cmd_loop)
     return p
+
+
+def _build_real_domain_runner(domain: str):
+    """Wire a REAL domain engine as the dual-layer domain runner.
+
+    The runner executes one materialised config (base or candidate) end-to-end
+    through the domain's own compute function (train -> evaluate) and returns the
+    primary metric Q. No fabricated metric is ever produced: if the engine or its
+    frozen dataset is unavailable, this raises rather than faking a number.
+    """
+    if domain == "embodied":
+        from .domains.embodied import embodied_compute
+        compute = embodied_compute
+        primary_metric = "state_mse@1"
+    elif domain == "quant":
+        from .domains.quant import quant_compute
+        compute = quant_compute
+        primary_metric = "net_return_after_cost"
+    else:
+        raise SystemExit(
+            f"no real engine runner wired for domain {domain!r}; the loop must "
+            f"run the REAL engine, so scinet requires the SciNet++ engine to be "
+            f"connected first (no FakeRunner is allowed)")
+    from pathlib import Path as _P
+    import tempfile as _tf
+    import yaml as _yaml
+
+    def runner(art: dict) -> float:
+        cfg = _yaml.safe_load(_P(art["config_path"]).read_text(encoding="utf-8"))
+        job_dir = _P(art["directory"])
+        job_dir.mkdir(parents=True, exist_ok=True)
+        seed = int(cfg.get("seed", 42))
+        tr = compute(cfg, {"stage": "train", "seed": seed}, job_dir)
+        if tr.get("status") != "succeeded":
+            return float("nan")
+        run_id = job_dir.name
+        ev = compute(cfg, {"stage": "evaluate", "seed": seed, "run_id": run_id},
+                     job_dir)
+        if ev.get("status") != "succeeded":
+            return float("nan")
+        q = (ev.get("metrics") or {}).get(primary_metric)
+        if q is None:
+            return float("nan")
+        return float(q)
+
+    return runner
+
+
+def cmd_loop(args: argparse.Namespace) -> int:
+    """Autonomous multi-round research loop (ARR 1.1 / Package G).
+
+    Runs the dual-layer RRSI for ``--rounds`` rounds; the next round inherits the
+    version the previous round ACCEPTED (domain config baked into a new baseline,
+    harness patches applied via the real patch primitive), and a crashed process
+    resumes from the last completed round. The domain engine is REAL -- a missing
+    frozen dataset or engine fails loudly, never silently.
+    """
+    from .loop import run_loop
+    from adaptive_runtime.harness_evolution import evolve
+    runner = _build_real_domain_runner(args.domain)
+    report = run_loop(
+        state_path=args.state_path,
+        domain=args.domain,
+        baseline_config_path=args.baseline_config,
+        project_dir=args.project_dir,
+        max_rounds=args.rounds,
+        dataset_version=args.dataset_version,
+        domain_seeds=tuple(args.seeds),
+        domain_runner=runner,
+        domain_require_frozen_manifest=args.require_frozen_manifest,
+        harness_evolve=evolve,
+        base_harness_tag=None,
+    )
+    print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
+    return 0 if report.get("status") == "completed" else 1
 
 
 def main(argv: list[str] | None = None) -> int:
