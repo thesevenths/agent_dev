@@ -182,6 +182,61 @@ class TestCheckpointResume(unittest.TestCase):
             self.assertEqual(report["rounds_completed"], 2)
 
 
+class TestRealHarnessInheritance(unittest.TestCase):
+    """M2.5 P0: the loop threads the CONCRETE patched harness object (not a string
+    tag, not the original base) into the next round, via the real
+    ``default_harness_inherit`` primitive. Uses a stub dual-layer so the test is
+    fast; the harness materialisation is the production code path.
+    """
+
+    def test_loop_threads_patched_harness_object_into_next_round(self):
+        import os
+        from research_runtime.arr_runtime import BASE_HARNESS
+        from research_runtime.loop.version_inheritance import default_harness_inherit
+
+        seen: list[Any] = []
+
+        def stub(**kw):
+            seen.append(kw.get("base_harness"))
+            rec = {"candidate": {
+                "candidate_id": "h1", "target": "planner.strategy",
+                "old": "fixed_first_knob", "new": "diagnosis_targeted",
+                "taxonomy": "EXPERIMENT_DESIGN_FAILURE",
+                "patch": {"kind": "research_harness", "target": "planner.strategy",
+                          "old": "fixed_first_knob", "new": "diagnosis_targeted"},
+                "hyp_fingerprint": "research_harness::a"}}
+            return _payload(harness_accepted=[rec])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "base.yaml"
+            cfg.write_text("seed: 0\ntrain:\n  lr: 0.01\ndata: {}\n", encoding="utf-8")
+            cwd = os.getcwd()
+            try:
+                os.chdir(tmp)  # keep the harness sandbox inside temp dir
+                report = run_loop(
+                    state_path=Path(tmp) / "loop_state.json",
+                    domain="embodied", baseline_config_path=str(cfg),
+                    project_dir=tmp, max_rounds=3, dataset_version="test-v1",
+                    domain_seeds=(50,), domain_runner=None,
+                    domain_require_frozen_manifest=False,
+                    harness_evolve=None,
+                    base_harness=BASE_HARNESS,
+                    harness_inherit_fn=default_harness_inherit,
+                    run_dual_layer_fn=stub)
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(report["status"], "completed")
+            # Round 1 starts from the real BASE_HARNESS object.
+            self.assertIs(seen[0], BASE_HARNESS)
+            # Round 2 receives the PATCHED harness object (real inheritance), not
+            # the original base and not a string tag.
+            self.assertIsNot(seen[1], BASE_HARNESS)
+            self.assertNotEqual(seen[1].fingerprint(), BASE_HARNESS.fingerprint())
+            # And round 3 carries an (again distinct) inherited object.
+            self.assertIsNotNone(seen[2])
+            self.assertNotEqual(seen[2].fingerprint(), BASE_HARNESS.fingerprint())
+
+
 class TestRecoveryMismatch(unittest.TestCase):
     def test_resume_refuses_different_domain_checkpoint(self):
         from research_runtime.loop.recovery import LoopRecoveryError
