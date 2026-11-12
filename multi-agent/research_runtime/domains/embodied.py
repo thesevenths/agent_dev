@@ -187,13 +187,18 @@ def embodied_compute(config: dict[str, Any], spec: dict[str, Any],
                      job_dir: Path) -> dict[str, Any]:
     """Real train / evaluate computation behind ``LocalComputeAdapter``."""
     stage = spec.get("stage")
+    # Isolation-aware data root: prefer an explicit project_dir from the spec so a
+    # loop that runs against a copied / verified project uses THAT project's frozen
+    # dataset, never a silently different canonical copy. Falls back to the module
+    # PROJECT_DIR for callers that don't pass one (e.g. the standalone campaign).
+    project_dir = Path(spec.get("project_dir") or PROJECT_DIR).resolve()
     if stage == "train":
-        rows = load_split(PROJECT_DIR, config, "train")
+        rows = load_split(project_dir, config, "train")
         W, bias = _fit(config, rows, int(spec.get("seed") or 42))
         checkpoint = {
             "W": W, "bias": bias, "config": config,
             "bootstrap_seed": int(spec.get("seed") or 42),
-            "dataset_version": read_frozen_manifest(PROJECT_DIR, config)["dataset_version"],
+            "dataset_version": read_frozen_manifest(project_dir, config)["dataset_version"],
             "seed": spec.get("seed"),
         }
         blob = json.dumps(checkpoint, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -242,7 +247,7 @@ def embodied_compute(config: dict[str, Any], spec: dict[str, Any],
     if split not in ("train", "validation", "test", "ood"):
         return {"status": "failed", "error_type": "invalid_split",
                 "error": f"unknown split {split!r}"}
-    rows = load_split(PROJECT_DIR, config, split)
+    rows = load_split(project_dir, config, split)
 
     errors: dict[int, list[float]] = {k: [] for k in HORIZONS}
     action_errors: list[float] = []
