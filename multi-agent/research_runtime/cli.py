@@ -463,7 +463,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="root the loop writes isolated campaign artefacts under")
     lp.add_argument("--rounds", type=int, default=3)
     lp.add_argument("--dataset-version", default="robot_sim_v1")
-    lp.add_argument("--seeds", nargs="+", type=int, default=[50, 51])
+    lp.add_argument("--seeds", nargs="+", type=int, default=[50, 51, 52, 53, 54],
+                    help="paired (base/candidate) experiment seeds for the DOMAIN "
+                         "layer (default 5: the M2.7 formal-ACCEPT minimum). Fewer "
+                         "than 5 yields only INCONCLUSIVE, never ACCEPT.")
     lp.add_argument("--require-frozen-manifest", action="store_true", default=True,
                     help="(default ON) require the frozen dataset manifest to "
                          "verify on disk before each round; production research "
@@ -483,7 +486,35 @@ def build_parser() -> argparse.ArgumentParser:
     lp.add_argument("--holdout-seeds", nargs="*", type=int, default=[],
                     help="independent seeds for holdout confirmation of domain "
                          "candidates (a clear contradiction downgrades to "
-                         "INCONCLUSIVE)")
+                         "INCONCLUSIVE). Provide >= --min-seeds-for-accept for a "
+                         "formal ACCEPT.")
+    lp.add_argument("--min-seeds-for-accept", type=int, default=5,
+                    help="minimum VALID paired seeds for a formal Domain ACCEPT "
+                         "(default 5, HARD FLOOR: values below 5 are clamped UP, "
+                         "never down). Fewer seeds (e.g. 2) can only produce "
+                         "INCONCLUSIVE, never ACCEPT -- the M2.7 statistical gate.")
+    lp.add_argument("--practical-floor-rel", type=float, default=0.01,
+                    help="relative practical-improvement floor: a positive mean gain "
+                         "below this fraction of the baseline metric is noise-level "
+                         "(INCONCLUSIVE). Default 0.01, HARD FLOOR (clamped UP).")
+    lp.add_argument("--require-holdout-confirmation", dest="require_holdout_confirmation",
+                    action="store_true", default=True,
+                    help="(default ON) a formal Domain ACCEPT requires an "
+                         "independent holdout confirmation; without it the candidate "
+                         "is INCONCLUSIVE.")
+    lp.add_argument("--no-holdout-confirmation", dest="require_holdout_confirmation",
+                    action="store_false",
+                    help="DEV / PROVISIONAL ONLY: skip the independent holdout. "
+                         "Positive candidates are then INCONCLUSIVE (provisional), "
+                         "NEVER a formal ACCEPT. Seed / CI / practical gates stay "
+                         "enforced. Production research must keep confirmation ON.")
+    lp.add_argument("--no-stop-on-no-accept", dest="stop_on_no_accept",
+                    action="store_false", default=True,
+                    help="EVIDENCE-COLLECTION mode: run ALL --rounds even when a "
+                         "round accepts nothing (default: stop early on a genuine "
+                         "no-gain round). This does NOT relax any ACCEPT gate -- "
+                         "INCONCLUSIVE / REJECT decisions are preserved verbatim; "
+                         "it only lets a multi-round study collect its full trail.")
     lp.add_argument("--state-path", default="",
                     help="loop checkpoint path; defaults to "
                          "<project-dir>/state/loop_state.json; resume an "
@@ -492,13 +523,20 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _build_real_domain_runner(domain: str):
+def _build_real_domain_runner(domain: str,
+                              project_dir: str | Path | None = None):
     """Wire a REAL domain engine as the dual-layer domain runner.
 
     The runner executes one materialised config (base or candidate) end-to-end
     through the domain's own compute function (train -> evaluate) and returns the
     primary metric Q. No fabricated metric is ever produced: if the engine or its
     frozen dataset is unavailable, this raises rather than faking a number.
+
+    ``project_dir`` is threaded into the engine spec for the local numeric engines
+    so the frozen dataset the engine READS is the SAME root the
+    CandidateConfigBuilder VERIFIED (data-root isolation, M2.5 P1). Without it the
+    engine would fall back to its module-level source-tree path while candidate
+    configs are materialised under --project-dir -- a provenance gap.
     """
     if domain == "embodied":
         from .domains.embodied import embodied_compute, PRIMARY_METRIC
@@ -538,21 +576,27 @@ def _build_real_domain_runner(domain: str):
         job_dir = _P(art["directory"])
         job_dir.mkdir(parents=True, exist_ok=True)
         seed = int(cfg.get("seed", 42))
+        # Common spec fields; local numeric engines also receive the SAME data
+        # root the candidate configs were materialised/verified against.
+        base_spec: dict = {"stage": "train", "seed": seed}
+        eval_spec: dict = {"stage": "evaluate", "seed": seed,
+                           "run_id": job_dir.name}
+        if project_dir is not None and domain != "scinet":
+            base_spec["project_dir"] = str(project_dir)
+            eval_spec["project_dir"] = str(project_dir)
         if domain == "scinet":
-            tr = compute(cfg, {"stage": "train", "seed": seed}, job_dir,
+            tr = compute(cfg, base_spec, job_dir,
                          config_path=art["config_path"])
         else:
-            tr = compute(cfg, {"stage": "train", "seed": seed}, job_dir)
+            tr = compute(cfg, base_spec, job_dir)
         if tr.get("status") != "succeeded":
             return float("nan")
         run_id = job_dir.name
         if domain == "scinet":
-            ev = compute(cfg, {"stage": "evaluate", "seed": seed,
-                              "run_id": run_id}, job_dir,
+            ev = compute(cfg, eval_spec, job_dir,
                          config_path=art["config_path"])
         else:
-            ev = compute(cfg, {"stage": "evaluate", "seed": seed,
-                              "run_id": run_id}, job_dir)
+            ev = compute(cfg, eval_spec, job_dir)
         if ev.get("status") != "succeeded":
             return float("nan")
         q = (ev.get("metrics") or {}).get(primary_metric)
@@ -583,7 +627,16 @@ def cmd_loop(args: argparse.Namespace) -> int:
     # directory, which is unsafe and easy to clobber).
     state_path = args.state_path or str(
         Path(args.project_dir) / "state" / "loop_state.json")
-    runner = _build_real_domain_runner(args.domain)
+    # CandidateConfigBuilder.build_baseline resolves a RELATIVE baseline config
+    # against project_dir AND requires the result to live inside project_dir.
+    # Normalise once here so a relative --baseline-config (e.g. "config.yaml")
+    # is not joined twice ("proj/proj/config.yaml"). Absolute paths are kept
+    # verbatim. This is a CLI boundary fix, generic to every domain.
+    baseline_config = Path(args.baseline_config)
+    if not baseline_config.is_absolute():
+        baseline_config = Path(args.project_dir) / baseline_config
+    baseline_config = baseline_config.resolve()
+    runner = _build_real_domain_runner(args.domain, args.project_dir)
     # Genuine harness layer: real base harness + real research tasks + an
     # independent held-out task (cross-domain, so a harness improvement that only
     # helps THIS domain cannot be accepted on the held-out evidence).
@@ -598,7 +651,7 @@ def cmd_loop(args: argparse.Namespace) -> int:
     report = run_loop(
         state_path=state_path,
         domain=args.domain,
-        baseline_config_path=args.baseline_config,
+        baseline_config_path=str(baseline_config),
         project_dir=args.project_dir,
         max_rounds=args.rounds,
         dataset_version=args.dataset_version,
@@ -606,6 +659,10 @@ def cmd_loop(args: argparse.Namespace) -> int:
         domain_runner=runner,
         domain_require_frozen_manifest=args.require_frozen_manifest,
         domain_holdout_seeds=tuple(args.holdout_seeds),
+        min_seeds_for_accept=args.min_seeds_for_accept,
+        practical_improvement_floor_rel=args.practical_floor_rel,
+        require_holdout_confirmation=args.require_holdout_confirmation,
+        stop_on_no_accept=args.stop_on_no_accept,
         harness_evolve=evolve,
         base_harness=BASE_HARNESS,
         harness_tasks=tasks,
