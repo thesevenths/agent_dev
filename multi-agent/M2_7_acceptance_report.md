@@ -249,7 +249,7 @@ CRASH RECOVERY OK -- completed rounds were not re-run (real engine).
 
 ## 9. Commit 清单
 
-**本轮 8 个独立 commit，已推送到 `feature/arr-0.1-domain-registry`**（`git push`：`f8654b2a..15267f37`，未 merge main、未开 PR）：
+**本轮 12 个独立 commit，已推送到 `feature/arr-0.1-domain-registry`**（未 merge main、未开 PR）：
 
 | SHA | 逻辑包 |
 |---|---|
@@ -263,9 +263,10 @@ CRASH RECOVERY OK -- completed rounds were not re-run (real engine).
 | `15267f37` | CI 注释同步为 54 项测试（远端 run #1 的触发 commit） |
 | `15d8468e` | P2 真实崩溃恢复检查 + 证据链提取脚本 + loop 日志 |
 | `808d4af3` | P1-1 SciNet++ 真实指标落盘（SHA 追溯）+ 回归测试（第 29 项，全套 55） |
-| `8352ead1` | 本验收报告 + scinet 完整 3 轮日志 + 最终 evidence_chain.json（**分支 HEAD**） |
+| `8352ead1` | 本验收报告 + scinet 完整 3 轮日志 + 最终 evidence_chain.json |
+| `a895d9be` | 修正报告 commit 表与真实 git 历史一致（**分支 HEAD**） |
 
-基线：`f8654b2a`（M2.6 最后一个 commit，ChatGPT 复查看到的远端最新提交）。**本轮共 11 个独立 commit**，已全部推送到 `feature/arr-0.1-domain-registry`（`f8654b2a..15267f37` → `15267f37..15d8468e` → `15d8468e..8352ead1`）。所有 M2/M2.5/M2.6 历史实现与验收产物保留，未删除、未重写；未 merge main、未开 PR。
+基线：`f8654b2a`（M2.6 最后一个 commit，ChatGPT 复查看到的远端最新提交）。**本轮共 12 个独立 commit**，已全部推送到 `feature/arr-0.1-domain-registry`（最终 HEAD `a895d9be`）。所有 M2/M2.5/M2.6 历史实现与验收产物保留，未删除、未重写；未 merge main、未开 PR。
 
 ---
 
