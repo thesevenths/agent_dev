@@ -247,12 +247,16 @@ class TestDualLayerSeparation(unittest.TestCase):
             cfg = Path(tmp) / "base.yaml"
             cfg.write_text(
                 "seed: 0\ntrain:\n  lr: 0.01\ndata: {}\n", encoding="utf-8")
+            # M2.7: a formal ACCEPT now needs >= 5 paired seeds AND an independent
+            # holdout confirmation (>= 5 seeds). Supply BOTH so this separation
+            # test exercises the real accepted path instead of a provisional one.
             payload = run_dual_layer(
                 base_harness=None, tasks=[], heldout_task=None,
                 run_root=tmp, repo_root=tmp, rounds=1, max_minutes=1.0,
                 domain="embodied", domain_base_config=str(cfg),
                 project_dir=tmp, dataset_version="test-v1",
-                domain_seeds=(50, 51),
+                domain_seeds=(50, 51, 52, 53, 54),
+                domain_holdout_seeds=(60, 61, 62, 63, 64),
                 domain_require_frozen_manifest=False,
                 domain_runner=lambda art: 0.7 if "baseline" not in art["directory"] else 0.9,
                 harness_evolve=self._harness_stub)
@@ -299,7 +303,15 @@ class TestDomainDecision(unittest.TestCase):
             "n_accepted": 1,
         }
 
-    def _run(self, runner):
+    def _run(self, runner, *, seeds=(50, 51, 52, 53, 54),
+             holdout_seeds=(60, 61, 62, 63, 64)):
+        """Run one dual-layer round with FULL formal evidence.
+
+        M2.7 raised the ACCEPT bar to >= 5 paired seeds + an independent holdout
+        (>= 5 seeds). Tests that assert a formal ACCEPT/REJECT must supply both;
+        the seed count is overridable only so a test can deliberately exercise the
+        "too few seeds -> INCONCLUSIVE" path.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Path(tmp) / "base.yaml"
             cfg.write_text(
@@ -309,7 +321,7 @@ class TestDomainDecision(unittest.TestCase):
                 run_root=tmp, repo_root=tmp, rounds=1, max_minutes=1.0,
                 domain="embodied", domain_base_config=str(cfg),
                 project_dir=tmp, dataset_version="test-v1",
-                domain_seeds=(50, 51),
+                domain_seeds=seeds, domain_holdout_seeds=holdout_seeds,
                 domain_require_frozen_manifest=False,
                 domain_runner=runner, harness_evolve=self._harness_stub)
             return payload["domain_layer"]["records"]
@@ -334,11 +346,14 @@ class TestDomainDecision(unittest.TestCase):
     def test_failed_run_is_inconclusive_not_rejected(self):
         # NaN (engine failure / missing metric) must become INCONCLUSIVE, never a
         # fabricated REJECT that would pretend the candidate was genuinely worse.
+        # n_invalid counts the 5 PAIRED runs (holdout is tracked separately in
+        # holdout_n_valid), so a full-evidence failure yields 5 invalid pairs.
         recs = self._run(lambda art: float("nan"))
         self.assertTrue(recs)
         for r in recs:
             self.assertEqual(r["decision"], "inconclusive")
-            self.assertEqual(r["n_invalid"], 2)
+            self.assertEqual(r["n_invalid"], 5)
+            self.assertEqual(r["holdout_n_valid"], 0)
 
     def test_single_seed_is_inconclusive(self):
         # One paired run cannot separate signal from noise -> INCONCLUSIVE.
