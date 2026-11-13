@@ -531,7 +531,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _build_real_domain_runner(domain: str,
-                              project_dir: str | Path | None = None):
+                              project_dir: str | Path | None = None,
+                              ood_config_path: str | Path | None = None):
     """Wire a REAL domain engine as the dual-layer domain runner.
 
     The runner executes one materialised config (base or candidate) end-to-end
@@ -593,7 +594,8 @@ def _build_real_domain_runner(domain: str,
             eval_spec["project_dir"] = str(project_dir)
         if domain == "scinet":
             tr = compute(cfg, base_spec, job_dir,
-                         config_path=art["config_path"])
+                         config_path=art["config_path"],
+                         ood_config_path=ood_config_path)
         else:
             tr = compute(cfg, base_spec, job_dir)
         if tr.get("status") != "succeeded":
@@ -601,7 +603,8 @@ def _build_real_domain_runner(domain: str,
         run_id = job_dir.name
         if domain == "scinet":
             ev = compute(cfg, eval_spec, job_dir,
-                         config_path=art["config_path"])
+                         config_path=art["config_path"],
+                         ood_config_path=ood_config_path)
         else:
             ev = compute(cfg, eval_spec, job_dir)
         if ev.get("status") != "succeeded":

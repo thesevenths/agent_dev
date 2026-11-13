@@ -12,6 +12,7 @@ campaign.
 from __future__ import annotations
 
 import importlib
+import json
 import math
 from pathlib import Path
 from typing import Any, Callable
@@ -84,6 +85,91 @@ def _coerce(raw: Any) -> Any:
         except ValueError:
             return raw
     return raw
+
+
+def _read_ood_q(directory: str | Path, primary_metric: str) -> float:
+    """Read the OOD metric Q that ``scinet_compute`` wrote for one artifact.
+
+    Returns NaN when the OOD evaluation did not run or did not succeed, so a
+    missing / broken OOD result fails closed into the OOD gate (never faked).
+    The OOD Q lives in ``ood_metrics.json`` in the SAME research_runtime job_dir
+    as the ID ``backtest_metrics.json``; the two files are disjoint by design.
+    """
+    p = Path(directory) / "ood_metrics.json"
+    if not p.is_file():
+        return float("nan")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return float("nan")
+    metrics = data.get("metrics") or {}
+    q = metrics.get(primary_metric)
+    if not _is_finite(q):
+        return float("nan")
+    return float(q)
+
+
+def _axis_record(base_Q: list[float], cand_Q: list[float],
+                ho_base: list[float] | None, ho_cand: list[float] | None,
+                sign: float, min_valid_seeds: int, *, prefix: str = ""
+                ) -> dict[str, Any]:
+    """Direction-normalized improvement record for ONE evaluation axis.
+
+    The ID axis uses ``prefix=""``; the OOD axis (M3.3) uses ``prefix="ood_"``.
+    Every field is namespaced with ``prefix`` so the SAME gate primitives
+    (``_significance_direction`` / ``_holdout_confirms`` / ``domain_family_…
+    ``) read the correct axis by key. ``ho_base`` / ``ho_cand`` are ``None``
+    when no holdout seeds were requested for this axis.
+    """
+    valid = [(b, c) for b, c in zip(base_Q, cand_Q)
+             if _is_finite(b) and _is_finite(c)]
+    n_invalid = len(base_Q) - len(valid)
+    improvements = [sign * (c - b) for (b, c) in valid]
+    if valid:
+        mean_improvement = sum(improvements) / len(improvements)
+        std_improvement = _std(improvements)
+        baseline_mean = sum(b for (b, c) in valid) / len(valid)
+    else:
+        mean_improvement = std_improvement = baseline_mean = None
+    f: dict[str, Any] = {
+        f"{prefix}base_Q": base_Q,
+        f"{prefix}cand_Q": cand_Q,
+        f"{prefix}deltas": [round(c - b, 6) for b, c in zip(base_Q, cand_Q)],
+        f"{prefix}improvements": [round(x, 6) for x in improvements],
+        f"{prefix}mean_improvement": (round(mean_improvement, 6)
+                                     if mean_improvement is not None else None),
+        f"{prefix}std_improvement": (round(std_improvement, 6)
+                                    if std_improvement is not None else None),
+        f"{prefix}baseline_mean": (round(baseline_mean, 6)
+                                  if baseline_mean is not None else None),
+        f"{prefix}n_seeds": len(base_Q),
+        f"{prefix}n_valid": len(valid),
+        f"{prefix}n_invalid": n_invalid,
+        f"{prefix}min_valid_seeds": min_valid_seeds,
+    }
+    if ho_base is not None and ho_cand is not None:
+        ho_valid = [(b, c) for b, c in zip(ho_base, ho_cand)
+                    if _is_finite(b) and _is_finite(c)]
+        ho_imp = [sign * (c - b) for (b, c) in ho_valid]
+        f[f"{prefix}holdout_base_Q"] = [b if _is_finite(b) else None
+                                       for b in ho_base]
+        f[f"{prefix}holdout_cand_Q"] = [c if _is_finite(c) else None
+                                       for c in ho_cand]
+        f[f"{prefix}holdout_improvements"] = [round(x, 6) for x in ho_imp]
+        f[f"{prefix}holdout_n_seeds"] = len(ho_base)
+        f[f"{prefix}holdout_n_valid"] = len(ho_valid)
+        f[f"{prefix}holdout_n_invalid"] = len(ho_base) - len(ho_valid)
+        f[f"{prefix}holdout_n_positive"] = sum(1 for x in ho_imp if x > 0)
+        f[f"{prefix}holdout_direction_fraction"] = (
+            round(f[f"{prefix}holdout_n_positive"] / len(ho_imp), 6)
+            if ho_imp else None)
+        if ho_imp:
+            f[f"{prefix}holdout_improvement"] = round(sum(ho_imp) / len(ho_imp), 6)
+            f[f"{prefix}holdout_std_improvement"] = round(_std(ho_imp), 6)
+        else:
+            f[f"{prefix}holdout_improvement"] = None
+            f[f"{prefix}holdout_std_improvement"] = None
+    return f
 
 
 def generate_domain_candidates(*, domain: str, dominant: str,
@@ -171,7 +257,8 @@ def evaluate_domain_candidate(*, domain: str, candidate: DomainModelCandidate,
                               runner: DomainRunner | None = None,
                               require_frozen_manifest: bool = True,
                               holdout_seeds: tuple[int, ...] = (),
-                              min_valid_seeds: int = 2
+                              min_valid_seeds: int = 2,
+                              ood_config_path: str | Path | None = None
                               ) -> dict[str, Any]:
     """Paired Base/Candidate experiment for ONE domain candidate on fixed seeds.
 
@@ -204,9 +291,12 @@ def evaluate_domain_candidate(*, domain: str, candidate: DomainModelCandidate,
     #       -1 -> smaller (cand - base) is better (minimize).
     sign = -1.0 if direction == "minimize" else 1.0
 
-    def _run_on(run_seeds: tuple[int, ...]) -> tuple[list[float], list[float]]:
+    def _run_on(run_seeds: tuple[int, ...], *, need_ood: bool
+                ) -> tuple[list[float], list[float], list[float], list[float]]:
         bQ: list[float] = []
         cQ: list[float] = []
+        bOQ: list[float] = []
+        cOQ: list[float] = []
         for seed in run_seeds:
             arts = materialize_domain_candidate(
                 domain=domain, candidate=candidate, base_config=base_config,
@@ -215,24 +305,10 @@ def evaluate_domain_candidate(*, domain: str, candidate: DomainModelCandidate,
                 require_frozen_manifest=require_frozen_manifest)
             bQ.append(runner(arts["base"]))
             cQ.append(runner(arts["candidate"]))
-        return bQ, cQ
-
-    base_Q, cand_Q = _run_on(seeds)
-    valid = [(b, c) for b, c in zip(base_Q, cand_Q)
-             if _is_finite(b) and _is_finite(c)]
-    n_invalid = len(base_Q) - len(valid)
-    improvements = [sign * (c - b) for (b, c) in valid]
-    if valid:
-        mean_improvement = sum(improvements) / len(improvements)
-        std_improvement = _std(improvements)
-        # Raw (direction-native) baseline mean, kept so the decision can apply a
-        # *relative* practical-improvement floor independent of the metric's scale
-        # (latent_mse ~1e-2 vs net_return ~1e-1 must share one threshold).
-        baseline_mean = sum(b for (b, c) in valid) / len(valid)
-    else:
-        mean_improvement = None
-        std_improvement = None
-        baseline_mean = None
+            if need_ood:
+                bOQ.append(_read_ood_q(arts["base"]["directory"], primary_metric))
+                cOQ.append(_read_ood_q(arts["candidate"]["directory"], primary_metric))
+        return bQ, cQ, bOQ, cOQ
 
     rec: dict[str, Any] = {
         "candidate_type": CandidateType.DOMAIN_MODEL.value,
@@ -244,46 +320,28 @@ def evaluate_domain_candidate(*, domain: str, candidate: DomainModelCandidate,
         "new": candidate.new,
         "taxonomy": candidate.taxonomy,
         "hyp_fingerprint": candidate.hyp_fingerprint,
-        "base_Q": base_Q,
-        "cand_Q": cand_Q,
-        # Raw (cand - base) deltas, kept for traceability only.
-        "deltas": [round(c - b, 6) for b, c in zip(base_Q, cand_Q)],
-        # Direction-normalized: positive == candidate is BETTER.
-        "improvements": [round(x, 6) for x in improvements],
-        "mean_improvement": (round(mean_improvement, 6)
-                             if mean_improvement is not None else None),
-        "std_improvement": (round(std_improvement, 6)
-                            if std_improvement is not None else None),
-        "baseline_mean": (round(baseline_mean, 6)
-                          if baseline_mean is not None else None),
-        "n_seeds": len(seeds),
-        "n_valid": len(valid),
-        "n_invalid": n_invalid,
-        "min_valid_seeds": min_valid_seeds,
     }
+
+    # ---- ID axis (in-distribution): prefix "" reuses the exact M3.0 gate ----
+    base_Q, cand_Q, _bO, _cO = _run_on(seeds, need_ood=False)
+    rec.update(_axis_record(base_Q, cand_Q, None, None, sign, min_valid_seeds))
     if holdout_seeds:
-        ho_base, ho_cand = _run_on(holdout_seeds)
-        ho_valid = [(b, c) for b, c in zip(ho_base, ho_cand)
-                    if _is_finite(b) and _is_finite(c)]
-        ho_imp = [sign * (c - b) for (b, c) in ho_valid]
-        # M3.0: persist EVERY holdout seed's RAW result, not just the mean.
-        # M2.7's mean-only record could not prove an independent direction
-        # confirmation and silently swallowed partially-failed holdout seeds.
-        # These fields are DISJOINT from ``improvements`` / ``mean_improvement``
-        # -- the holdout never enters the candidate-selection statistic.
-        rec["holdout_base_Q"] = [b if _is_finite(b) else None for b in ho_base]
-        rec["holdout_cand_Q"] = [c if _is_finite(c) else None for c in ho_cand]
-        rec["holdout_improvements"] = [round(x, 6) for x in ho_imp]
-        rec["holdout_n_seeds"] = len(holdout_seeds)
-        rec["holdout_n_valid"] = len(ho_valid)
-        rec["holdout_n_invalid"] = len(ho_base) - len(ho_valid)
-        rec["holdout_n_positive"] = sum(1 for x in ho_imp if x > 0)
-        rec["holdout_direction_fraction"] = (
-            round(rec["holdout_n_positive"] / len(ho_imp), 6) if ho_imp else None)
-        if ho_imp:
-            rec["holdout_improvement"] = round(sum(ho_imp) / len(ho_imp), 6)
-            rec["holdout_std_improvement"] = round(_std(ho_imp), 6)
-        else:
-            rec["holdout_improvement"] = None
-            rec["holdout_std_improvement"] = None
+        ho_base, ho_cand, _hbO, _hcO = _run_on(holdout_seeds, need_ood=False)
+        rec.update(_axis_record(base_Q, cand_Q, ho_base, ho_cand, sign,
+                               min_valid_seeds))
+
+    # ---- OOD axis (M3.3, regime shift): SAME gate, namespaced "ood_" ----
+    # The runner produces the OOD Q as a side-effect (scinet_compute writes
+    # ood_metrics.json); _read_ood_q then reads it. When ``ood_config_path`` is
+    # None the axis is simply absent and every OOD gate read fails closed.
+    if ood_config_path is not None:
+        _b, _c, ood_base_Q, ood_cand_Q = _run_on(seeds, need_ood=True)
+        ood_rec = _axis_record(ood_base_Q, ood_cand_Q, None, None, sign,
+                               min_valid_seeds, prefix="ood_")
+        if holdout_seeds:
+            _hb, _hc, ho_base_o, ho_cand_o = _run_on(holdout_seeds, need_ood=True)
+            ood_rec.update(_axis_record(ood_base_Q, ood_cand_Q, ho_base_o,
+                                        ho_cand_o, sign, min_valid_seeds,
+                                        prefix="ood_"))
+        rec.update(ood_rec)
     return rec

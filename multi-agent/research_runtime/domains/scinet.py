@@ -104,7 +104,8 @@ def scinet_research_policy(*, project_dir: str | Path | None = None,
 # --------------------------------------------------------------------------- #
 
 def scinet_compute(config: dict[str, Any], spec: dict[str, Any],
-                   job_dir: Any, *, config_path: str | Path) -> dict[str, Any]:
+                   job_dir: Any, *, config_path: str | Path,
+                   ood_config_path: str | Path | None = None) -> dict[str, Any]:
     """REAL SciNet++ engine runner for the dual-layer loop.
 
     Drives the genuine SciNet++ engine through ``SciNetAdapter`` (subprocess
@@ -190,6 +191,42 @@ def scinet_compute(config: dict[str, Any], spec: dict[str, Any],
     # metric values come from the engine's collect_result, never fabricated here.
     from ..candidate_config import sha256_file
     metrics = dict(res.metrics)
+
+    # ---- OOD evaluation (M3.3): reuse the SAME trained checkpoint via run_id,
+    # but score it on an independent regime-shift dataset (a DIFFERENT frozen_dir
+    # with a content-addressed, distinct dataset_version). The engine loads the
+    # OOD data while reusing ID-trained weights -- this is a genuine
+    # generalization probe, NOT an IID re-read. No FakeRunner, no fabricated
+    # metric: an unreachable engine / missing OOD config fails closed to NaN ->
+    # the OOD axis is INCONCLUSIVE. The OOD result is persisted to
+    # ``ood_metrics.json`` in the SAME research_runtime job_dir, disjoint from
+    # ``backtest_metrics.json`` so the ID / OOD evidence can never collide.
+    ood_metrics: dict[str, Any] | None = None
+    ood_dataset_version: str | None = None
+    ood_cfg_path: str | None = None
+    if ood_config_path is not None:
+        ood_cfg = Path(ood_config_path)
+        if not ood_cfg.is_file():
+            return {"status": "failed", "error_type": "ood_config_missing",
+                    "error": f"OOD config not found: {ood_cfg}"}
+        ood_cfg_path = str(ood_cfg)
+        ood_eval_spec = ExperimentSpec(
+            experiment_id=experiment_id, objective_id=SCINET_OBJECTIVE_ID,
+            stage="evaluate", config_path=str(ood_cfg), run_id=run_id,
+            split=split, seed=seed, budget={"epochs": epochs})
+        try:
+            ojid = adapter.submit(ood_eval_spec)
+            adapter.wait(ojid, timeout=WAIT_TIMEOUT_S)
+            ores = adapter.collect_result(ojid, ood_eval_spec)
+        except (AdapterError, ConfigurationError) as exc:
+            return {"status": "failed", "error_type": "ood_eval_error",
+                    "error": f"SciNet++ OOD evaluate failed: {exc}"}
+        if ores.status != "succeeded":
+            return {"status": "failed", "error_type": "ood_eval_failed",
+                    "error": ores.error or f"OOD evaluate status={ores.status}"}
+        ood_metrics = dict(ores.metrics)
+        ood_dataset_version = ores.dataset_version
+
     ckpt_path = job_dir / "checkpoint.json"
     out = job_dir / "backtest_metrics.json"
     out.write_text(json.dumps({
@@ -198,9 +235,25 @@ def scinet_compute(config: dict[str, Any], spec: dict[str, Any],
         "checkpoint_sha256": (sha256_file(ckpt_path)
                              if ckpt_path.is_file() else None),
     }, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
-    return {"status": "succeeded", "metrics": metrics,
-            "checkpoint": {"path": str(ckpt_path),
-                           "sha256": (sha256_file(ckpt_path)
-                                      if ckpt_path.is_file() else None)},
-            "artifacts": ["backtest_metrics.json", "checkpoint.json"]}
+    artifacts = ["backtest_metrics.json", "checkpoint.json"]
+    result: dict[str, Any] = {
+        "status": "succeeded", "metrics": metrics,
+        "checkpoint": {"path": str(ckpt_path),
+                       "sha256": (sha256_file(ckpt_path)
+                                  if ckpt_path.is_file() else None)},
+        "artifacts": artifacts,
+    }
+    if ood_metrics is not None:
+        oout = job_dir / "ood_metrics.json"
+        oout.write_text(json.dumps({
+            "metrics": ood_metrics, "split": split, "run_id": run_id,
+            "dataset_version": ood_dataset_version,
+            "config_path": ood_cfg_path,
+            "checkpoint_sha256": (sha256_file(ckpt_path)
+                                 if ckpt_path.is_file() else None),
+        }, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+        result["artifacts"] = artifacts + ["ood_metrics.json"]
+        result["ood_metrics"] = ood_metrics
+        result["ood_dataset_version"] = ood_dataset_version
+    return result
 

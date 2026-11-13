@@ -70,7 +70,8 @@ def _nonneg_int(x: Any) -> bool:
     return isinstance(x, int) and not isinstance(x, bool) and x >= 0
 
 
-def _significance_direction(rec: dict[str, Any], alpha: float) -> str | None:
+def _significance_direction(rec: dict[str, Any], alpha: float,
+                           prefix: str = "") -> str | None:
     """Two-sided Student-t decision for ONE paired-improvement sample.
 
     Returns ``"positive"`` only when the whole ``1-alpha`` CI is above 0,
@@ -81,12 +82,19 @@ def _significance_direction(rec: dict[str, Any], alpha: float) -> str | None:
 
     ``std == 0`` is NOT treated as missing: all paired differences are identical,
     so the CI degenerates to the single point ``mean`` and the direction is exact.
+
+    ``prefix`` namespaces the field reads so the SAME logic decides the OOD axis
+    (``prefix="ood_"``) as the ID axis (``prefix=""``) under the M3.3 extension.
+    A missing / malformed axis fails closed to ``None`` (inconclusive).
     """
     if not _finite_number(alpha) or not (0.0 < alpha < 1.0):
         return None
-    n = rec["n_valid"]
-    mean = rec["mean_improvement"]
-    std = rec["std_improvement"]
+    n = rec.get(f"{prefix}n_valid")
+    mean = rec.get(f"{prefix}mean_improvement")
+    std = rec.get(f"{prefix}std_improvement")
+    if (not _nonneg_int(n) or n < 2 or not _finite_number(mean)
+            or not _finite_number(std) or std < 0):
+        return None
     lo, hi = paired_confidence_interval(mean, std, n, alpha)
     if lo > 0.0:
         return "positive"
@@ -96,7 +104,7 @@ def _significance_direction(rec: dict[str, Any], alpha: float) -> str | None:
 
 
 def _holdout_confirms(rec: dict[str, Any], direction: str,
-                      min_seeds: int) -> bool:
+                      min_seeds: int, prefix: str = "") -> bool:
     """Independent holdout CONFIRMATION using per-seed raw results.
 
     M2.7 only checked the holdout *mean*. M3.0 additionally requires:
@@ -110,11 +118,11 @@ def _holdout_confirms(rec: dict[str, Any], direction: str,
     The holdout numbers never enter ``improvements`` / ``mean_improvement``, so
     they cannot leak into candidate selection.
     """
-    ho_mean = rec.get("holdout_improvement")
-    ho_n = rec.get("holdout_n_valid")
-    ho_seeds = rec.get("holdout_n_seeds")
-    ho_invalid = rec.get("holdout_n_invalid")
-    ho_imp = rec.get("holdout_improvements")
+    ho_mean = rec.get(f"{prefix}holdout_improvement")
+    ho_n = rec.get(f"{prefix}holdout_n_valid")
+    ho_seeds = rec.get(f"{prefix}holdout_n_seeds")
+    ho_invalid = rec.get(f"{prefix}holdout_n_invalid")
+    ho_imp = rec.get(f"{prefix}holdout_improvements")
     if not _finite_number(ho_mean) or not _nonneg_int(ho_n) or ho_n < min_seeds:
         return False
     if not _nonneg_int(ho_seeds) or ho_seeds != ho_n:
@@ -134,8 +142,8 @@ def _holdout_confirms(rec: dict[str, Any], direction: str,
 
 
 def domain_family_significance(records: list[dict[str, Any]],
-                               alpha: float = DEFAULT_ALPHA
-                               ) -> list[dict[str, Any]]:
+                               alpha: float = DEFAULT_ALPHA,
+                               prefix: str = "") -> list[dict[str, Any]]:
     """Family-wise Holm correction for ONE round's domain candidates.
 
     A round evaluates several candidates (e.g. three learning rates) and then
@@ -145,16 +153,19 @@ def domain_family_significance(records: list[dict[str, Any]],
     ``alpha`` can only be made STRICTER than the frozen protocol constant --
     a caller must never be able to widen it to manufacture ACCEPTs. Records with
     missing / invalid statistics get p=1.0 (least significant), never a free pass.
+
+    ``prefix`` namespaces the axis (``""`` = ID, ``"ood_"`` = OOD) so the SAME
+    family correction applies to the OOD axis under the M3.3 extension.
     """
     effective_alpha = min(float(alpha), DEFAULT_ALPHA)
     p_values: list[float] = []
     for rec in records:
-        n = rec.get("n_valid")
-        mean = rec.get("mean_improvement")
-        std = rec.get("std_improvement")
+        n = rec.get(f"{prefix}n_valid")
+        mean = rec.get(f"{prefix}mean_improvement")
+        std = rec.get(f"{prefix}std_improvement")
         if (not _nonneg_int(n) or n < 2 or not _finite_number(mean)
                 or not _finite_number(std) or std < 0
-                or (rec.get("n_invalid") or 0) > 0):
+                or (rec.get(f"{prefix}n_invalid") or 0) > 0):
             p_values.append(1.0)
         else:
             p_values.append(paired_p_value(mean, std, n))
@@ -165,7 +176,8 @@ def _decide_domain(rec: dict[str, Any], *,
                    min_seeds_for_accept: int = MIN_SEEDS_FOR_FORMAL_ACCEPT,
                    practical_improvement_floor_rel: float = PRACTICAL_IMPROVEMENT_FLOOR_REL,
                    require_holdout_confirmation: bool = True,
-                   holm_alpha: float | None = None
+                   holm_alpha: float | None = None,
+                   prefix: str = ""
                    ) -> CandidateStatus:
     """Fixed, transparent, BIDIRECTIONAL statistical decision for one candidate.
 
@@ -201,22 +213,22 @@ def _decide_domain(rec: dict[str, Any], *,
              else min(float(holm_alpha), DEFAULT_ALPHA))
 
     # 1) Evidence hygiene -- fail closed on ANY missing / malformed statistic.
-    n_valid = rec.get("n_valid")
-    n_invalid = rec.get("n_invalid")
+    n_valid = rec.get(f"{prefix}n_valid")
+    n_invalid = rec.get(f"{prefix}n_invalid")
     if not _nonneg_int(n_valid) or not _nonneg_int(n_invalid):
         return CandidateStatus.INCONCLUSIVE
     if n_invalid > 0 or n_valid < min_seeds_for_accept:
         return CandidateStatus.INCONCLUSIVE
-    mean = rec.get("mean_improvement")
-    std = rec.get("std_improvement")
-    baseline_mean = rec.get("baseline_mean")
+    mean = rec.get(f"{prefix}mean_improvement")
+    std = rec.get(f"{prefix}std_improvement")
+    baseline_mean = rec.get(f"{prefix}baseline_mean")
     if not _finite_number(mean) or not _finite_number(std) or std < 0:
         return CandidateStatus.INCONCLUSIVE
     if not _finite_number(baseline_mean) or abs(baseline_mean) <= 0.0:
         return CandidateStatus.INCONCLUSIVE
 
     # 2) Bidirectional Student-t significance (Holm-adjusted when in a family).
-    direction = _significance_direction(rec, alpha)
+    direction = _significance_direction(rec, alpha, prefix=prefix)
     if direction is None:
         return CandidateStatus.INCONCLUSIVE
 
@@ -229,7 +241,8 @@ def _decide_domain(rec: dict[str, Any], *,
     if not require_holdout_confirmation:
         if direction == "positive":
             return CandidateStatus.INCONCLUSIVE
-    elif not _holdout_confirms(rec, direction, min_seeds_for_accept):
+    elif not _holdout_confirms(rec, direction, min_seeds_for_accept,
+                               prefix=prefix):
         return CandidateStatus.INCONCLUSIVE
 
     # 5) Only statistically significant directions produce a terminal verdict.
@@ -251,6 +264,33 @@ def _version_inheritance(harness_payload: dict[str, Any],
     }
 
 
+def _combine_dual_layer_decisions(id_status: CandidateStatus,
+                                 ood_status: CandidateStatus) -> CandidateStatus:
+    """Combine the ID and OOD axis verdicts into ONE production verdict (M3.3).
+
+    A candidate is PRODUCTION-ACCEPTED only when BOTH axes accept it -- that is
+    the entire point of the OOD gate: an ID-only gain that collapses under
+    distribution shift must not be shipped. Semantics:
+
+      * ID ACCEPT + OOD ACCEPT       -> ACCEPTED  (OOD-confident production).
+      * ID ACCEPT + OOD REJECTED     -> REJECTED  (ID-overfit exposed: the change
+                                        helps the training regime but HARMS the
+                                        deployment regime -- strictly worse than
+                                        neutral, so it is rejected, not merely
+                                        left undecided).
+      * ID ACCEPT + OOD INCONCLUSIVE -> INCONCLUSIVE (cannot claim OOD robustness;
+                                        the gate stays shut).
+      * ID not ACCEPTED (REJECT / INCONCLUSIVE) -> unchanged (OOD is irrelevant).
+    """
+    if id_status == CandidateStatus.ACCEPTED:
+        if ood_status == CandidateStatus.ACCEPTED:
+            return CandidateStatus.ACCEPTED
+        if ood_status == CandidateStatus.REJECTED:
+            return CandidateStatus.REJECTED
+        return CandidateStatus.INCONCLUSIVE
+    return id_status
+
+
 def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
                    run_root: str | Path, repo_root: str | Path,
                    rounds: int = 2, max_minutes: float = 30.0, operator: str = "",
@@ -269,7 +309,13 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
                    # M2.7 statistical gate (P0-1): never lower the bar for ACCEPT.
                    min_seeds_for_accept: int = MIN_SEEDS_FOR_FORMAL_ACCEPT,
                    practical_improvement_floor_rel: float = PRACTICAL_IMPROVEMENT_FLOOR_REL,
-                   require_holdout_confirmation: bool = True
+                   require_holdout_confirmation: bool = True,
+                   # M3.3: an independent regime-shift (OOD) dataset. When set,
+                   # every candidate is ALSO scored on this dataset with the SAME
+                   # gate (namespaced "ood_"); the production verdict is the
+                   # combination of the ID and OOD axes (see
+                   # _combine_dual_layer_decisions). None -> behaviour unchanged.
+                   ood_config_path: str | Path | None = None
                    ) -> dict[str, Any]:
     """Run the two RRSI layers and return a combined, auditable payload."""
     run_root = Path(run_root).resolve()
@@ -287,12 +333,23 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
 
     # ---- Layer 2: DOMAIN_MODEL (reuses existing whitelist + builder) ----
     domain_records: list[dict[str, Any]] = []
-    if domain and domain_base_config and domain_runner is not None:
+    if domain and domain_base_config and (domain_runner is not None
+                                         or ood_config_path is not None):
+        # When an OOD axis is requested but no runner was supplied, build the
+        # REAL engine runner with the OOD config wired in. (The M3.0 driver
+        # supplies its own runner with ood_config_path; this branch only fires
+        # when run_dual_layer is asked to build one.)
+        if ood_config_path is not None and domain_runner is None:
+            from research_runtime.cli import _build_real_domain_runner
+            domain_runner = _build_real_domain_runner(
+                domain, project_dir, ood_config_path=ood_config_path)
         dominant = harness_payload.get("dominant_failure", "")
         cands = generate_domain_candidates(domain=domain, dominant=dominant)
         # ---- Phase 1: evaluate EVERY candidate first (real engine runs) ----
         # M3.0: Holm correction needs the whole family's p-values, so decisions
-        # can no longer be made one-by-one inside the evaluation loop.
+        # can no longer be made one-by-one inside the evaluation loop. The OOD
+        # axis is produced in the SAME pass (scinet_compute writes both
+        # backtest_metrics.json and ood_metrics.json), so no extra engine run.
         evaluated: list[tuple[Any, dict[str, Any]]] = []
         for c in cands:
             registry.register(c, status=CandidateStatus.PROPOSED)
@@ -304,7 +361,8 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
                 seeds=domain_seeds, dataset_version=dataset_version,
                 runner=domain_runner,
                 require_frozen_manifest=domain_require_frozen_manifest,
-                holdout_seeds=domain_holdout_seeds)
+                holdout_seeds=domain_holdout_seeds,
+                ood_config_path=ood_config_path)
             registry.transition(c.hyp_fingerprint, CandidateStatus.EVALUATED,
                                record=rec)
             evaluated.append((c, rec))
@@ -320,6 +378,7 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
                 "holm_rank": h["rank"],
                 "n_compared": h["n_compared"],
                 "method": h["method"],
+                "axis": "id",
             }
             decision = _decide_domain(
                 rec,
@@ -328,11 +387,70 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
                 require_holdout_confirmation=require_holdout_confirmation,
                 holm_alpha=h["effective_alpha"])
             rec["decision"] = decision.value
-            # Persist the FULL record (evidence + statistics + decision) in the
-            # registry so the SHA-256 evidence chain can recompute the verdict.
-            registry.transition(c.hyp_fingerprint, decision, record=rec)
+            if ood_config_path is None:
+                # M3.0 (no OOD axis): the ID verdict IS the production verdict,
+                # so persist it as the single terminal transition here.
+                registry.transition(c.hyp_fingerprint, decision, record=rec)
+            else:
+                # M3.3: the production verdict is the ID+OOD COMBINATION, decided
+                # in Phase 3. We must NOT terminal-transition now, because the
+                # registry state machine forbids a second terminal transition
+                # (e.g. ACCEPTED -> REJECTED). Phase 3 issues exactly ONE
+                # terminal transition per candidate to the combined verdict.
+                pass
             domain_records.append(rec)
 
+        # ---- Phase 3 (M3.3): OOD axis -- SAME gate, namespaced "ood_" ----
+        # Reuses the identical M3.0 protocol on the regime-shift axis. The final
+        # production verdict combines ID + OOD via _combine_dual_layer_decisions.
+        if ood_config_path is not None:
+            ood_holm = domain_family_significance(
+                [rec for _, rec in evaluated], prefix="ood_")
+            for (c, rec), h in zip(evaluated, ood_holm):
+                ood_decision = _decide_domain(
+                    rec, prefix="ood_",
+                    min_seeds_for_accept=min_seeds_for_accept,
+                    practical_improvement_floor_rel=practical_improvement_floor_rel,
+                    require_holdout_confirmation=require_holdout_confirmation,
+                    holm_alpha=h["effective_alpha"])
+                rec["ood_statistics"] = {
+                    "protocol": "M3.0-student-t-holm",
+                    "family_alpha": DEFAULT_ALPHA,
+                    "p_value": round(h["p_value"], 9),
+                    "holm_effective_alpha": h["effective_alpha"],
+                    "holm_significant": h["significant"],
+                    "holm_rank": h["rank"],
+                    "n_compared": h["n_compared"],
+                    "method": h["method"],
+                    "axis": "ood",
+                }
+                rec["ood_decision"] = ood_decision.value
+                id_decision = CandidateStatus(rec["decision"])
+                rec["decision"] = _combine_dual_layer_decisions(
+                    id_decision, ood_decision).value
+                # Single terminal transition to the COMBINED verdict. In OOD mode
+                # this is the ONLY terminal transition (Phase 2 withheld it), so
+                # the registry state machine is respected (EVALUATED -> terminal).
+                registry.transition(
+                    c.hyp_fingerprint,
+                    CandidateStatus(rec["decision"]), record=rec)
+
+    ood_config_resolved = (str(ood_config_path)
+                           if ood_config_path is not None else None)
+    if ood_config_path is not None:
+        ood_counts: dict[str, int | None] = {
+            "ood_n_accepted": sum(1 for r in domain_records
+                                 if r.get("ood_decision") == CandidateStatus.ACCEPTED.value),
+            "ood_n_rejected": sum(1 for r in domain_records
+                                 if r.get("ood_decision") == CandidateStatus.REJECTED.value),
+            "ood_n_inconclusive": sum(1 for r in domain_records
+                                     if r.get("ood_decision") == CandidateStatus.INCONCLUSIVE.value),
+        }
+    else:
+        ood_counts = {
+            "ood_n_accepted": None, "ood_n_rejected": None,
+            "ood_n_inconclusive": None,
+        }
     payload: dict[str, Any] = {
         "schema_version": "arr-1.1-dual-layer-v1",
         "elapsed_seconds": round(time.time() - started, 3),
@@ -354,6 +472,10 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
                              if r.get("decision") == CandidateStatus.REJECTED.value),
             "n_inconclusive": sum(1 for r in domain_records
                                  if r.get("decision") == CandidateStatus.INCONCLUSIVE.value),
+            "ood_config_path": ood_config_resolved,
+            "ood_n_accepted": ood_counts["ood_n_accepted"],
+            "ood_n_rejected": ood_counts["ood_n_rejected"],
+            "ood_n_inconclusive": ood_counts["ood_n_inconclusive"],
         },
         "separation": {
             "candidate_types_distinct": HARNESS_LAYER != DOMAIN_LAYER,
