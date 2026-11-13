@@ -52,6 +52,7 @@ from .local_engine import (
     checkpoint_for_run,
     load_split,
     read_frozen_manifest,
+    record_checkpoint,
     sha256_bytes,
 )
 
@@ -280,6 +281,15 @@ def quant_compute(config: dict[str, Any], spec: dict[str, Any],
         blob = json.dumps(checkpoint, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ckpt = job_dir / "checkpoint.json"
         ckpt.write_bytes(blob)
+        # Register the trained checkpoint so a later evaluate stage can resolve it
+        # by run_id (checkpoint_for_run) without scanning every job dir. Without
+        # this index the direct train->evaluate handoff (used by the dual-layer
+        # RRSI runner) cannot find the checkpoint and the round fails. Embodied's
+        # compute already does this; Quant's train stage was missing it -- a
+        # PRE-EXISTING bug (M2.6 does not touch Quant) that broke the Quant loop's
+        # eval handoff. Fixed here so the three-domain loop is coherent.
+        record_checkpoint(job_dir, run_id=str(spec.get("run_id") or job_dir.name),
+                         checkpoint_path=ckpt)
         return {
             "status": "succeeded",
             "metrics": {"train_signal_norm": math.sqrt(sum(w * w for w in weights))},
