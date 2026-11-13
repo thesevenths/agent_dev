@@ -47,6 +47,15 @@ def derive_next_version(*, state: LoopState, payload: dict[str, Any],
     if not accepted_domain and not accepted_harness:
         return state, None, None, None
 
+    # Resolve the baseline config against project_dir: bake_baseline reads it
+    # relative to CWD, so a relative --baseline-config (which the CLI stores
+    # verbatim) must be made absolute here. This is the data-root isolation
+    # principle (M2.5 P1) applied to version inheritance -- the next round must
+    # inherit the SAME project root, never the operator's shell CWD.
+    baseline_src = Path(state.baseline_config_path)
+    if not baseline_src.is_absolute():
+        baseline_src = Path(project_dir) / baseline_src
+
     # ---- accumulate domain overrides (union; later rounds stack on earlier) ----
     new_overrides: dict[str, Any] = {}
     for r in accepted_domain:
@@ -77,7 +86,7 @@ def derive_next_version(*, state: LoopState, payload: dict[str, Any],
     if new_overrides:
         out = (Path(project_dir)
                / f"baseline_v{state.current_round + 1}.yaml")
-        bake_baseline(baseline_config_path=state.baseline_config_path,
+        bake_baseline(baseline_config_path=str(baseline_src),
                       overrides=new_overrides, out_path=str(out))
         next_baseline = str(out)
         # The accumulated overrides persist across rounds so a later acceptance
@@ -86,15 +95,16 @@ def derive_next_version(*, state: LoopState, payload: dict[str, Any],
         merged.update(new_overrides)
         state.accepted_domain_overrides = merged
     else:
-        # No domain change this round -> the next round keeps the same baseline.
-        next_baseline = state.baseline_config_path
+        # No domain change this round -> the next round keeps the same baseline
+        # (absolute, project-root-anchored, so the next round resolves it too).
+        next_baseline = str(baseline_src)
 
     if next_base_harness is not None:
         state.base_harness_tag = next_base_harness
 
     record = VersionRecord(
         round_no=state.current_round,
-        baseline_config_path=next_baseline or state.baseline_config_path,
+        baseline_config_path=next_baseline or str(baseline_src),
         accepted_domain_overrides=new_overrides,
         accepted_harness_targets=accepted_harness_targets,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
