@@ -265,11 +265,25 @@ def evaluate_domain_candidate(*, domain: str, candidate: DomainModelCandidate,
         ho_base, ho_cand = _run_on(holdout_seeds)
         ho_valid = [(b, c) for b, c in zip(ho_base, ho_cand)
                     if _is_finite(b) and _is_finite(c)]
-        if ho_valid:
-            ho_imp = [sign * (c - b) for (b, c) in ho_valid]
+        ho_imp = [sign * (c - b) for (b, c) in ho_valid]
+        # M3.0: persist EVERY holdout seed's RAW result, not just the mean.
+        # M2.7's mean-only record could not prove an independent direction
+        # confirmation and silently swallowed partially-failed holdout seeds.
+        # These fields are DISJOINT from ``improvements`` / ``mean_improvement``
+        # -- the holdout never enters the candidate-selection statistic.
+        rec["holdout_base_Q"] = [b if _is_finite(b) else None for b in ho_base]
+        rec["holdout_cand_Q"] = [c if _is_finite(c) else None for c in ho_cand]
+        rec["holdout_improvements"] = [round(x, 6) for x in ho_imp]
+        rec["holdout_n_seeds"] = len(holdout_seeds)
+        rec["holdout_n_valid"] = len(ho_valid)
+        rec["holdout_n_invalid"] = len(ho_base) - len(ho_valid)
+        rec["holdout_n_positive"] = sum(1 for x in ho_imp if x > 0)
+        rec["holdout_direction_fraction"] = (
+            round(rec["holdout_n_positive"] / len(ho_imp), 6) if ho_imp else None)
+        if ho_imp:
             rec["holdout_improvement"] = round(sum(ho_imp) / len(ho_imp), 6)
-            rec["holdout_n_valid"] = len(ho_valid)
+            rec["holdout_std_improvement"] = round(_std(ho_imp), 6)
         else:
             rec["holdout_improvement"] = None
-            rec["holdout_n_valid"] = 0
+            rec["holdout_std_improvement"] = None
     return rec
