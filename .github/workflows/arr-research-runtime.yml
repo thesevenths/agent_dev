@@ -1,25 +1,91 @@
-name: ARR engine-free CI
+name: ARR Research Runtime (M2.7)
 
-# M2.6 (fix #6): a real remote gate for the unified Research Runtime. This workflow
-# runs the ENGINE-FREE suite only -- it never needs the SciNet++ torch checkout
-# (SCINET_DIR) or real exchange data, so it executes on plain ubuntu runners.
-# Engine-dependent runs (real SciNet++ / robotics / exchange backtest) remain
-# operator-driven with fail-closed local verification (see M2_6_*_loop.log).
+# ---------------------------------------------------------------------------
+# M2.7 P0-3: the M2.6 engine-free gate was created at the WRONG path
+#   multi-agent/.github/workflows/arr_ci.yml
+# GitHub Actions only auto-discovers workflows under <REPO-ROOT>/.github/workflows/,
+# so that file was never run. It is moved here and renamed arr-research-runtime.yml.
+#
+# The EXISTING root workflow .github/workflows/arr-0.1.yml (ARR 0.1 integration)
+# is PRESERVED untouched -- this is an ADDITIONAL gate, not a replacement.
+#
+# Runs the UNIFIED Research Runtime suite on every push/PR to the ARR feature
+# branch. ENGINE-FREE: no torch / SciNet++ checkout / real robot / exchange data.
+# Real-engine runs remain operator-driven with fail-closed local verification.
+#
+# Dependency note (verified in a CLEAN venv, M2.7):
+#   `pyyaml` ALONE is NOT enough. research_runtime/__init__.py imports
+#   research_runtime/schemas.py -> `from pydantic import ...` at MODULE level,
+#   so every engine-free test import needs pydantic. The M2.6 workflow installed
+#   only pyyaml and would have failed with ModuleNotFoundError even if it had
+#   been in the right directory. Minimal verified set: PyYAML + pydantic>=2.7.4.
+#   Verified: 53 passed, 0 failed in a clean venv with exactly these two.
+# ---------------------------------------------------------------------------
+
 on:
   push:
     branches: [feature/arr-0.1-domain-registry]
   pull_request:
     branches: [feature/arr-0.1-domain-registry]
+  workflow_dispatch:
 
 jobs:
-  engine-free-tests:
-    runs-on: ubuntu-latest
+  research-runtime-tests:
+    # Repo-root placement + working-directory: the ARR suites live under
+    # multi-agent/, while GitHub discovers workflows ONLY at the repo root.
+    defaults:
+      run:
+        working-directory: multi-agent
+        shell: bash
+    name: ARR 1.1 runtime (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      - name: Install minimal deps
-        run: python -m pip install --upgrade pip pyyaml
-      - name: Run engine-free research_runtime tests
-        run: python -m unittest research_runtime.tests.test_loop research_runtime.tests.test_unified_candidate -v
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install minimal verified deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "PyYAML>=6.0" "pydantic>=2.7.4"
+
+      - name: Run unified Research Runtime engine-free suite
+        # Covered modules:
+        #   test_loop              -> loop controller / recovery / version inheritance
+        #   test_unified_candidate -> candidate lifecycle, domain_evolver,
+        #                            materialize/evaluate_domain_candidate,
+        #                            evolution_controller dual-layer separation
+        #   test_m2_7_reliability  -> M2.7 statistical gate (_decide_domain),
+        #                            holdout isolation, CLI arg defaults,
+        #                            frozen-manifest fail-closed + resume re-verify
+        run: |
+          python -m unittest \
+            research_runtime.tests.test_loop \
+            research_runtime.tests.test_unified_candidate \
+            research_runtime.tests.test_m2_7_reliability \
+            -v
+
+      - name: Verify CLI safety defaults (no engine required)
+        # Independent CLI smoke: the production entry point must default to
+        # require-frozen-manifest ON, 5 paired seeds, holdout confirmation ON.
+        run: |
+          python -c "
+          from research_runtime.cli import build_parser
+          a = build_parser().parse_args(['loop','--domain','scinet','--baseline-config','b.yaml','--project-dir','p'])
+          assert a.require_frozen_manifest is True, 'frozen-manifest must default ON'
+          assert a.require_holdout_confirmation is True, 'holdout confirmation must default ON'
+          assert a.seeds == [50,51,52,53,54], 'formal ACCEPT requires >=5 seeds by default'
+          assert a.min_seeds_for_accept >= 5
+          b = build_parser().parse_args(['loop','--domain','scinet','--baseline-config','b.yaml','--project-dir','p','--allow-unfrozen-data'])
+          assert b.require_frozen_manifest is False, 'explicit dev opt-out must work'
+          print('CLI safety defaults OK')
+          "
