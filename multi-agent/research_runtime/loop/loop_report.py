@@ -38,10 +38,17 @@ def build_loop_report(state: LoopState) -> dict[str, Any]:
 
 
 def summarise_text(report: dict[str, Any]) -> str:
+    # M2.7: under a strict statistical gate most rounds legitimately end
+    # INCONCLUSIVE/REJECT, so "rounds=<accepted>/<requested>" used to read as
+    # "0/3" for a loop that actually EXECUTED all 3 rounds. Report both the
+    # executed-round count and the accepted-version count explicitly -- never let
+    # an honest no-gain run look like it did nothing.
     lines = [
         f"ARR 1.1 research loop {report['loop_id']} -- domain={report['domain']}",
-        f"  status={report['status']} rounds={report['rounds_completed']}/"
-        f"{report['rounds_requested']}",
+        f"  status={report['status']} "
+        f"rounds_executed={report.get('rounds_executed', report['rounds_completed'])}"
+        f"/{report['rounds_requested']} "
+        f"accepted_versions={report['rounds_completed']}",
         f"  final baseline: {report['final_baseline_config_path']}",
         f"  accumulated domain overrides: "
         f"{report['final_accepted_domain_overrides'] or '{}'}",

@@ -55,6 +55,7 @@ from research_runtime.evolution.evolution_controller import (
     _decide_domain, run_dual_layer,
 )
 from research_runtime.loop.controller import _reverify_frozen_manifest, run_loop
+from research_runtime.loop.loop_report import build_loop_report, summarise_text
 from research_runtime.loop.recovery import LoopRecoveryError
 from research_runtime.loop.research_cycle import run_research_cycle
 
@@ -388,6 +389,30 @@ class TestFrozenManifestSafetyDefault(unittest.TestCase):
                 _reverify_frozen_manifest(
                     project_dir=tmp, baseline_config_path=Path(tmp) / "gone.yaml",
                     dataset_version="test-v1", domain="embodied")
+
+
+class TestNoGainRunIsReportedHonestly(unittest.TestCase):
+    """M2.7: a strict-gate run with 0 ACCEPT must not read as '0 rounds ran'."""
+
+    def test_report_distinguishes_executed_rounds_from_accepted_versions(self):
+        from research_runtime.loop.loop_state import LoopState
+        st = LoopState(
+            loop_id="m27_no_gain", domain="quant", max_rounds=3,
+            current_round=4, status="completed",
+            baseline_config_path="config.yaml",
+            dataset_version="market_hist_v1-7640575b236b",
+            domain_seeds=[50, 51, 52, 53, 54])
+        st.last_completed_round = 3  # all 3 rounds really executed
+        # version_history stays empty: every candidate was honestly
+        # INCONCLUSIVE / REJECT -- no version to inherit.
+        report = build_loop_report(st)
+        self.assertEqual(report["rounds_executed"], 3)
+        self.assertEqual(report["rounds_completed"], 0)
+        text = summarise_text(report)
+        self.assertIn("rounds_executed=3/3", text)
+        self.assertIn("accepted_versions=0", text)
+        # The old misleading "rounds=0/3" line must be gone.
+        self.assertNotIn("rounds=0/3", text)
 
 
 if __name__ == "__main__":
