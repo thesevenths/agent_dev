@@ -267,13 +267,18 @@ def _backtest(rows: list[dict[str, Any]], config: dict[str, Any],
 def quant_compute(config: dict[str, Any], spec: dict[str, Any],
                   job_dir: Path) -> dict[str, Any]:
     stage = spec.get("stage")
+    # Isolation-aware data root: prefer an explicit project_dir from the spec so
+    # a loop's materialised configs and the frozen dataset they were VERIFIED
+    # against share ONE root. Default PROJECT_DIR keeps the standalone campaign
+    # working. Mirrors embodied_compute (data-root isolation, M2.5 P1).
+    project_dir = Path(spec.get("project_dir") or PROJECT_DIR).resolve()
     if stage == "train":
-        rows = load_split(PROJECT_DIR, config, "train")
+        rows = load_split(project_dir, config, "train")
         weights = _fit(config, rows, int(spec.get("seed") or 42))
         checkpoint = {
             "weights": weights, "config": config,
             "bootstrap_seed": int(spec.get("seed") or 42),
-            "dataset_version": read_frozen_manifest(PROJECT_DIR, config)["dataset_version"],
+            "dataset_version": read_frozen_manifest(project_dir, config)["dataset_version"],
             "seed": spec.get("seed"),
             "trained_on": "train",
             "label_used": "fwd_ret_1 (train split only; never an input feature)",
@@ -309,7 +314,7 @@ def quant_compute(config: dict[str, Any], spec: dict[str, Any],
     if split not in ("train", "validation", "test", "ood"):
         return {"status": "failed", "error_type": "invalid_split",
                 "error": f"unknown split {split!r}"}
-    rows = load_split(PROJECT_DIR, config, split)
+    rows = load_split(project_dir, config, split)
     metrics = _backtest(rows, config, weights)
     if metrics["lookahead_leakage"] > 0:
         return {"status": "failed", "error_type": "integrity_error",
