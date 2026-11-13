@@ -28,6 +28,9 @@ from .harness_evolver import evolve as _harness_evolve, HARNESS_LAYER
 from .domain_evolver import (
     generate_domain_candidates, evaluate_domain_candidate, DOMAIN_LAYER,
 )
+from .statistics import (
+    DEFAULT_ALPHA, paired_p_value, paired_confidence_interval, holm_step_down,
+)
 
 DomainRunner = Callable[[dict[str, Any]], float]
 
@@ -51,96 +54,187 @@ MIN_SEEDS_FOR_FORMAL_ACCEPT = 5
 #: this are treated as noise-level and downgraded to INCONCLUSIVE, never ACCEPTED.
 PRACTICAL_IMPROVEMENT_FLOOR_REL = 0.01
 
+#: M3.0: an independent holdout must confirm the paired direction on at least
+#: this fraction of its seeds (a strict majority), IN ADDITION to a same-sign
+#: holdout mean. A single lucky holdout seed must not be able to confirm a gain.
+HOLDOUT_DIRECTION_MIN_FRACTION = 0.6
+
+
+def _finite_number(x: Any) -> bool:
+    """A real, finite number (bools are NOT numbers for evidence purposes)."""
+    return (isinstance(x, (int, float)) and not isinstance(x, bool)
+            and math.isfinite(x))
+
+
+def _nonneg_int(x: Any) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool) and x >= 0
+
+
+def _significance_direction(rec: dict[str, Any], alpha: float) -> str | None:
+    """Two-sided Student-t decision for ONE paired-improvement sample.
+
+    Returns ``"positive"`` only when the whole ``1-alpha`` CI is above 0,
+    ``"negative"`` only when the whole CI is below 0, and ``None`` when the CI
+    straddles 0 (or the significance level is unusable). This is the M3.0
+    replacement for M2.7's ``mean - 1.96*se`` normal approximation, which
+    underestimated uncertainty at n=5 (correct t critical value: 2.776).
+
+    ``std == 0`` is NOT treated as missing: all paired differences are identical,
+    so the CI degenerates to the single point ``mean`` and the direction is exact.
+    """
+    if not _finite_number(alpha) or not (0.0 < alpha < 1.0):
+        return None
+    n = rec["n_valid"]
+    mean = rec["mean_improvement"]
+    std = rec["std_improvement"]
+    lo, hi = paired_confidence_interval(mean, std, n, alpha)
+    if lo > 0.0:
+        return "positive"
+    if hi < 0.0:
+        return "negative"
+    return None
+
+
+def _holdout_confirms(rec: dict[str, Any], direction: str,
+                      min_seeds: int) -> bool:
+    """Independent holdout CONFIRMATION using per-seed raw results.
+
+    M2.7 only checked the holdout *mean*. M3.0 additionally requires:
+      * every requested holdout seed produced a valid paired run (no silent
+        partial failure -- ``holdout_n_seeds == holdout_n_valid`` and
+        ``holdout_n_invalid == 0``);
+      * the persisted per-seed raw improvements are complete and finite;
+      * a strict majority of holdout seeds point in the SAME direction as the
+        paired verdict, and the holdout mean agrees.
+
+    The holdout numbers never enter ``improvements`` / ``mean_improvement``, so
+    they cannot leak into candidate selection.
+    """
+    ho_mean = rec.get("holdout_improvement")
+    ho_n = rec.get("holdout_n_valid")
+    ho_seeds = rec.get("holdout_n_seeds")
+    ho_invalid = rec.get("holdout_n_invalid")
+    ho_imp = rec.get("holdout_improvements")
+    if not _finite_number(ho_mean) or not _nonneg_int(ho_n) or ho_n < min_seeds:
+        return False
+    if not _nonneg_int(ho_seeds) or ho_seeds != ho_n:
+        return False
+    if not _nonneg_int(ho_invalid) or ho_invalid != 0:
+        return False
+    if not isinstance(ho_imp, (list, tuple)) or len(ho_imp) != ho_n:
+        return False
+    if not all(_finite_number(x) for x in ho_imp):
+        return False
+    frac_positive = sum(1 for x in ho_imp if x > 0) / ho_n
+    if direction == "positive":
+        return (ho_mean > 0.0
+                and frac_positive >= HOLDOUT_DIRECTION_MIN_FRACTION)
+    return (ho_mean < 0.0
+            and (1.0 - frac_positive) >= HOLDOUT_DIRECTION_MIN_FRACTION)
+
+
+def domain_family_significance(records: list[dict[str, Any]],
+                               alpha: float = DEFAULT_ALPHA
+                               ) -> list[dict[str, Any]]:
+    """Family-wise Holm correction for ONE round's domain candidates.
+
+    A round evaluates several candidates (e.g. three learning rates) and then
+    picks the best; using an uncorrected 95% CI for each inflates the chance of a
+    false-positive "winner". Holm step-down controls the family-wise error rate.
+
+    ``alpha`` can only be made STRICTER than the frozen protocol constant --
+    a caller must never be able to widen it to manufacture ACCEPTs. Records with
+    missing / invalid statistics get p=1.0 (least significant), never a free pass.
+    """
+    effective_alpha = min(float(alpha), DEFAULT_ALPHA)
+    p_values: list[float] = []
+    for rec in records:
+        n = rec.get("n_valid")
+        mean = rec.get("mean_improvement")
+        std = rec.get("std_improvement")
+        if (not _nonneg_int(n) or n < 2 or not _finite_number(mean)
+                or not _finite_number(std) or std < 0
+                or (rec.get("n_invalid") or 0) > 0):
+            p_values.append(1.0)
+        else:
+            p_values.append(paired_p_value(mean, std, n))
+    return holm_step_down(p_values, alpha=effective_alpha)
+
 
 def _decide_domain(rec: dict[str, Any], *,
                    min_seeds_for_accept: int = MIN_SEEDS_FOR_FORMAL_ACCEPT,
                    practical_improvement_floor_rel: float = PRACTICAL_IMPROVEMENT_FLOOR_REL,
-                   require_holdout_confirmation: bool = True
+                   require_holdout_confirmation: bool = True,
+                   holm_alpha: float | None = None
                    ) -> CandidateStatus:
-    """Fixed, transparent, direction-aware decision for one domain candidate.
+    """Fixed, transparent, BIDIRECTIONAL statistical decision for one candidate.
 
-    M2.7 statistical gate (no fabricated verdicts, no lowered bar):
-      * Any NaN / Inf / None / missing run (``n_invalid > 0``) is INCONCLUSIVE --
-        a failed or missing experiment is NOT "real degradation".
-      * Fewer than ``min_seeds_for_accept`` valid paired runs is INCONCLUSIVE: a
-        2-seed dev/quick run can therefore never be formally ACCEPTED.
-      * Statistical significance: the 95% CI (normal approx) of the paired
-        improvements must exclude 0; a directional but non-significant gain is
-        INCONCLUSIVE, not ACCEPT.
-      * Practical significance: the mean improvement must exceed a relative floor
-        of the baseline metric (``practical_improvement_floor_rel``); a
-        directional but noise-level gain is INCONCLUSIVE, not ACCEPT.
-      * Independent holdout confirmation is REQUIRED for a formal ACCEPT: with
-        ``require_holdout_confirmation`` (default True) a missing / too-small /
-        contradictory holdout downgrades to INCONCLUSIVE. The holdout set is
-        evaluated ONLY as confirmation -- it never participates in candidate
-        selection, so it cannot leak into the decision it is meant to guard. With
-        it disabled (DEV / provisional mode) a positive candidate is only ever
-        INCONCLUSIVE, never a formal ACCEPT.
-      * HARD FLOORS: ``min_seeds_for_accept`` / ``practical_improvement_floor_rel``
-        can only be RAISED above the module constants, never lowered -- no CLI
-        flag or Python API caller can relax the gate to manufacture more ACCEPTs.
-      * A genuine negative improvement is REJECTED; it is never silently dropped.
+    M3.0 protocol (frozen; no fabricated verdicts, no lowered bar):
+      * Any NaN / Inf / None / missing experiment (``n_invalid > 0``) is
+        INCONCLUSIVE -- a failed run is NOT "real degradation".
+      * Fewer than ``min_seeds_for_accept`` valid paired runs is INCONCLUSIVE.
+      * MISSING STATISTICS FAIL CLOSED: ``n_valid`` / ``n_invalid`` /
+        ``mean_improvement`` / ``std_improvement`` / ``baseline_mean`` must all
+        be finite and well-formed. M2.7 silently SKIPPED the CI check when std
+        was missing and SKIPPED the practical floor when baseline_mean was
+        missing; both are now hard INCONCLUSIVE.
+      * BIDIRECTIONAL significance: a two-sided STUDENT-T CI (Holm-adjusted
+        ``alpha``) must lie wholly above 0 for ACCEPT, or wholly below 0 for
+        REJECT. A CI straddling 0 is INCONCLUSIVE in EITHER direction -- M2.7
+        used the normal 1.96 critical value and rejected on ``mean <= 0`` alone.
+      * Practical significance: a positive gain must exceed a relative floor of
+        the baseline metric; a noise-level gain is INCONCLUSIVE, not ACCEPT.
+      * Independent holdout confirmation is REQUIRED: >= min_seeds valid
+        holdout seeds, all requested seeds valid, per-seed raw results persisted,
+        a same-sign mean AND a strict majority of seeds in the same direction.
+        The holdout never participates in candidate selection.
+      * DEV / provisional mode (``require_holdout_confirmation=False``): a
+        positive candidate is only ever INCONCLUSIVE, never a formal ACCEPT.
+      * HARD FLOORS: caller parameters can only RAISE the bar. ``holm_alpha`` is
+        clamped to at most ``DEFAULT_ALPHA``.
     """
-    # M2.7 P0-1 rule 8: clamp to the hard floors. A caller may demand MORE
-    # evidence, but can never demand LESS than the formal protocol.
     min_seeds_for_accept = max(int(min_seeds_for_accept),
                                MIN_SEEDS_FOR_FORMAL_ACCEPT)
     floor_rel = max(float(practical_improvement_floor_rel),
                     PRACTICAL_IMPROVEMENT_FLOOR_REL)
+    alpha = (DEFAULT_ALPHA if holm_alpha is None
+             else min(float(holm_alpha), DEFAULT_ALPHA))
 
-    n_valid = rec.get("n_valid") or 0
-    n_invalid = rec.get("n_invalid") or 0
-    # 1) Any failed / missing experiment is not evidence of degradation.
-    if n_invalid > 0:
+    # 1) Evidence hygiene -- fail closed on ANY missing / malformed statistic.
+    n_valid = rec.get("n_valid")
+    n_invalid = rec.get("n_invalid")
+    if not _nonneg_int(n_valid) or not _nonneg_int(n_invalid):
         return CandidateStatus.INCONCLUSIVE
-    # 2) Too few valid paired runs to separate signal from noise -> cannot ACCEPT.
-    if n_valid < min_seeds_for_accept:
+    if n_invalid > 0 or n_valid < min_seeds_for_accept:
         return CandidateStatus.INCONCLUSIVE
     mean = rec.get("mean_improvement")
-    if mean is None or not math.isfinite(mean):
-        return CandidateStatus.INCONCLUSIVE
     std = rec.get("std_improvement")
-    # 3) Statistical significance: for a gain that would be ACCEPTED (mean > 0), the
-    #    95% CI (normal approx) of paired diffs must exclude 0; a directional but
-    #    non-significant gain is INCONCLUSIVE. (A negative mean is heading to REJECT
-    #    regardless, so the CI gate is only applied on the positive side.)
-    if mean > 0 and std is not None and math.isfinite(std) and std > 0 and n_valid >= 2:
-        se = std / math.sqrt(n_valid)
-        ci_lower = mean - 1.96 * se
-        if ci_lower <= 0:
-            return CandidateStatus.INCONCLUSIVE
-    # 4) Practical significance: improvement must exceed a relative floor of the
-    #    baseline metric, otherwise it is noise-level -> INCONCLUSIVE.
     baseline_mean = rec.get("baseline_mean")
-    if (baseline_mean is not None and math.isfinite(baseline_mean)
-            and abs(baseline_mean) > 0):
-        floor = floor_rel * abs(baseline_mean)
-        if 0 < mean < floor:
+    if not _finite_number(mean) or not _finite_number(std) or std < 0:
+        return CandidateStatus.INCONCLUSIVE
+    if not _finite_number(baseline_mean) or abs(baseline_mean) <= 0.0:
+        return CandidateStatus.INCONCLUSIVE
+
+    # 2) Bidirectional Student-t significance (Holm-adjusted when in a family).
+    direction = _significance_direction(rec, alpha)
+    if direction is None:
+        return CandidateStatus.INCONCLUSIVE
+
+    # 3) Practical significance on the positive side.
+    if direction == "positive":
+        if mean < floor_rel * abs(baseline_mean):
             return CandidateStatus.INCONCLUSIVE
-    # 5) Independent holdout confirmation required for a formal ACCEPT.
-    ho = rec.get("holdout_improvement")
-    ho_n = rec.get("holdout_n_valid") or 0
+
+    # 4) Independent holdout confirmation (per-seed direction, not just mean).
     if not require_holdout_confirmation:
-        # DEV / provisional mode: no independent holdout was executed. A positive
-        # candidate is only PROVISIONAL -> INCONCLUSIVE (never a formal ACCEPT);
-        # this stops the fast dev path from manufacturing real scientific verdicts.
-        if mean > 0:
+        if direction == "positive":
             return CandidateStatus.INCONCLUSIVE
-    else:
-        if ho is None or not math.isfinite(ho) or ho_n < min_seeds_for_accept:
-            return CandidateStatus.INCONCLUSIVE
-        # A candidate that CLAIMS improvement (mean > 0) must be confirmed by the
-        # independent holdout; a contradictory (non-positive) holdout downgrades it
-        # to INCONCLUSIVE. A candidate that is already worse (mean <= 0) is
-        # REJECTED regardless of holdout sign -- the holdout cannot rescue a
-        # genuine regression.
-        if mean > 0 and ho <= 0:
-            return CandidateStatus.INCONCLUSIVE
-    # 6) Genuine negative improvement -> REJECT (never silently dropped).
-    if mean <= 0:
-        return CandidateStatus.REJECTED
-    return CandidateStatus.ACCEPTED
+    elif not _holdout_confirms(rec, direction, min_seeds_for_accept):
+        return CandidateStatus.INCONCLUSIVE
+
+    # 5) Only statistically significant directions produce a terminal verdict.
+    return (CandidateStatus.ACCEPTED if direction == "positive"
+            else CandidateStatus.REJECTED)
 
 
 def _version_inheritance(harness_payload: dict[str, Any],
@@ -196,6 +290,10 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
     if domain and domain_base_config and domain_runner is not None:
         dominant = harness_payload.get("dominant_failure", "")
         cands = generate_domain_candidates(domain=domain, dominant=dominant)
+        # ---- Phase 1: evaluate EVERY candidate first (real engine runs) ----
+        # M3.0: Holm correction needs the whole family's p-values, so decisions
+        # can no longer be made one-by-one inside the evaluation loop.
+        evaluated: list[tuple[Any, dict[str, Any]]] = []
         for c in cands:
             registry.register(c, status=CandidateStatus.PROPOSED)
             registry.transition(c.hyp_fingerprint, CandidateStatus.CRITIC_APPROVED)
@@ -209,13 +307,30 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
                 holdout_seeds=domain_holdout_seeds)
             registry.transition(c.hyp_fingerprint, CandidateStatus.EVALUATED,
                                record=rec)
+            evaluated.append((c, rec))
+        # ---- Phase 2: family-wise correction, then per-candidate verdict ----
+        holm = domain_family_significance([rec for _, rec in evaluated])
+        for (c, rec), h in zip(evaluated, holm):
+            rec["statistics"] = {
+                "protocol": "M3.0-student-t-holm",
+                "family_alpha": DEFAULT_ALPHA,
+                "p_value": round(h["p_value"], 9),
+                "holm_effective_alpha": h["effective_alpha"],
+                "holm_significant": h["significant"],
+                "holm_rank": h["rank"],
+                "n_compared": h["n_compared"],
+                "method": h["method"],
+            }
             decision = _decide_domain(
                 rec,
                 min_seeds_for_accept=min_seeds_for_accept,
                 practical_improvement_floor_rel=practical_improvement_floor_rel,
-                require_holdout_confirmation=require_holdout_confirmation)
-            registry.transition(c.hyp_fingerprint, decision)
+                require_holdout_confirmation=require_holdout_confirmation,
+                holm_alpha=h["effective_alpha"])
             rec["decision"] = decision.value
+            # Persist the FULL record (evidence + statistics + decision) in the
+            # registry so the SHA-256 evidence chain can recompute the verdict.
+            registry.transition(c.hyp_fingerprint, decision, record=rec)
             domain_records.append(rec)
 
     payload: dict[str, Any] = {
@@ -225,6 +340,13 @@ def run_dual_layer(*, base_harness: Any, tasks: list[Any], heldout_task: Any,
         "domain_layer": {
             "domain": domain,
             "candidate_type": CandidateType.DOMAIN_MODEL.value,
+            "statistics_protocol": {
+                "name": "M3.0-student-t-holm",
+                "family_alpha": DEFAULT_ALPHA,
+                "n_compared": len(domain_records),
+                "holdout_direction_min_fraction": HOLDOUT_DIRECTION_MIN_FRACTION,
+                "bidirectional": True,
+            },
             "records": domain_records,
             "n_accepted": sum(1 for r in domain_records
                              if r.get("decision") == CandidateStatus.ACCEPTED.value),
