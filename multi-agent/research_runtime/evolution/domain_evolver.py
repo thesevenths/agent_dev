@@ -225,9 +225,14 @@ def evaluate_domain_candidate(*, domain: str, candidate: DomainModelCandidate,
     if valid:
         mean_improvement = sum(improvements) / len(improvements)
         std_improvement = _std(improvements)
+        # Raw (direction-native) baseline mean, kept so the decision can apply a
+        # *relative* practical-improvement floor independent of the metric's scale
+        # (latent_mse ~1e-2 vs net_return ~1e-1 must share one threshold).
+        baseline_mean = sum(b for (b, c) in valid) / len(valid)
     else:
         mean_improvement = None
         std_improvement = None
+        baseline_mean = None
 
     rec: dict[str, Any] = {
         "candidate_type": CandidateType.DOMAIN_MODEL.value,
@@ -249,6 +254,8 @@ def evaluate_domain_candidate(*, domain: str, candidate: DomainModelCandidate,
                              if mean_improvement is not None else None),
         "std_improvement": (round(std_improvement, 6)
                             if std_improvement is not None else None),
+        "baseline_mean": (round(baseline_mean, 6)
+                          if baseline_mean is not None else None),
         "n_seeds": len(seeds),
         "n_valid": len(valid),
         "n_invalid": n_invalid,
