@@ -485,23 +485,30 @@ def build_parser() -> argparse.ArgumentParser:
                          "actually search, not the previous 1.0-min floor.")
     lp.add_argument("--holdout-seeds", nargs="*", type=int, default=[],
                     help="independent seeds for holdout confirmation of domain "
-                         "candidates (a clear contradiction downgrades to "
-                         "INCONCLUSIVE). Provide >= --min-seeds-for-accept for a "
-                         "formal ACCEPT.")
+                         "candidates. M3.0: EVERY holdout seed's raw result is "
+                         "persisted and a strict majority must confirm the paired "
+                         "direction; a partially-failed or contradictory holdout "
+                         "downgrades to INCONCLUSIVE. Provide >= "
+                         "--min-seeds-for-accept for a formal ACCEPT.")
     lp.add_argument("--min-seeds-for-accept", type=int, default=5,
                     help="minimum VALID paired seeds for a formal Domain ACCEPT "
                          "(default 5, HARD FLOOR: values below 5 are clamped UP, "
                          "never down). Fewer seeds (e.g. 2) can only produce "
-                         "INCONCLUSIVE, never ACCEPT -- the M2.7 statistical gate.")
+                         "INCONCLUSIVE. M3.0 frozen protocol: two-sided Student-t "
+                         "CI (df=n-1) + family-wise Holm correction across all "
+                         "candidates in the round; CI straddling 0 is INCONCLUSIVE "
+                         "in BOTH directions.")
     lp.add_argument("--practical-floor-rel", type=float, default=0.01,
                     help="relative practical-improvement floor: a positive mean gain "
                          "below this fraction of the baseline metric is noise-level "
-                         "(INCONCLUSIVE). Default 0.01, HARD FLOOR (clamped UP).")
+                         "(INCONCLUSIVE). Default 0.01, HARD FLOOR (clamped UP). "
+                         "M3.0: a missing baseline_mean fails closed instead of "
+                         "skipping this check.")
     lp.add_argument("--require-holdout-confirmation", dest="require_holdout_confirmation",
                     action="store_true", default=True,
                     help="(default ON) a formal Domain ACCEPT requires an "
-                         "independent holdout confirmation; without it the candidate "
-                         "is INCONCLUSIVE.")
+                         "independent per-seed holdout confirmation; without it the "
+                         "candidate is INCONCLUSIVE.")
     lp.add_argument("--no-holdout-confirmation", dest="require_holdout_confirmation",
                     action="store_false",
                     help="DEV / PROVISIONAL ONLY: skip the independent holdout. "
