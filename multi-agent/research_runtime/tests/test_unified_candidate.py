@@ -105,11 +105,21 @@ class TestDomainCandidate(unittest.TestCase):
                 c.hyp_fingerprint.startswith("domain_model::"))
 
     def test_generate_empty_when_domain_has_no_whitelist(self):
-        # SciNet++ exposes no ALLOWED_KEYS, so no DOMAIN_MODEL candidate can be
-        # fabricated for it -- the loop must fall back to its harness layer.
+        # M2.6: SciNet++ now exports ALLOWED_KEYS (re-exported from campaign.scinet),
+        # so the loop can generate REAL DOMAIN_MODEL candidates for it instead of
+        # silently falling back to harness-only. This test now asserts the wiring
+        # works: every generated candidate targets a knob inside scinet's whitelist
+        # (e.g. train.lr), never an unknown field.
+        from research_runtime.domains import scinet as scinet_mod
         cands = generate_domain_candidates(
             domain="scinet", dominant="DECISION_UNCERTAINTY", limit=3)
-        self.assertEqual(cands, [])
+        self.assertTrue(
+            cands, "scinet must now produce domain-model candidates")
+        for c in cands:
+            self.assertEqual(c.domain, "scinet")
+            self.assertIn(c.target, scinet_mod.ALLOWED_KEYS)
+            self.assertTrue(
+                c.hyp_fingerprint.startswith("domain_model::"))
 
 
 class TestRegistry(unittest.TestCase):
