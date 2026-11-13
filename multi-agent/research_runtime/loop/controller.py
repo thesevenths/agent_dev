@@ -26,7 +26,8 @@ from typing import Any, Callable
 from .improvement_cycle import derive_next_version
 from .loop_report import build_loop_report, summarise_text
 from .loop_state import LoopState, save
-from .recovery import load_or_init, mark_completed, mark_failed
+from .recovery import (LoopRecoveryError, load_or_init, mark_completed,
+                        mark_failed)
 from .research_cycle import run_research_cycle
 from .version_inheritance import default_harness_inherit
 
@@ -39,8 +40,15 @@ def run_loop(*, state_path: str | Path,
              dataset_version: str = "test-v1",
              domain_seeds: tuple[int, ...] = (50, 51),
              domain_runner: Callable[[dict[str, Any]], float] | None = None,
-             domain_require_frozen_manifest: bool = False,
+             # M2.7 P0-2: frozen-manifest enforcement is a RUNTIME safety property,
+             # not a CLI convenience. Default ON so any direct Python-API caller
+             # (not just the CLI) is protected; dev mode must opt OUT explicitly.
+             domain_require_frozen_manifest: bool = True,
              domain_holdout_seeds: tuple[int, ...] = (),
+             # M2.7 P0-1 statistical gate (threaded verbatim to the decision).
+             min_seeds_for_accept: int = 5,
+             practical_improvement_floor_rel: float = 0.01,
+             require_holdout_confirmation: bool = True,
              harness_evolve: Callable[..., dict[str, Any]] | None = None,
              harness_inherit_fn: Callable[[list[dict[str, Any]], Any], Any]
              | None = None,
@@ -87,6 +95,17 @@ def run_loop(*, state_path: str | Path,
     if base_harness_tag is not None and not resumed:
         state.base_harness_tag = base_harness_tag
 
+    # M2.7 P0-2: on RESUME, re-verify the frozen dataset bound to the inherited
+    # baseline before trusting a prior run's checkpoint. A changed/corrupt dataset
+    # must fail closed, never silently continue. (Per-round evaluation also
+    # re-verifies, but the explicit resume check is the gate ChatGPT required.)
+    if resumed and domain_require_frozen_manifest:
+        _reverify_frozen_manifest(
+            project_dir=project_dir,
+            baseline_config_path=state.baseline_config_path,
+            dataset_version=dataset_version,
+            domain=domain)
+
     if state.status == "completed":
         return build_loop_report(state)
     if state.status == "failed":
@@ -110,6 +129,9 @@ def run_loop(*, state_path: str | Path,
                 domain_runner=domain_runner,
                 domain_require_frozen_manifest=domain_require_frozen_manifest,
                 domain_holdout_seeds=domain_holdout_seeds,
+                min_seeds_for_accept=min_seeds_for_accept,
+                practical_improvement_floor_rel=practical_improvement_floor_rel,
+                require_holdout_confirmation=require_holdout_confirmation,
                 harness_evolve=harness_evolve,
                 base_harness=current_base_harness,
                 harness_tasks=harness_tasks,
@@ -168,3 +190,46 @@ def _record_payload_sha(state: LoopState, payload: dict[str, Any]) -> None:
         state.last_round_payload_sha256 = hashlib.sha256(blob).hexdigest()
     except (TypeError, ValueError):
         state.last_round_payload_sha256 = ""
+
+
+def _reverify_frozen_manifest(*, project_dir: str | Path,
+                              baseline_config_path: str | Path,
+                              dataset_version: str, domain: str) -> None:
+    """Fail-closed re-check of the frozen dataset bound to the INHERITED baseline
+    on loop RESUME (M2.7 P0-2).
+
+    Reuses the exact on-disk verification the per-round evaluation performs, so a
+    changed / corrupt dataset cannot silently continue a prior run's checkpoint.
+    Raises :class:`LoopRecoveryError` on any mismatch (the caller's ``load_or_init``
+    then archives the old checkpoint rather than reusing it).
+    """
+    from research_runtime.candidate_config import (
+        CandidateConfigBuilder, CandidateConfigError,
+    )
+    from research_runtime.evolution.domain_evolver import domain_whitelist
+    import yaml
+
+    cfg_path = Path(baseline_config_path)
+    # A checkpoint may still store a RELATIVE baseline path (older runs). Anchor
+    # it to project_dir, exactly as version inheritance does (M2.6 F4), so resume
+    # never silently resolves against the operator's CWD.
+    if not cfg_path.is_absolute():
+        cfg_path = Path(project_dir) / cfg_path
+    if not cfg_path.is_file():
+        raise LoopRecoveryError(
+            f"resume re-verify: inherited baseline config missing: {cfg_path}")
+    try:
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    except (ValueError, OSError) as exc:
+        raise LoopRecoveryError(
+            f"resume re-verify: unreadable inherited baseline: {exc}") from exc
+    try:
+        allowed, rules = domain_whitelist(domain)
+        builder = CandidateConfigBuilder(
+            project_dir=Path(project_dir), allowed_keys=allowed,
+            value_rules=rules, require_frozen_manifest=True)
+        builder.verify_frozen_dataset(cfg, dataset_version)
+    except (CandidateConfigError, ValueError, KeyError) as exc:
+        raise LoopRecoveryError(
+            f"resume re-verify: frozen dataset manifest no longer valid: {exc}"
+        ) from exc

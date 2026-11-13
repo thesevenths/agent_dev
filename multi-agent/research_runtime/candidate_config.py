@@ -258,6 +258,16 @@ class CandidateConfigBuilder:
             "dataset_seed": data.get("dataset_seed"),
         }
 
+    def verify_frozen_dataset(self, config: Mapping[str, Any],
+                              dataset_version: str) -> dict[str, Any]:
+        """Public, fail-closed frozen-dataset re-check (used on loop resume).
+
+        Performs the identical on-disk verification as the internal builder check;
+        exposed so the loop controller can re-verify the manifest when resuming a
+        prior run (M2.7 P0-2) without re-reading the full candidate config.
+        """
+        return self._verify_frozen_dataset(config, dataset_version)
+
     # ------------------------------------------------------------ preflight
     def verify_dataset(self, base_config: str | Path,
                        dataset_version: str) -> dict[str, Any]:

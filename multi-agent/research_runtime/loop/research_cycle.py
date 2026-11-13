@@ -23,7 +23,11 @@ def run_research_cycle(*, round_no: int, state: Any,
                         dataset_version: str,
                         domain_seeds: tuple[int, ...],
                         domain_runner: Callable[[dict[str, Any]], float] | None,
-                        domain_require_frozen_manifest: bool,
+                        # M2.7 P0-2: was a REQUIRED arg; now defaults ON so every
+                        # Python API layer is fail-safe (not just the CLI). Every
+                        # existing caller passes it explicitly, so behaviour is
+                        # unchanged for them.
+                        domain_require_frozen_manifest: bool = True,
                         domain_holdout_seeds: tuple[int, ...] = (),
                         harness_evolve: Callable[..., dict[str, Any]] | None,
                         base_harness: Any = None,
@@ -31,6 +35,12 @@ def run_research_cycle(*, round_no: int, state: Any,
                         harness_heldout_task: Any = None,
                         harness_rounds: int = 1,
                         harness_max_minutes: float = 1.0,
+                        # M2.7 statistical gate (P0-1): threaded verbatim to the
+                        # dual-layer decision so a Python API caller cannot silently
+                        # lower the ACCEPT bar below the formal 5-seed / holdout gate.
+                        min_seeds_for_accept: int = 5,
+                        practical_improvement_floor_rel: float = 0.01,
+                        require_holdout_confirmation: bool = True,
                         extra: dict[str, Any] | None = None) -> dict[str, Any]:
     """Execute one round and return the dual-layer payload.
 
@@ -56,6 +66,9 @@ def run_research_cycle(*, round_no: int, state: Any,
         "domain_seeds": domain_seeds,
         "domain_require_frozen_manifest": domain_require_frozen_manifest,
         "domain_holdout_seeds": domain_holdout_seeds,
+        "min_seeds_for_accept": min_seeds_for_accept,
+        "practical_improvement_floor_rel": practical_improvement_floor_rel,
+        "require_holdout_confirmation": require_holdout_confirmation,
         "domain_runner": domain_runner,
         # Each round is an isolated experiment: namespace the domain campaign dir
         # by round so a changed baseline across rounds (domain overrides baked in)
