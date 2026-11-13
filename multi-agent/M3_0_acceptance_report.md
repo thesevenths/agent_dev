@@ -231,18 +231,17 @@ python -u M3_0_runs/scinet_10seed_validation.py > M3_0_runs/scinet_10seed.log 2>
 
 **远端实证，非本地 PASS 替代。** 本机 `gh` 未认证，改用 GitHub REST API 直接核实：
 `api.github.com/repos/thesevenths/agent_dev/actions/workflows/arr-research-runtime.yml/runs`
-与 `.../actions/runs/43384422378/jobs`。
+与 `.../actions/runs/43392991350/jobs`。
 
 | 项 | 远端实测 |
 |---|---|
 | Workflow 名 | `ARR Research Runtime (M2.7 + M3.0)`（仓库根 `.github/workflows/`，GitHub 自动发现） |
-| 本轮触发 run | **#8 / id 43384422378**，[链接](https://github.com/thesevenths/agent_dev/actions/runs/43384422378) |
-| head_sha | `9581fcde`（本轮代码 push） |
-| status / conclusion | `completed` / **`success`**，耗时 38 s |
+| 本轮最终 run | **#9 / id 43392991350**，head_sha=`d751d59b`（M3.0 最终 commit），[链接](https://github.com/thesevenths/agent_dev/actions/runs/43392991350) |
+| status / conclusion | `completed` / **`success`** |
 | 矩阵 jobs | **6 / 6 全部 success**：ubuntu-latest × py3.11/3.12/3.13、windows-latest × py3.11/3.12/3.13 |
 | 关键步骤 | 每个 job 的 `Run unified Research Runtime engine-free suite` 与 `Verify CLI safety defaults + frozen statistical protocol` 均 success |
 | 远端跑过的断言 | 89 项测试（含新增 34 项）+ `student_t_crit_two_sided(0.05,4) == 2.776445` 且 `> 2.77`，**从远端证明旧 1.96 已被替换** |
-| 工作流累计 | 8 次 run **全部 success**，0 failure |
+| 工作流累计 | **9 次 run 全部 success**，0 failure（#1..#9） |
 
 顺带更正复查中的一处状态：ChatGPT 复查时记录「最后 docs-only HEAD 对应运行仍为 `in_progress`」，该 run（`9326a9cb`）现已核实为 **Success**。保留的 [ARR 0.1 Integration](https://github.com/thesevenths/agent_dev/actions/workflows/arr-0.1.yml) 旧 workflow 未被修改。
 
