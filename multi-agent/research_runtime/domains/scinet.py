@@ -183,7 +183,24 @@ def scinet_compute(config: dict[str, Any], spec: dict[str, Any],
     if res.status != "succeeded":
         return {"status": "failed", "error_type": "eval_failed",
                 "error": res.error or f"evaluate status={res.status}"}
-    return {"status": "succeeded", "metrics": dict(res.metrics),
-            "checkpoint": {"run_id": run_id},
-            "artifacts": ["backtest_metrics.json"]}
+    # Persist the REAL engine metrics on disk, exactly like embodied_compute /
+    # quant_compute do. The old return claimed an artifact
+    # ("backtest_metrics.json") that was never written, leaving the SciNet++ loop
+    # with no per-job metric evidence for SHA-256 provenance (M2.7 P2). The
+    # metric values come from the engine's collect_result, never fabricated here.
+    from ..candidate_config import sha256_file
+    metrics = dict(res.metrics)
+    ckpt_path = job_dir / "checkpoint.json"
+    out = job_dir / "backtest_metrics.json"
+    out.write_text(json.dumps({
+        "metrics": metrics, "split": split, "run_id": run_id,
+        "dataset_version": res.dataset_version,
+        "checkpoint_sha256": (sha256_file(ckpt_path)
+                             if ckpt_path.is_file() else None),
+    }, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+    return {"status": "succeeded", "metrics": metrics,
+            "checkpoint": {"path": str(ckpt_path),
+                           "sha256": (sha256_file(ckpt_path)
+                                      if ckpt_path.is_file() else None)},
+            "artifacts": ["backtest_metrics.json", "checkpoint.json"]}
 

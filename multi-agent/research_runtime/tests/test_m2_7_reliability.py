@@ -391,6 +391,58 @@ class TestFrozenManifestSafetyDefault(unittest.TestCase):
                     dataset_version="test-v1", domain="embodied")
 
 
+class TestEngineMetricProvenance(unittest.TestCase):
+    """M2.7 P1-1: every domain engine must PERSIST its real metrics on disk."""
+
+    def test_scinet_evaluate_persists_metrics_file_with_checkpoint_sha(self):
+        # The declared artifacts list must match files that really exist, and the
+        # persisted metric must be the SAME value returned to the caller (never a
+        # fabricated number). Uses a tiny in-process stub of the engine adapter's
+        # collect_result -- the code under test is the REAL scinet_compute body.
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from research_runtime.domains import scinet as mod
+
+        class _R:
+            status = "succeeded"
+            metrics = {"latent_mse@1": 0.024023795500397682}
+            dataset_version = "pendulum-a0e03386be89"
+            run_id = "run-x"
+            error = None
+
+        class _A:
+            def submit(self, spec): return "j"
+            def wait(self, jid, timeout=None): return None
+            def collect_result(self, jid, spec): return _R()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "_scinet_run_id.txt").write_text("run-x", encoding="utf-8")
+            (d / "checkpoint.json").write_text("{}", encoding="utf-8")
+            cfgp = d / "cfg.yaml"
+            cfgp.write_text("seed: 50\ntrain: {epochs: 1}\n", encoding="utf-8")
+            with patch.object(mod, "SciNetAdapter", _A, create=True):
+                # patch the name used inside scinet_compute's local import
+                import research_runtime.adapters as adapters
+                with patch.object(adapters, "SciNetAdapter", _A):
+                    res = mod.scinet_compute(
+                        {"seed": 50, "train": {"epochs": 1}},
+                        {"stage": "evaluate", "seed": 50, "run_id": "run-x"},
+                        d, config_path=cfgp)
+            self.assertEqual(res["status"], "succeeded")
+            self.assertEqual(res["metrics"]["latent_mse@1"],
+                             0.024023795500397682)
+            for name in res["artifacts"]:
+                self.assertTrue((d / name).is_file(),
+                                f"declared artifact {name} must exist on disk")
+            persisted = json.loads((d / "backtest_metrics.json").read_text(
+                encoding="utf-8"))
+            self.assertEqual(persisted["metrics"]["latent_mse@1"],
+                             res["metrics"]["latent_mse@1"])
+            self.assertTrue(persisted["checkpoint_sha256"])
+
+
 class TestNoGainRunIsReportedHonestly(unittest.TestCase):
     """M2.7: a strict-gate run with 0 ACCEPT must not read as '0 rounds ran'."""
 
