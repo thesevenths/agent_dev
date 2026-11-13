@@ -28,6 +28,14 @@ P0-2 Frozen-manifest safety default
 
 P0-3 (CI) is covered by the workflow itself: this file is listed in
 .github/workflows/arr-research-runtime.yml at the REPO ROOT.
+
+M3.0 note: the statistical verdict itself was UPGRADED (two-sided Student-t
+CI instead of the 1.96 normal approximation, Holm family-wise correction,
+bidirectional significance, per-seed holdout confirmation, missing-statistic
+fail-closed). This file keeps the M2.7 safety invariants; the new protocol's
+verdict cases live in test_m3_0_statistics.py. ``_rec`` now supplies the full
+per-seed holdout evidence so these tests RAISE their evidence rather than
+lower the gate.
 """
 from __future__ import annotations
 
@@ -61,13 +69,24 @@ from research_runtime.loop.research_cycle import run_research_cycle
 
 
 def _rec(*, n_valid=5, mean=0.001, std=0.0002, baseline_mean=0.012,
-         ho=0.0009, ho_n=5, n_invalid=0):
-    """A direction-normalized domain evaluation record (positive == better)."""
+         ho=0.0009, ho_n=5, n_invalid=0,
+         ho_improvements=None, ho_n_seeds=None, ho_n_invalid=0):
+    """A direction-normalized domain evaluation record (positive == better).
+
+    M3.0: the holdout now carries PER-SEED raw results, an explicit requested
+    seed count and an invalid-run count. The protocol requires all of them, so
+    this helper supplies the full evidence instead of relaxing the gate.
+    """
+    if ho_improvements is None and ho is not None and ho_n:
+        ho_improvements = [ho] * ho_n
     return {
         "n_valid": n_valid, "n_invalid": n_invalid,
         "mean_improvement": mean, "std_improvement": std,
         "baseline_mean": baseline_mean,
         "holdout_improvement": ho, "holdout_n_valid": ho_n,
+        "holdout_improvements": ho_improvements,
+        "holdout_n_seeds": ho_n if ho_n_seeds is None else ho_n_seeds,
+        "holdout_n_invalid": ho_n_invalid,
     }
 
 
