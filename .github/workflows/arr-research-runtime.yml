@@ -1,4 +1,4 @@
-name: ARR Research Runtime (M2.7)
+name: ARR Research Runtime (M2.7 + M3.0)
 
 # ---------------------------------------------------------------------------
 # M2.7 P0-3: the M2.6 engine-free gate was created at the WRONG path
@@ -13,13 +13,13 @@ name: ARR Research Runtime (M2.7)
 # branch. ENGINE-FREE: no torch / SciNet++ checkout / real robot / exchange data.
 # Real-engine runs remain operator-driven with fail-closed local verification.
 #
-# Dependency note (verified in a CLEAN venv, M2.7):
+# Dependency note (verified in a CLEAN venv):
 #   `pyyaml` ALONE is NOT enough. research_runtime/__init__.py imports
-#   research_runtime/schemas.py -> `from pydantic import ...` at MODULE level,
-#   so every engine-free test import needs pydantic. The M2.6 workflow installed
-#   only pyyaml and would have failed with ModuleNotFoundError even if it had
-#   been in the right directory. Minimal verified set: PyYAML + pydantic>=2.7.4.
-#   Verified: 54 passed, 0 failed in a clean venv with exactly these two.
+#   research_runtime/schemas.py -> `from pydantic import ...` at MODULE level.
+#   M3.0's statistics.py is PURE STANDARD LIBRARY (beta function via Lentz
+#   continued fraction + bisection) -- deliberately NO numpy/scipy/pandas, so
+#   the minimal verified set stays: PyYAML>=6.0 + pydantic>=2.7.4.
+#   Verified: 89 passed, 0 failed in a clean venv with exactly these two.
 # ---------------------------------------------------------------------------
 
 on:
@@ -64,28 +64,39 @@ jobs:
         #   test_unified_candidate -> candidate lifecycle, domain_evolver,
         #                            materialize/evaluate_domain_candidate,
         #                            evolution_controller dual-layer separation
-        #   test_m2_7_reliability  -> M2.7 statistical gate (_decide_domain),
+        #   test_m2_7_reliability  -> statistical gate (_decide_domain),
         #                            holdout isolation, CLI arg defaults,
         #                            frozen-manifest fail-closed + resume re-verify
+        #   test_m3_0_statistics   -> Student-t CI (df=4 -> 2.776, NOT 1.96),
+        #                            Holm step-down, bidirectional significance,
+        #                            missing-statistic fail-closed, holdout
+        #                            per-seed direction confirmation, M2.7
+        #                            historical ACCEPT re-evaluation
         run: |
           python -m unittest \
             research_runtime.tests.test_loop \
             research_runtime.tests.test_unified_candidate \
             research_runtime.tests.test_m2_7_reliability \
+            research_runtime.tests.test_m3_0_statistics \
             -v
 
-      - name: Verify CLI safety defaults (no engine required)
-        # Independent CLI smoke: the production entry point must default to
-        # require-frozen-manifest ON, 5 paired seeds, holdout confirmation ON.
+      - name: Verify CLI safety defaults + frozen statistical protocol
+        # Independent smoke: the production entry point must default to
+        # require-frozen-manifest ON, 5 paired seeds, holdout confirmation ON,
+        # and the gate must use the Student-t critical value (not the old 1.96).
         run: |
           python -c "
           from research_runtime.cli import build_parser
+          from research_runtime.evolution.statistics import student_t_crit_two_sided
           a = build_parser().parse_args(['loop','--domain','scinet','--baseline-config','b.yaml','--project-dir','p'])
           assert a.require_frozen_manifest is True, 'frozen-manifest must default ON'
           assert a.require_holdout_confirmation is True, 'holdout confirmation must default ON'
           assert a.seeds == [50,51,52,53,54], 'formal ACCEPT requires >=5 seeds by default'
           assert a.min_seeds_for_accept >= 5
+          t4 = student_t_crit_two_sided(0.05, 4)
+          assert abs(t4 - 2.7764451052) < 1e-6, 'M3.0 Student-t gate must be active'
+          assert t4 > 2.77, 'normal 1.96 must NOT be used at n=5'
           b = build_parser().parse_args(['loop','--domain','scinet','--baseline-config','b.yaml','--project-dir','p','--allow-unfrozen-data'])
           assert b.require_frozen_manifest is False, 'explicit dev opt-out must work'
-          print('CLI safety defaults OK')
+          print('CLI safety defaults + M3.0 protocol OK (t_df4=%.6f)' % t4)
           "
