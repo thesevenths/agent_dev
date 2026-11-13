@@ -200,7 +200,8 @@ Loop `loop_1618ea700c33`：`status=completed`，`rounds_executed=3/3`，`resumed
 - **Annotations**：6 warnings（均为 `actions/checkout@v4` / `setup-python@v5` 的 Node.js 20 弃用提示）+ 3 notices（ubuntu-latest 将迁移 Ubuntu 26），**0 failure**。
 - 本地无法使用 `gh`（未安装），故通过 GitHub Actions 网页直接核实，未以本地 PASS 代替远端结论。
 - 保留的 [ARR 0.1 Integration](https://github.com/thesevenths/agent_dev/actions/workflows/arr-0.1.yml) 旧 workflow 未被修改。
-- 该 run 触发于 `15267f37`（54 项测试版本）；最后一个 commit `808d4af3` 新增第 55 项测试，将在最终 push 后再次触发同一 workflow。两者均为纯 engine-free 单测，最小依赖集未变。
+- 后续 push 共触发 **6 次** 该 workflow：截至最终核对，`15267f37` / `15d8468e` / `8352ead1` / `a895d9be` / `f72223c7` **5 次 Success**，最终 HEAD `e63673c1` 仍在 `in_progress`（纯 docs 改动，不改任何代码）。其中 `8352ead1` 的 run 已包含 `808d4af3` 的第 55 项测试并通过。全部为 engine-free 单测，最小依赖集未变（PyYAML + pydantic）。
+- 远端核实方式：本机未安装 `gh`，改用 GitHub REST API（`/actions/workflows/arr-research-runtime.yml/runs`）与 Actions 网页，**未以本地 PASS 代替远端结论**。
 
 ---
 
