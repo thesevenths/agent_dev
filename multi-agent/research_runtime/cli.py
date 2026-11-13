@@ -464,9 +464,22 @@ def build_parser() -> argparse.ArgumentParser:
     lp.add_argument("--rounds", type=int, default=3)
     lp.add_argument("--dataset-version", default="robot_sim_v1")
     lp.add_argument("--seeds", nargs="+", type=int, default=[50, 51])
-    lp.add_argument("--require-frozen-manifest", action="store_true",
-                    default=False,
-                    help="require the frozen dataset manifest to verify on disk")
+    lp.add_argument("--require-frozen-manifest", action="store_true", default=True,
+                    help="(default ON) require the frozen dataset manifest to "
+                         "verify on disk before each round; production research "
+                         "must never run without it")
+    lp.add_argument("--allow-unfrozen-data", dest="require_frozen_manifest",
+                    action="store_false",
+                    help="DEV ONLY: permit non-frozen data. Production research "
+                         "must NOT use this; a missing/unverified manifest fails "
+                         "loudly (fail-closed) by default")
+    lp.add_argument("--harness-rounds", type=int, default=1,
+                    help="RRSI harness-evolution rounds per loop round "
+                         "(default 1). Raise for real capability testing.")
+    lp.add_argument("--harness-max-minutes", type=float, default=15.0,
+                    help="Per-round Harness evolution time budget in minutes "
+                         "(default 15.0). M2.6: a real budget so the harness can "
+                         "actually search, not the previous 1.0-min floor.")
     lp.add_argument("--holdout-seeds", nargs="*", type=int, default=[],
                     help="independent seeds for holdout confirmation of domain "
                          "candidates (a clear contradiction downgrades to "
@@ -493,11 +506,16 @@ def _build_real_domain_runner(domain: str):
     elif domain == "quant":
         from .domains.quant import quant_compute, PRIMARY_METRIC
         compute = quant_compute
+    elif domain == "scinet":
+        # Real SciNet++ engine via the existing SciNetAdapter (subprocess JSON-RPC
+        # over research_api.cli). No FakeRunner is used; an unreachable engine
+        # fails closed to NaN -> the candidate is INCONCLUSIVE, never faked.
+        from .domains.scinet import scinet_compute, PRIMARY_METRIC
+        compute = scinet_compute
     else:
         raise SystemExit(
             f"no real engine runner wired for domain {domain!r}; the loop must "
-            f"run the REAL engine, so scinet requires the SciNet++ engine to be "
-            f"connected first (no FakeRunner is allowed)")
+            f"run the REAL engine (no FakeRunner is allowed)")
     # Single source of truth: the domain module defines PRIMARY_METRIC, shared by
     # the research task, the engine runner and the dual-layer RRSI decision.
     primary_metric = PRIMARY_METRIC
@@ -506,16 +524,35 @@ def _build_real_domain_runner(domain: str):
     import yaml as _yaml
 
     def runner(art: dict) -> float:
-        cfg = _yaml.safe_load(_P(art["config_path"]).read_text(encoding="utf-8"))
+        # Fail-closed: a missing / unreadable config yields NaN (candidate
+        # INCONCLUSIVE) instead of crashing the whole loop.
+        cfg_path = _P(art["config_path"])
+        if not cfg_path.is_file():
+            return float("nan")
+        try:
+            cfg = _yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return float("nan")
+        if not isinstance(cfg, dict):
+            return float("nan")
         job_dir = _P(art["directory"])
         job_dir.mkdir(parents=True, exist_ok=True)
         seed = int(cfg.get("seed", 42))
-        tr = compute(cfg, {"stage": "train", "seed": seed}, job_dir)
+        if domain == "scinet":
+            tr = compute(cfg, {"stage": "train", "seed": seed}, job_dir,
+                         config_path=art["config_path"])
+        else:
+            tr = compute(cfg, {"stage": "train", "seed": seed}, job_dir)
         if tr.get("status") != "succeeded":
             return float("nan")
         run_id = job_dir.name
-        ev = compute(cfg, {"stage": "evaluate", "seed": seed, "run_id": run_id},
-                     job_dir)
+        if domain == "scinet":
+            ev = compute(cfg, {"stage": "evaluate", "seed": seed,
+                              "run_id": run_id}, job_dir,
+                         config_path=art["config_path"])
+        else:
+            ev = compute(cfg, {"stage": "evaluate", "seed": seed,
+                              "run_id": run_id}, job_dir)
         if ev.get("status") != "succeeded":
             return float("nan")
         q = (ev.get("metrics") or {}).get(primary_metric)
@@ -574,7 +611,8 @@ def cmd_loop(args: argparse.Namespace) -> int:
         harness_tasks=tasks,
         harness_heldout_task=heldout,
         base_harness_tag=BASE_HARNESS.fingerprint(),
-        extra={"rounds": 1, "max_minutes": 1.0,
+        extra={"rounds": args.harness_rounds,
+               "max_minutes": args.harness_max_minutes,
                "negative_harness": NEGATIVE_HARNESS},
     )
     print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
