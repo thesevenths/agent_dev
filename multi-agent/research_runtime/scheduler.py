@@ -165,12 +165,23 @@ class UnifiedResearchScheduler:
         return payload
 
     @staticmethod
+    def _norm_decision(d: Any) -> str:
+        """domain_layer records carry the verdict as a lower-case string."""
+        return (d or "").strip().upper()
+
+    @staticmethod
     def _summarize_domain(spec: DomainSpec, payload: dict[str, Any]) -> dict[str, Any]:
         dom = payload.get("domain_layer", {})
         records = dom.get("records", [])
-        accepted = [r for r in records if r.get("decision") == "ACCEPTED"]
-        rejected = [r for r in records if r.get("decision") == "REJECTED"]
-        inconclusive = [r for r in records if r.get("decision") == "INCONCLUSIVE"]
+        accepted = [r for r in records
+                    if UnifiedResearchScheduler._norm_decision(r.get("decision"))
+                    == "ACCEPTED"]
+        rejected = [r for r in records
+                    if UnifiedResearchScheduler._norm_decision(r.get("decision"))
+                    == "REJECTED"]
+        inconclusive = [r for r in records
+                        if UnifiedResearchScheduler._norm_decision(r.get("decision"))
+                        == "INCONCLUSIVE"]
         promotion = UnifiedResearchScheduler._select_promotion(spec, records)
         return {
             "domain": spec.domain,
@@ -206,7 +217,9 @@ class UnifiedResearchScheduler:
         baseline. Baseline mutation belongs to the loop / version-inheritance
         layer, which the task book keeps separate.
         """
-        eligible = [r for r in records if r.get("decision") == "ACCEPTED"]
+        eligible = [r for r in records
+                    if UnifiedResearchScheduler._norm_decision(r.get("decision"))
+                    == "ACCEPTED"]
         if not eligible:
             return {"chosen": None, "reason": "no ACCEPTED candidate",
                     "candidates_considered": 0}
@@ -315,7 +328,8 @@ class UnifiedResearchScheduler:
                 "n_accepted": d.get("n_accepted"),
                 "n_rejected": d.get("n_rejected"),
                 "n_inconclusive": d.get("n_inconclusive"),
-                "decisions": {str(r.get("target")): {
+                "decisions": {str(r.get("hyp_fingerprint")): {
+                    "target": r.get("target"),
                     "new": r.get("new"),
                     "decision": r.get("decision"),
                     "ood_decision": r.get("ood_decision"),
@@ -325,7 +339,7 @@ class UnifiedResearchScheduler:
                 "promotion_recommendation": d.get("promotion_recommendation"),
             }
         return {
-            "run_id": self.run_id,
+            "run_id": state.get("run_id"),
             "schema_version": "m3.4-evidence-index-v1",
             "generated_by": "UnifiedResearchScheduler",
             "note": ("Frozen datasets / baseline configs are immutable, "

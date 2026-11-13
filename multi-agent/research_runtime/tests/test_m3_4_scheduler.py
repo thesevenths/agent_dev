@@ -195,3 +195,78 @@ class TestHarnessStub:
         out = _harness_stub(base_harness=None, tasks=[], heldout_task=None)
         assert out["n_accepted"] == 0
         assert out["dominant_failure"] == "DECISION_UNCERTAINTY"
+
+
+class TestDecisionCasingRegression:
+    """Regression: domain_layer records carry LOWER-CASE verdict strings.
+
+    A previous bug compared them against upper-case constants ("ACCEPTED" /
+    "REJECTED" / "INCONCLUSIVE"), so every count collapsed to 0 and promotion
+    was never selected. The real E2E (arr_m34_001) exposed this. These tests
+    lock the casing-normalised behaviour.
+    """
+
+    def test_lowercase_decisions_are_counted(self, tmp_path):
+        recs = [
+            {"target": "train.lr", "new": "0.003", "decision": "accepted",
+             "mean_improvement": 0.010, "holdout_direction_fraction": 1.0,
+             "ood_decision": "accepted"},
+            {"target": "train.lr", "new": "0.01", "decision": "rejected",
+             "mean_improvement": -0.004, "holdout_direction_fraction": 0.2,
+             "ood_decision": "rejected"},
+            {"target": "train.lr", "new": "0.02", "decision": "inconclusive",
+             "mean_improvement": 0.001, "holdout_direction_fraction": 1.0,
+             "ood_decision": "inconclusive"},
+        ]
+        spec = DomainSpec(domain="scinet", base_config="x",
+                          dataset_version="x", paired_seeds=(1, 2),
+                          metric_direction="minimize")
+        summary = UnifiedResearchScheduler._summarize_domain(
+            spec, {"domain_layer": {"records": recs,
+                                    "statistics_protocol": {"name": "M3.0"}}})
+        assert summary["n_accepted"] == 1
+        assert summary["n_rejected"] == 1
+        assert summary["n_inconclusive"] == 1
+
+    def test_lowercase_accepted_is_eligible_for_promotion(self):
+        recs = [
+            {"target": "train.lr", "new": "0.003", "decision": "accepted",
+             "mean_improvement": 0.010, "holdout_direction_fraction": 1.0,
+             "ood_decision": "accepted"},
+            {"target": "train.lr", "new": "0.01", "decision": "accepted",
+             "mean_improvement": 0.030, "holdout_direction_fraction": 1.0,
+             "ood_decision": "accepted"},
+        ]
+        spec = DomainSpec(domain="scinet", base_config="x",
+                          dataset_version="x", paired_seeds=(1, 2),
+                          metric_direction="minimize")
+        promo = UnifiedResearchScheduler._select_promotion(spec, recs)
+        assert promo["chosen"]["new"] == "0.01"
+        assert promo["candidates_considered"] == 2
+
+    def test_evidence_index_keys_by_fingerprint_not_target(self, tmp_path):
+        # Three candidates share target "train.lr"; keying by target would
+        # collapse them to one entry. Keying by hyp_fingerprint preserves all.
+        recs = [
+            {"hyp_fingerprint": "d::train.lr|None->0.003|X",
+             "target": "train.lr", "new": "0.003", "decision": "rejected",
+             "mean_improvement": -0.002, "holdout_direction_fraction": 0.0},
+            {"hyp_fingerprint": "d::train.lr|None->0.005|X",
+             "target": "train.lr", "new": "0.005", "decision": "rejected",
+             "mean_improvement": -0.001, "holdout_direction_fraction": 0.0},
+            {"hyp_fingerprint": "d::train.lr|None->0.01|X",
+             "target": "train.lr", "new": "0.01", "decision": "rejected",
+             "mean_improvement": -0.0009, "holdout_direction_fraction": 0.0},
+        ]
+        spec = DomainSpec(domain="embodied", base_config="x",
+                          dataset_version="x", paired_seeds=(1, 2),
+                          metric_direction="minimize")
+        summary = UnifiedResearchScheduler._summarize_domain(
+            spec, {"domain_layer": {"records": recs,
+                                    "statistics_protocol": {"name": "M3.0"}}})
+        state = {"run_id": "r1"}
+        ev = UnifiedResearchScheduler._build_evidence_index(
+            None, state, {"embodied": summary})
+        assert len(ev["domains"]["embodied"]["decisions"]) == 3
+        assert ev["domains"]["embodied"]["n_rejected"] == 3
+
