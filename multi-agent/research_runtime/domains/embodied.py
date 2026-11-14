@@ -54,7 +54,31 @@ from .local_engine import (
 PROJECT_DIR = Path(__file__).resolve().parent / "projects" / "embodied"
 BASELINE_CONFIG = "config.yaml"
 PAIRED_SEEDS = (42, 43, 44, 45, 46)
-HORIZONS = (1, 2, 3, 4, 5)
+
+# --------------------------------------------------------------------------- #
+# Two DISTINCT notions of "horizon" (P0-1). Conflating them was the root cause
+# of evaluate-stage crashes for any ``model.rollout_horizon`` != 5:
+#
+#   * EVALUATION_HORIZONS -- the FIXED set of k at which ``state_mse@k`` is
+#     reported. It is part of the metric contract: REQUIRED_METRICS, the M3.0
+#     statistical gate, the holdout comparison and the comparator all key on
+#     exactly these names. It MUST NOT depend on a candidate config, otherwise
+#     two candidates would be scored on different metric sets and could not be
+#     paired. (Old name ``HORIZONS`` is kept as an alias for compatibility.)
+#   * PLANNING_HORIZON -- ``model.rollout_horizon``, how many open-loop steps
+#     the planner rolls the model forward when deciding task success. This is a
+#     configurable MODEL property (VALUE_RULES allows 2..8), NOT a metric set.
+#
+# The evaluate stage sizes each rollout window to cover BOTH (``max`` of the
+# two) and keeps its error table over their UNION, while REPORTING only the
+# fixed evaluation set. Short planning horizons (2..4) therefore no longer
+# truncate the window (IndexError), and long ones (6..8) no longer address a
+# missing key (KeyError).
+# --------------------------------------------------------------------------- #
+EVALUATION_HORIZONS: tuple[int, ...] = (1, 2, 3, 4, 5)
+HORIZONS = EVALUATION_HORIZONS  # backwards-compatible alias
+MIN_PLANNING_HORIZON = 2
+MAX_PLANNING_HORIZON = 8
 
 # Order matters for the BASE Harness's deliberately naive "first knob" policy:
 # the FIRST whitelisted key is an ordinary training hyperparameter, NOT the
@@ -84,7 +108,9 @@ def _num_rule(low: float, high: float) -> ValueRule:
 
 VALUE_RULES: dict[str, ValueRule] = {
     "model.drift_correction": _num_rule(0.0, 1.0),
-    "model.rollout_horizon": _num_rule(2.0, 8.0),
+    # Single source of truth for the planning-horizon range (P0-1).
+    "model.rollout_horizon": _num_rule(float(MIN_PLANNING_HORIZON),
+                                       float(MAX_PLANNING_HORIZON)),
     "train.lr": _num_rule(0.0001, 0.5),
     "train.epochs": _num_rule(1.0, 500.0),
 }
@@ -237,7 +263,13 @@ def embodied_compute(config: dict[str, Any], spec: dict[str, Any],
     bias = {"pos": checkpoint["bias"]["bias_pos"],
             "neg": checkpoint["bias"]["bias_neg"]}
     correction = float(config["model"]["drift_correction"])
-    horizon = int(config["model"]["rollout_horizon"])
+    planning_horizon = int(config["model"]["rollout_horizon"])
+    # Fail CLOSED on an out-of-contract planning horizon instead of letting it
+    # reach the window slicing below (which would raise or silently truncate).
+    if not (MIN_PLANNING_HORIZON <= planning_horizon <= MAX_PLANNING_HORIZON):
+        return {"status": "failed", "error_type": "invalid_planning_horizon",
+                "error": (f"model.rollout_horizon={planning_horizon} outside "
+                          f"[{MIN_PLANNING_HORIZON}, {MAX_PLANNING_HORIZON}]")}
     # Safety = a PLANNING-USABILITY constraint: the predicted rollout must not
     # diverge from the real state beyond this tolerance. Counting merely LARGE
     # states would penalise correct physics; counting prediction divergence
@@ -249,14 +281,19 @@ def embodied_compute(config: dict[str, Any], spec: dict[str, Any],
                 "error": f"unknown split {split!r}"}
     rows = load_split(project_dir, config, split)
 
-    errors: dict[int, list[float]] = {k: [] for k in HORIZONS}
+    # A window must be long enough for the LONGEST evaluated k AND for the
+    # planner's own horizon: ``seq[k]`` is read for every k in the error table,
+    # so a short planning horizon must not shorten the slice (P0-1).
+    window_steps = max(max(EVALUATION_HORIZONS), planning_horizon)
+    error_horizons = tuple(sorted(set(EVALUATION_HORIZONS) | {planning_horizon}))
+    errors: dict[int, list[float]] = {k: [] for k in error_horizons}
     action_errors: list[float] = []
     successes, total, violations = 0, 0, 0
     for group in _episodes(rows).values():
-        for start in range(0, len(group) - horizon, 3):
-            seq = group[start:start + horizon + 1]
+        for start in range(0, len(group) - window_steps, 3):
+            seq = group[start:start + window_steps + 1]
             x, v = float(seq[0]["x"]), float(seq[0]["v"])
-            for k in HORIZONS:
+            for k in error_horizons:
                 xx, vv = x, v
                 for step in range(k):
                     action = float(seq[step]["action"])
@@ -265,19 +302,28 @@ def embodied_compute(config: dict[str, Any], spec: dict[str, Any],
                 truth_x = float(seq[k]["x"])
                 truth_v = float(seq[k]["v"])
                 errors[k].append((xx - truth_x) ** 2 + (vv - truth_v) ** 2)
-                if abs(xx - truth_x) > safety_bound:
+                # safety_violations belongs to the FIXED evaluation metric
+                # contract (REQUIRED_METRICS / guardrails), so it must be
+                # accumulated on EVALUATION_HORIZONS only -- never on the
+                # configurable planning horizon, or the guardrail would change
+                # meaning between candidates.
+                if k in EVALUATION_HORIZONS and abs(xx - truth_x) > safety_bound:
                     violations += 1
             # Inverse-dynamics action prediction (a real auxiliary task).
             b = seq[1]
             pred_action = (float(b["v"]) - float(seq[0]["v"])) / 0.08
             action_errors.append((pred_action - float(seq[0]["action"])) ** 2)
             total += 1
-            if errors[horizon][-1] < 0.25:
+            if errors[planning_horizon][-1] < 0.25:
                 successes += 1
     if total == 0:
         return {"status": "failed", "error_type": "missing_artifact",
                 "error": "no rollout windows in the frozen split"}
-    metrics = {f"state_mse@{k}": sum(v) / len(v) for k, v in errors.items()}
+    # REPORT ONLY the fixed evaluation set. Extra planning-horizon entries are
+    # computed solely for the task-success criterion; leaking them into the
+    # metric dict would change the metric contract per candidate config (P0-1).
+    metrics = {f"state_mse@{k}": sum(errors[k]) / len(errors[k])
+               for k in EVALUATION_HORIZONS}
     metrics["action_prediction_mse"] = sum(action_errors) / len(action_errors)
     metrics["task_success_rate"] = successes / total
     metrics["safety_violations"] = float(violations)
@@ -285,6 +331,9 @@ def embodied_compute(config: dict[str, Any], spec: dict[str, Any],
     out = job_dir / "rollout_metrics.json"
     out.write_text(json.dumps({"metrics": metrics, "split": split,
                                "n_windows": total, "correction": correction,
+                               # P0-1: make the two horizon notions auditable.
+                               "evaluation_horizons": list(EVALUATION_HORIZONS),
+                               "planning_horizon": planning_horizon,
                                "checkpoint_sha256": sha256_bytes(ckpt_path.read_bytes())},
                               indent=2, sort_keys=True), encoding="utf-8")
     return {
