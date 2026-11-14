@@ -311,14 +311,66 @@ class UnifiedEvidenceReader:
                 view._record_carrier("candidate_registry", rp, n)
 
     # -- carrier: engine *metrics*.json artifacts -------------------------
+    def _explicit_campaign_ids(self, run_id: str) -> set[str]:
+        """P1-01: the EXACT set of campaign_ids this run owns.
+
+        Derived from the run's own ``evidence_index.json`` (its domains'
+        ``campaign_id`` fields). Never inferred from a string prefix, which
+        would silently conflate ``arr_m34_001`` with ``arr_m34_0010_scinet``
+        or ``arr_m34_001_fake``.
+        """
+        idx = self.runs_root / run_id / "evidence_index.json"
+        if not idx.is_file():
+            return set()
+        try:
+            doc = _json(idx)
+        except (ValueError, OSError):
+            return set()
+        out: set[str] = set()
+        for entry in (doc.get("domains") or {}).values():
+            cid = entry.get("campaign_id")
+            if isinstance(cid, str) and cid:
+                out.add(cid)
+        return out
+
+    @staticmethod
+    def _campaign_id_from_path(p: Path, allowed: set[str],
+                               run_id: str) -> tuple[str | None, str | None]:
+        """Locate the campaign_id that owns a metrics file.
+
+        Returns (campaign_id, kind) where kind is 'exact' (in the allowed
+        set) or 'collision' (a path component starts with ``run_id`` but is
+        NOT an explicit campaign_id of this run). Returns (None, None) when
+        the file belongs to an unrelated run.
+        """
+        collision: str | None = None
+        for part in p.parts:
+            if part in allowed:
+                return part, "exact"
+            if part != run_id and part.startswith(run_id):
+                collision = part
+        return collision, ("collision" if collision else None)
+
     def _read_engine_metrics(self, view: EvidenceView, run_id: str) -> None:
         base = self.workspace / "M2_7_runs"
         if not base.is_dir():
             return
+        allowed = self._explicit_campaign_ids(run_id)
         for p in sorted(base.rglob("*metrics*.json")):
-            camp = p.parent.parent.name
-            if not camp.startswith(run_id):     # explicit run_id scoping only
+            camp, kind = self._campaign_id_from_path(p, allowed, run_id)
+            if kind == "collision":
+                # P1-01: a dir that LOOKS like this run's (prefix match) but is
+                # NOT an explicit campaign_id. Exclude it to prevent cross-run
+                # metric leakage, and record the exclusion for transparency.
+                view.unresolved.append({
+                    "path": _rel(p, self.workspace),
+                    "reason": (
+                        f"campaign '{camp}' has run_id prefix but is not an "
+                        f"explicit campaign_id of run '{run_id}'; excluded "
+                        "from this run's Evidence View")})
                 continue
+            if kind != "exact":
+                continue   # belongs to an unrelated run; never scope it here
             try:
                 doc = _json(p)
             except (ValueError, OSError):

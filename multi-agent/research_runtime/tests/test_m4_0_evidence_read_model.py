@@ -207,3 +207,80 @@ def test_windows_style_artifact_path_resolves_on_any_platform(tmp_path: Path):
     resolved = _resolve_artifact_path(win_path, tmp_path)
     assert resolved is not None and resolved.is_file()
     assert sha256_file(resolved) == sha256_file(target)
+
+
+def test_campaign_prefix_collision_is_excluded_from_run(tmp_path: Path):
+    """P1-01 -- a metrics file whose campaign dir SHARES the run_id prefix but
+    is NOT an explicit campaign_id of this run must NOT leak into the run's
+    Evidence View. The REAL campaign (exact match) is included; the collision
+    (arr_m34_0010_scinet vs arr_m34_001) is excluded and recorded unresolved.
+    """
+    run = "arr_m34_001"
+    idx_dir = tmp_path / "M3_4_runs" / run
+    idx_dir.mkdir(parents=True)
+    idx = {
+        "run_id": run,
+        "domains": {
+            "scinet": {
+                "campaign_id": f"{run}_scinet",
+                "dataset_version": "v1",
+                "decisions": {},
+                "ood_provenance": {
+                    "ood_dataset": {"dataset_version": "o1"},
+                    "ood_metrics": {"artifacts": []},
+                },
+            },
+        },
+    }
+    (idx_dir / "evidence_index.json").write_text(
+        json.dumps(idx, sort_keys=True), encoding="utf-8")
+
+    # Exact, explicit campaign -- MUST be included.
+    real_camp = (tmp_path / "M2_7_runs" / "scinet" / "outputs" /
+                 "research_campaigns" / f"{run}_scinet" / "seed_1")
+    real_camp.mkdir(parents=True)
+    real_file = real_camp / "ood_metrics.json"
+    real_file.write_text(json.dumps({"dataset_version": "o1", "run_id": "e1",
+                                     "checkpoint_sha256": "c" * 64,
+                                     "metrics": {"m": 1}}), encoding="utf-8")
+
+    # Collision: shares the run_id prefix but is NOT an explicit campaign_id.
+    fake_camp = (tmp_path / "M2_7_runs" / "scinet" / "outputs" /
+                 "research_campaigns" / f"{run}0_scinet" / "seed_1")
+    fake_camp.mkdir(parents=True)
+    fake_file = fake_camp / "ood_metrics.json"
+    fake_file.write_text(json.dumps({"dataset_version": "o1", "run_id": "e2",
+                                     "checkpoint_sha256": "d" * 64,
+                                     "metrics": {"m": 2}}), encoding="utf-8")
+
+    v = UnifiedEvidenceReader(tmp_path).query_run(run)
+
+    real_eid = "sha256:" + hashlib.sha256(real_file.read_bytes()).hexdigest()
+    assert any(e["evidence_id"] == real_eid for e in v["evidence"]), \
+        "exact-match campaign metric must be present"
+
+    fake_eid = "sha256:" + hashlib.sha256(fake_file.read_bytes()).hexdigest()
+    assert not any(e["evidence_id"] == fake_eid for e in v["evidence"]), \
+        "prefix-collision campaign metric must NOT leak into this run"
+
+    reasons = [u.get("reason", "") for u in v["unresolved"]
+               if u.get("path") and "arr_m34_0010_scinet" in u["path"]]
+    assert reasons, "prefix collision must be recorded as unresolved with a reason"
+    assert any("not an explicit campaign_id" in r for r in reasons)
+
+
+def test_run_without_evidence_index_scopes_no_metrics(tmp_path: Path):
+    """P1-01 -- when a run has NO evidence_index.json, no campaign_id is known,
+    so engine metrics cannot be scoped to it. They are all excluded (and any
+    run_id-prefixed collision recorded unresolved), never guessed in."""
+    run = "arr_no_index"
+    # A metrics file that merely shares the prefix but has no explicit scope.
+    camp = (tmp_path / "M2_7_runs" / "scinet" / "outputs" /
+            "research_campaigns" / f"{run}_scinet" / "seed_1")
+    camp.mkdir(parents=True)
+    f = camp / "ood_metrics.json"
+    f.write_text(json.dumps({"dataset_version": "o1", "run_id": "e1"}),
+                 encoding="utf-8")
+    v = UnifiedEvidenceReader(tmp_path).query_run(run)
+    eid = "sha256:" + hashlib.sha256(f.read_bytes()).hexdigest()
+    assert not any(e["evidence_id"] == eid for e in v["evidence"])
