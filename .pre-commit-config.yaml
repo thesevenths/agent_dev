@@ -1,0 +1,47 @@
+# --------------------------------------------------------------------------- #
+# Root-level pre-commit configuration (P0-4).
+#
+# GitHub Actions only discovers workflows under <repo-root>/.github/workflows/,
+# and the existing .github/workflows/pre-commit.yaml runs
+#   pre-commit run --all-files
+# from the REPOSITORY ROOT. Before this file existed that command failed with
+# "InvalidConfigError: .pre-commit-config.yaml is not a file" (reproduced
+# locally; the remote "Pre-commit checks" job was red on every push).
+#
+# Design constraints:
+#   * READ-ONLY hooks: they never rewrite a file, so --all-files cannot fail
+#     with "files were modified by this hook".
+#   * Local ``language: system`` hooks: no third-party hook repository is
+#     cloned, so the gate has no network dependency and no formatter version
+#     drift (black/isort/autoflake are NOT applied to historical code).
+#   * Tight ``files:`` patterns: this repository contains several unrelated
+#     legacy projects (RAG/, langGraph/, solver-verifier/, ...). Only the ARR
+#     subtree is gated; the rest of the repository is left untouched.
+# --------------------------------------------------------------------------- #
+minimum_pre_commit_version: "3.0.0"
+repos:
+  - repo: local
+    hooks:
+      - id: arr-python-syntax
+        name: "ARR: Python syntax (read-only)"
+        entry: python multi-agent/tools/precommit_checks.py ast
+        language: system
+        pass_filenames: true
+        files: ^multi-agent/(research_runtime/.*\.py|tools/.*\.py|M3_[0-9]+_runs/[^/]*\.py)$
+        types: [text]
+
+      - id: arr-json-valid
+        name: "ARR: run evidence JSON validity (read-only)"
+        entry: python multi-agent/tools/precommit_checks.py json
+        language: system
+        pass_filenames: true
+        files: ^multi-agent/M3_[0-9]+_runs/.*\.json$
+        types: [text]
+
+      - id: arr-no-merge-conflicts
+        name: "ARR: no merge-conflict markers (read-only)"
+        entry: python multi-agent/tools/precommit_checks.py conflict
+        language: system
+        pass_filenames: true
+        files: ^multi-agent/(research_runtime/.*\.py|tools/.*\.py|.*\.md)$
+        types: [text]

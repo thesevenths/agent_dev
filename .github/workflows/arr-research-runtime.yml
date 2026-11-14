@@ -56,7 +56,9 @@ jobs:
       - name: Install minimal verified deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "PyYAML>=6.0" "pydantic>=2.7.4"
+          # pytest >= 8 is required by the M3.2 / M3.4 pytest-based gates added
+          # in P0-4. PyYAML + pydantic remain the minimal verified runtime set.
+          python -m pip install "PyYAML>=6.0" "pydantic>=2.7.4" "pytest>=8.0"
 
       - name: Run unified Research Runtime engine-free suite
         # Covered modules:
@@ -79,6 +81,27 @@ jobs:
             research_runtime.tests.test_m2_7_reliability \
             research_runtime.tests.test_m3_0_statistics \
             -v
+
+      - name: Run M3.0 / M3.2 / M3.3 / M3.4 pytest gates (P0-4)
+        # P0-4: these five modules were previously only referenced by
+        # multi-agent/.github/workflows/ci.yml, a path GitHub Actions NEVER
+        # discovers, so they were never actually gated remotely. They now run
+        # in this ROOT-level workflow (the one GitHub really executes).
+        # All are ENGINE-FREE (stdlib + PyYAML + pydantic): no torch, no
+        # SciNet++ checkout, no robot simulator. The real-engine E2E remains a
+        # separate operator-driven run and is NOT claimed here.
+        env:
+          # Avoid an optional langsmith pytest plugin that needs network and
+          # crashes collection; none of these tests need any external plugin.
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          python -m pytest \
+            research_runtime/tests/test_m3_0_statistics.py \
+            research_runtime/tests/test_m3_2_embodied_real_data.py \
+            research_runtime/tests/test_m3_3_scinet_ood.py \
+            research_runtime/tests/test_m3_4_scheduler.py \
+            research_runtime/tests/test_m3_4_embodied_horizon.py \
+            -q
 
       - name: Verify CLI safety defaults + frozen statistical protocol
         # Independent smoke: the production entry point must default to
