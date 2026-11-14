@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS entity_links (
     source_sha256  TEXT,
     notes          TEXT NOT NULL DEFAULT '',
     created_at     TEXT NOT NULL,
-    UNIQUE(run_id, src_type, src_id, dst_type, dst_id, relation)
+    UNIQUE(run_id, objective_id, src_type, src_id, dst_type, dst_id, relation)
 );
 CREATE INDEX IF NOT EXISTS idx_links_src ON entity_links(run_id, src_type, src_id);
 CREATE INDEX IF NOT EXISTS idx_links_dst ON entity_links(run_id, dst_type, dst_id);
@@ -74,8 +74,43 @@ def sha256_file(path: Path) -> str | None:
     return h.hexdigest()
 
 
+def ensure_link_schema(db: ResearchDatabase) -> dict[str, Any]:
+    """Idempotently converge an EXISTING entity_links table to the current scope.
+
+    M4.0-02 shipped with UNIQUE(run_id, src_type, ...). M4.0-03 found that the
+    three domains share identical ``hyp_fingerprint`` values, so links for the
+    same candidate in different objectives were silently merged. The scope now
+    includes ``objective_id``. SQLite cannot ALTER a constraint, so an old EMPTY
+    table is rebuilt atomically; a NON-EMPTY old table is refused (fail-closed)
+    rather than having its history silently dropped.
+    """
+    with db.session() as conn:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='entity_links'").fetchone()
+        if row is None:
+            for statement in SCHEMA_SQL.split(";"):
+                if statement.strip():
+                    conn.execute(statement)
+            return {"status": "created"}
+        ddl = row["sql"] or ""
+        if "UNIQUE(run_id, objective_id" in ddl:
+            return {"status": "current"}
+        n = conn.execute("SELECT COUNT(*) AS n FROM entity_links").fetchone()["n"]
+        if n:
+            raise ResearchStoreConflict(
+                "entity_links has an obsolete UNIQUE scope and is non-empty; "
+                "refusing to silently rebuild historical relations")
+        conn.execute("DROP TABLE entity_links")
+        for statement in SCHEMA_SQL.split(";"):
+            if statement.strip():
+                conn.execute(statement)
+        return {"status": "rebuilt_empty_legacy_table"}
+
+
 class EntityLinkStore:
     def __init__(self, db: ResearchDatabase, *, workspace: Path | None = None):
+        ensure_link_schema(db)
         self.db = db
         # source_path is stored POSIX-relative to this root for Windows/Linux
         # portability; a workspace makes SHA verification reproducible.
@@ -112,9 +147,10 @@ class EntityLinkStore:
         with self.db.session() as conn:
             existing = conn.execute(
                 """SELECT link_id FROM entity_links
-                   WHERE run_id=? AND src_type=? AND src_id=? AND dst_type=?
-                     AND dst_id=? AND relation=?""",
-                (run_id, src_type, src_id, dst_type, dst_id, relation)).fetchone()
+                   WHERE run_id=? AND objective_id=? AND src_type=? AND src_id=?
+                     AND dst_type=? AND dst_id=? AND relation=?""",
+                (run_id, objective_id, src_type, src_id, dst_type, dst_id,
+                 relation)).fetchone()
             if existing is not None:
                 return {"status": "duplicate", "link_id": existing["link_id"]}
             cur = conn.execute(

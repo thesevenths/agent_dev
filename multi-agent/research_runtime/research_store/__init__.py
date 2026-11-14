@@ -43,7 +43,8 @@ from .objective_store import (
     describe_schema, from_research_objective, schema_structure,
 )
 from .entity_link_store import (
-    EntityLinkStore, SCHEMA_SQL as ENTITY_LINK_SCHEMA, sha256_file,
+    EntityLinkStore, SCHEMA_SQL as ENTITY_LINK_SCHEMA, ensure_link_schema,
+    sha256_file,
 )
 from .research_session_store import ResearchSessionStore, SCHEMA_SQL as SESSION_SCHEMA
 from .schemas import (
@@ -85,13 +86,15 @@ class ResearchStores:
         self.approvals = ApprovalStore(self.db)
         self.sessions = ResearchSessionStore(self.db)
         self.objectives = ObjectiveStore(self.db)
+        ensure_link_schema(self.db)       # idempotent, fail-closed
         self.links = EntityLinkStore(self.db, workspace=Path.cwd())
 
 
 __all__ = [
     "ResearchStores", "ResearchDatabase", "default_db_path",
     "HypothesisStore", "ExperimentPlanStore", "ApprovalStore",
-    "ResearchSessionStore", "ObjectiveStore", "EntityLinkStore", "sha256_file",
+    "ResearchSessionStore", "ObjectiveStore", "EntityLinkStore",
+    "ensure_link_schema", "sha256_file",
     "canonical_hypothesis", "hypothesis_sha256",
     "canonical_plan", "plan_sha256",
     "canonical_bytes", "content_sha256", "safe_id",
