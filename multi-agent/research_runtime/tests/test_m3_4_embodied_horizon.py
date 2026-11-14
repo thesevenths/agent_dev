@@ -37,8 +37,13 @@ from research_runtime.domains.embodied import (
 
 # Exact metrics produced by the DEFAULT config (rollout_horizon=5) BEFORE the
 # P0-1 fix, with train seed=50 / validation split / frozen robot_sim_v1.
-# Locking these numbers proves "keep the existing default behaviour unchanged"
-# bit-for-bit, not just "still succeeds".
+# Locking these numbers proves "keep the existing default behaviour unchanged".
+# Comparison uses a 1e-12 relative tolerance: CPython 3.11 vs 3.12+ differ by
+# ONE ULP in the float accumulation order of action_prediction_mse
+# (0.2594051985526708 vs 0.25940519855267075, ~5e-17). That is a platform
+# detail, NOT a behaviour change. 1e-12 is still ~9 orders of magnitude
+# tighter than any REAL behaviour change (e.g. a different window count shifts
+# state_mse@1 by ~4e-5); the test below proves that discriminating power.
 GOLDEN_DEFAULT = {
     "action_prediction_mse": 0.25940519855267075,
     "physics_consistency": 0.9984451639021401,
@@ -51,6 +56,8 @@ GOLDEN_DEFAULT = {
     "task_success_rate": 1.0,
 }
 GOLDEN_N_WINDOWS = 180
+# 1 ULP-level tolerance for cross-CPython-version float accumulation only.
+GOLDEN_RTOL = 1e-12
 
 ALL_HORIZONS = tuple(range(2, 9))  # 2,3,4,5,6,7,8
 
@@ -159,9 +166,30 @@ def test_default_config_behaviour_is_bit_for_bit_unchanged():
     assert out["n_rollout_windows"] == GOLDEN_N_WINDOWS
     assert set(out["metrics"]) == set(GOLDEN_DEFAULT)
     for name, expected in GOLDEN_DEFAULT.items():
-        assert out["metrics"][name] == pytest.approx(expected, abs=0, rel=0), \
+        assert out["metrics"][name] == pytest.approx(
+            expected, rel=GOLDEN_RTOL, abs=1e-15), \
             f"default behaviour changed for {name}: {out['metrics'][name]} != {expected}"
     assert doc["planning_horizon"] == 5
+    assert doc["evaluation_horizons"] == list(EVALUATION_HORIZONS)
+
+
+def test_golden_tolerance_still_detects_real_behaviour_change():
+    """The 1-ULP tolerance must NOT be able to hide an actual change.
+
+    A longer planning horizon (6) shrinks the window count 180 -> 168 and
+    moves state_mse@1 by ~4e-5, i.e. ~8 orders of magnitude above the
+    tolerance. If this ever stops being true, the golden test has become
+    vacuous and must be tightened.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        _, h5 = _train_and_evaluate(5, Path(td))
+    with tempfile.TemporaryDirectory() as td:
+        out6, _ = _train_and_evaluate(6, Path(td))
+    baseline = h5["metrics"]["state_mse@1"]
+    changed = out6["metrics"]["state_mse@1"]
+    assert h5["n_windows"] == 180 and out6["n_rollout_windows"] == 168
+    assert changed != pytest.approx(baseline, rel=GOLDEN_RTOL, abs=1e-15), \
+        "golden tolerance is too loose: it can no longer detect a real change"
 
 
 def test_evaluation_horizons_are_fixed_and_aliased():
@@ -211,5 +239,6 @@ def test_evaluation_metrics_independent_of_planning_horizon_2_to_5():
                  "state_mse@4", "state_mse@5", "action_prediction_mse",
                  "safety_violations"):
         values = [docs[h][name] for h in (2, 3, 4, 5)]
-        assert all(v == pytest.approx(values[0], abs=0, rel=0) for v in values), \
+        assert all(v == pytest.approx(values[0], rel=GOLDEN_RTOL, abs=1e-15)
+                   for v in values), \
             f"{name} drifted with planning horizon: {values}"
