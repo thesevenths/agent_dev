@@ -173,3 +173,37 @@ def test_sixth_carrier_evidence_jsonl_with_synthetic_workspace(tmp_path: Path):
     assert len(ents) == 1
     assert ents[0]["checkpoint_sha256"] == ["a" * 64]
     assert ents[0]["evaluation_run_ids"] == [run]
+
+
+def test_windows_style_artifact_path_resolves_on_any_platform(tmp_path: Path):
+    """P0-2 recorded Windows absolute paths. On Linux those are neither
+    absolute nor resolvable; the generic anchor resolver must recover the REAL
+    file so both carriers hash identical bytes."""
+    target = tmp_path / "M2_7_runs" / "scinet" / "outputs" / \
+        "research_campaigns" / "run_w_scinet" / "c" / "ood_metrics.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps({"dataset_version": "v", "run_id": "r",
+                                  "checkpoint_sha256": "a" * 64,
+                                  "metrics": {"m": 1}}), encoding="utf-8")
+    win_path = r"E:/agent_dev/multi-agent/M2_7_runs/scinet/outputs/research_campaigns/run_w_scinet/c/ood_metrics.json"
+    from research_runtime.evidence_read_model import _resolve_artifact_path
+    resolved = _resolve_artifact_path(win_path, tmp_path)
+    assert resolved is not None and resolved.is_file()
+    assert sha256_file(resolved) == sha256_file(target)
+
+
+def test_windows_style_artifact_path_resolves_on_any_platform(tmp_path: Path):
+    """P0-2 recorded Windows absolute paths. On Linux those are neither
+    absolute nor resolvable; the generic anchor resolver must recover the REAL
+    file so both carriers hash identical bytes."""
+    target = tmp_path / "M2_7_runs" / "scinet" / "outputs" / \
+        "research_campaigns" / "run_w_scinet" / "c" / "ood_metrics.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps({"dataset_version": "v", "run_id": "r",
+                                  "checkpoint_sha256": "a" * 64,
+                                  "metrics": {"m": 1}}), encoding="utf-8")
+    win_path = r"E:\agent_dev\multi-agent\M2_7_runs\scinet\outputs\research_campaigns\run_w_scinet\c\ood_metrics.json"
+    from research_runtime.evidence_read_model import _resolve_artifact_path
+    resolved = _resolve_artifact_path(win_path, tmp_path)
+    assert resolved is not None and resolved.is_file()
+    assert sha256_file(resolved) == sha256_file(target)
