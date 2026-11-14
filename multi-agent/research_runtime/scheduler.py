@@ -410,6 +410,17 @@ class UnifiedResearchScheduler:
         self.run_root.mkdir(parents=True, exist_ok=True)
 
     # -- naming -----------------------------------------------------------
+    def query_run_evidence(self, run_id: str, *,
+                           workspace: str | Path | None = None) -> dict[str, Any]:
+        """M4.0-04: unified READ-ONLY evidence view for one run.
+
+        Uses the SAME ``query_run_evidence`` entry point as ResearchService so
+        both agree on the evidence set. Read-only: does not run a domain, does
+        not recompute a verdict and does not touch any historical artifact.
+        """
+        from .evidence_read_model import query_run_evidence
+        return query_run_evidence(run_id, workspace=workspace)
+
     def _domain_run_root(self, domain: str) -> Path:
         return self.run_root / domain
 

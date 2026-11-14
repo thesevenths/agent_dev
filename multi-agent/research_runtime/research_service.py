@@ -151,6 +151,18 @@ class ResearchService:
         self.deps = deps
         self._run_lock = threading.RLock()
 
+    def query_run_evidence(self, run_id: str, *,
+                           workspace: str | Path | None = None) -> dict[str, Any]:
+        """M4.0-04: unified READ-ONLY evidence view for one run.
+
+        Delegates to the SAME module-level reader the Scheduler uses, so both
+        halves of ARR return an identical set. This never participates in a
+        gate: the 12-step fail-closed chain and ``default_evidence_provider``
+        are untouched; no statistical verdict is recomputed here.
+        """
+        from .evidence_read_model import query_run_evidence
+        return query_run_evidence(run_id, workspace=workspace)
+
     # ------------------------------------------------------------- helpers
     @property
     def stores(self) -> ResearchStores:
