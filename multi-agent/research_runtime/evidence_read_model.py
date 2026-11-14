@@ -63,6 +63,31 @@ def _rel(path: Path, workspace: Path) -> str:
         return "<external>:" + path.as_posix()
 
 
+def _resolve_artifact_path(raw: str, workspace: Path) -> Path | None:
+    """Resolve a recorded artifact path ACROSS PLATFORMS.
+
+    P0-2 recorded Windows absolute paths (``E:\\agent_dev\\multi-agent\\...``).
+    On a Linux CI checkout those are neither absolute nor resolvable, and the
+    RECORDED SHA came from a CRLF working copy while git stores LF -- so the
+    same real file would get two different identities. Re-resolve against the
+    current workspace and hash the REAL bytes instead. This is a portability
+    fix, not a fabricated hash.
+    """
+    if not raw:
+        return None
+    p = Path(raw)
+    if p.is_file():
+        return p
+    parts = str(raw).replace("\\", "/").split("/")
+    for anchor in ("M2_7_runs", "M3_4_runs", "M4_0_runs",
+                   "research_runtime", "experiments"):
+        if anchor in parts:
+            candidate = workspace.joinpath(*parts[parts.index(anchor):])
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def _json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -175,6 +200,12 @@ class UnifiedEvidenceReader:
         self._read_bundle_releases(view, run_id)
         return view.as_dict()
 
+    def _current_artifact_path(self, artifact: dict[str, Any],
+                               fallback: Path) -> Path:
+        resolved = _resolve_artifact_path(str(artifact.get("path") or ""),
+                                          self.workspace)
+        return resolved or Path(str(artifact.get("path") or fallback))
+
     # -- carrier: evidence_index.json (v1 or v2) ---------------------------
     def _read_evidence_index(self, view: EvidenceView, path: Path) -> None:
         if not path.is_file():
@@ -220,9 +251,11 @@ class UnifiedEvidenceReader:
                 # (duplicate recognition) instead of creating two.
                 if not a.get("file_sha256"):
                     continue
-                ap = Path(str(a.get("path"))) if a.get("path") else path
+                ap = (self._current_artifact_path(a, path)
+                      if a.get("path") else path)
+                real_sha = sha256_file(ap) or a["file_sha256"]
                 view.absorb(
-                    evidence_id="sha256:" + a["file_sha256"],
+                    evidence_id="sha256:" + real_sha,
                     carrier="evidence_index", source_path=ap,
                     dataset_versions=[a.get("dataset_version")],
                     checkpoint_sha256=[a.get("checkpoint_sha256")],

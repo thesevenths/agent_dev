@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from unittest import mock
 
+import pytest
 import yaml
 
 from research_runtime.scheduler import (

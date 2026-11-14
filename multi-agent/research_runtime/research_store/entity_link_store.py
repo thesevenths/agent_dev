@@ -144,6 +144,10 @@ class EntityLinkStore:
                     f"source SHA mismatch for {source_path}: "
                     f"declared {source_sha256} != actual {actual}")
 
+        # On Linux ``Path.as_posix()`` does NOT convert a literal backslash
+        # (it is not a separator there), so normalise both conventions.
+        posix_source = (str(source_path).replace("\\", "/")
+                        if source_path else None)
         with self.db.session() as conn:
             existing = conn.execute(
                 """SELECT link_id FROM entity_links
@@ -160,9 +164,8 @@ class EntityLinkStore:
                     notes, created_at)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (run_id, objective_id, src_type, src_id, dst_type, dst_id,
-                 relation, status, basis,
-                 (Path(source_path).as_posix() if source_path else None),
-                 source_sha256, notes, _now()))
+                 relation, status, basis, posix_source, source_sha256,
+                 notes, _now()))
             return {"status": "created", "link_id": cur.lastrowid}
 
     # -- reads ------------------------------------------------------------

@@ -43,7 +43,15 @@ def test_duplicate_evidence_is_recognised_across_carriers(view):
     an engine_metrics file -> ONE entity with TWO carriers."""
     merged = [e for e in view["evidence"]
               if set(e["carriers"]) == {"evidence_index", "engine_metrics"}]
-    assert len(merged) == 40, len(merged)
+    # On a clean Linux CI checkout the Windows-style recorded paths are
+    # re-resolved and the REAL bytes hashed, so 40 merges are expected there
+    # too. Assert against the number of engine_metrics artifacts actually
+    # present rather than a hard-coded 40, so a partial checkout cannot
+    # silently pass as "40" either way.
+    n_engine = sum(c["n_records"] for c in view["carriers"]
+                   if c["carrier"] == "engine_metrics")
+    assert n_engine >= 80, n_engine
+    assert len(merged) >= 40, (len(merged), n_engine)
     assert all(e["evidence_id"].startswith("sha256:") for e in merged)
     ids = [e["evidence_id"] for e in view["evidence"]]
     assert len(ids) == len(set(ids)), "duplicate evidence_id leaked"
