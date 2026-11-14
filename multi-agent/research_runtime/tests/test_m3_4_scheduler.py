@@ -670,3 +670,94 @@ class TestSchedulerRecoveryState:
         assert out["failed_domains"] == ["quant"]
         assert out["completed_this_invocation"] == ["scinet", "embodied"]
         assert out["completed_total"] == ["embodied", "scinet"]
+
+
+# --------------------------------------------------------------------------- #
+# M4.0-05 / P0-2 regression -- filename vs REAL config semantics.
+# --------------------------------------------------------------------------- #
+class TestProvenanceAxisCounterexamples:
+    """Task book §8: a filename saying 'ood' must NOT override explicit ID
+    content, and a filename with no 'ood' hint must still be detected as OOD
+    when its config_path / dataset_version says so.
+    """
+
+    @staticmethod
+    def _fixture(tmp_path: Path):
+        id_cfg, _ = _make_frozen_data(tmp_path, "id_set", "id-v1")
+        ood_cfg, _ = _make_frozen_data(tmp_path, "ood_set", "ood-v2")
+        camp = (tmp_path / "project" / "outputs" / "research_campaigns"
+                / "r1_scinet")
+        spec = DomainSpec(domain="scinet", base_config=id_cfg,
+                          dataset_version="id-v1", paired_seeds=(50,),
+                          project_dir=tmp_path / "project",
+                          ood_config_path=ood_cfg)
+        return id_cfg, ood_cfg, camp, spec
+
+    def test_filename_says_ood_but_content_says_id(self, tmp_path):
+        id_cfg, ood_cfg, camp, spec = self._fixture(tmp_path)
+        # COUNTEREXAMPLE: name='ood_metrics.json' but config_path + dataset are ID.
+        _make_metric_artifact(camp / "c" / "ood_metrics.json",
+                              version="id-v1", checkpoint="c" * 64,
+                              run_id="id-run", config_path=id_cfg)
+        # A genuine OOD artifact whose name carries NO ood hint.
+        _make_metric_artifact(camp / "c" / "engine_metrics.json",
+                              version="ood-v2", checkpoint="d" * 64,
+                              run_id="ood-run", config_path=ood_cfg)
+        prov = collect_domain_provenance(
+            spec=spec, dr_root=tmp_path / "run", campaign_id="r1_scinet")
+        by_name = {Path(a["path"]).name: a for a in prov["artifact_files"]}
+        assert by_name["ood_metrics.json"]["axis"] == "id"
+        assert by_name["ood_metrics.json"]["axis_basis"] == "config_path"
+        assert by_name["engine_metrics.json"]["axis"] == "ood"
+        assert prov["ood_metrics"]["n_artifacts"] == 1
+        assert prov["ood_metrics"]["artifacts"][0]["evaluation_run_id"] == "ood-run"
+        assert prov["checkpoint_sha256"]["id"] == ["c" * 64]
+        assert prov["checkpoint_sha256"]["ood"] == ["d" * 64]
+        assert prov["status"] == "complete", prov["missing"]
+
+    def test_filename_fallback_is_labelled_unverified(self, tmp_path):
+        _, _, camp, spec = self._fixture(tmp_path)
+        # No config_path and no recognised dataset version: filename is the
+        # ONLY hint -> must be explicitly marked unverified.
+        _make_metric_artifact(camp / "c" / "ood_metrics.json",
+                              version="unrecognised-v9", checkpoint="e" * 64,
+                              run_id="r")
+        prov = collect_domain_provenance(
+            spec=spec, dr_root=tmp_path / "run", campaign_id="r1_scinet")
+        a = prov["ood_metrics"]["artifacts"][0]
+        assert a["axis_basis"] == "filename_unverified"
+
+    def test_contradictory_content_is_not_silently_classified(self, tmp_path):
+        id_cfg, ood_cfg, camp, spec = self._fixture(tmp_path)
+        # config_path says OOD, dataset_version says ID -> conflict.
+        _make_metric_artifact(camp / "c" / "ood_metrics.json",
+                              version="id-v1", checkpoint="f" * 64,
+                              run_id="r", config_path=ood_cfg)
+        prov = collect_domain_provenance(
+            spec=spec, dr_root=tmp_path / "run", campaign_id="r1_scinet")
+        assert prov["artifact_files"][0]["axis"] == "unknown"
+        assert prov["artifact_files"][0]["axis_basis"] == "content_conflict"
+        assert len(prov["axis_warnings"]) == 1
+        assert prov["ood_metrics"]["n_artifacts"] == 0
+        assert prov["status"] == "incomplete"
+
+    def test_real_arr_m34_001_classification_still_correct(self, tmp_path):
+        """Guard against a regression on the REAL historical artifacts."""
+        ws = Path(__file__).resolve().parents[2]
+        sc = ws / "M2_7_runs" / "scinet"
+        ood_cfg = Path("E:/LLM/SciNet++/configs/pendulum_smoke_ood.yaml")
+        if not (sc / "configs" / "pendulum_smoke.yaml").is_file() or \
+                not ood_cfg.is_file():
+            pytest.skip("real engine checkout / frozen OOD config not present")
+        spec = DomainSpec(domain="scinet",
+                          base_config=sc / "configs" / "pendulum_smoke.yaml",
+                          dataset_version="pendulum-a0e03386be89",
+                          paired_seeds=(50,), project_dir=sc,
+                          ood_config_path=ood_cfg)
+        prov = collect_domain_provenance(
+            spec=spec, dr_root=ws / "M3_4_runs" / "arr_m34_001" / "scinet",
+            campaign_id="arr_m34_001_scinet")
+        assert prov["status"] == "complete"
+        assert prov["ood_metrics"]["n_artifacts"] == 40
+        assert prov["id_dataset"]["manifest"]["dataset_version"] == \
+            "pendulum-a0e03386be89"

@@ -180,11 +180,15 @@ class EntityLinkStore:
 
     def find_by_entity(self, entity_type: str, entity_id: str, *,
                        run_id: str | None = None,
+                       objective_id: str | None = None,
                        direction: str = "both") -> list[dict[str, Any]]:
         """FORWARD (as src) and REVERSE (as dst) queries.
 
-        ``direction``: 'out' | 'in' | 'both'. When ``run_id`` is given the
-        result is strictly scoped to that run (cross-run isolation).
+        ``direction``: 'out' | 'in' | 'both'. ``run_id`` scopes to one run;
+        ``objective_id`` scopes to one objective graph. The latter matters
+        because M3.x re-uses the SAME ``hyp_fingerprint`` in all three domains:
+        preserving that original ID is required, so the OBJECTIVE is the
+        isolation boundary that keeps per-domain chains from being mixed.
         """
         if direction not in ("out", "in", "both"):
             raise ValueError("direction must be out|in|both")
@@ -200,6 +204,9 @@ class EntityLinkStore:
         if run_id is not None:
             sql += " AND run_id=?"
             params.append(run_id)
+        if objective_id is not None:
+            sql += " AND objective_id=?"
+            params.append(objective_id)
         sql += " ORDER BY link_id"
         return [self._row(r) for r in self.db.rows(sql, tuple(params))]
 

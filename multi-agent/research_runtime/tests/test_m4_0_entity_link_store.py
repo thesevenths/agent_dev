@@ -165,3 +165,59 @@ def test_graph_is_deterministic_order(env):
     g2 = links.list_objective_graph("obj_A", run_id="run_A")
     assert g1 == g2
     assert g1["nodes"]["candidate"] == sorted(g1["nodes"]["candidate"])
+
+
+def test_same_entity_id_is_isolated_by_objective(env):
+    """M4.0-05: three domains reuse the SAME hyp_fingerprint. Preserving the
+    original ID must not mix their chains; objective_id is the boundary."""
+    _, _, _, links = env
+    shared = "candidate:domain_model::train.lr|None->0.003|X"
+    for domain in ("scinet", "embodied", "quant"):
+        oid = f"obj_run_A_{domain}"
+        _add(links, objective_id=oid, src_id=oid, dst_id=shared,
+             relation="drives")
+        _add(links, objective_id=oid, src_type="candidate", src_id=shared,
+             dst_type="campaign", dst_id=f"camp_{domain}",
+             relation="evaluated_in")
+        _add(links, objective_id=oid, src_type="candidate", src_id=shared,
+             dst_type="hypothesis", dst_id=UNRESOLVED_SENTINEL,
+             relation="hypothesis_unknown", status="unresolved",
+             basis="no_explicit_id", notes="no explicit hypothesis id")
+    all_links = links.find_by_entity("candidate", shared, run_id="run_A")
+    assert len(all_links) == 9           # 3 domains x 3 relations
+    scoped = links.find_by_entity("candidate", shared, run_id="run_A",
+                                  objective_id="obj_run_A_scinet")
+    assert len(scoped) == 3
+    assert {l["objective_id"] for l in scoped} == {"obj_run_A_scinet"}
+    assert [l["dst_id"] for l in scoped if l["dst_type"] == "campaign"] \
+        == ["camp_scinet"]
+    g = links.list_objective_graph("obj_run_A_quant", run_id="run_A")
+    assert g["n_links"] == 3 and g["n_unresolved"] == 1
+
+
+def test_same_entity_id_is_isolated_by_objective(env):
+    """M4.0-05: three domains reuse the SAME hyp_fingerprint. Preserving the
+    original ID must not mix their chains; objective_id is the boundary."""
+    _, _, _, links = env
+    shared = "candidate:domain_model::train.lr|None->0.003|X"
+    for domain in ("scinet", "embodied", "quant"):
+        oid = f"obj_run_A_{domain}"
+        _add(links, objective_id=oid, src_id=oid, dst_id=shared,
+             relation="drives")
+        _add(links, objective_id=oid, src_type="candidate", src_id=shared,
+             dst_type="campaign", dst_id=f"camp_{domain}",
+             relation="evaluated_in")
+        _add(links, objective_id=oid, src_type="candidate", src_id=shared,
+             dst_type="hypothesis", dst_id=UNRESOLVED_SENTINEL,
+             relation="hypothesis_unknown", status="unresolved",
+             basis="no_explicit_id", notes="no explicit hypothesis id")
+    all_links = links.find_by_entity("candidate", shared, run_id="run_A")
+    assert len(all_links) == 9           # 3 domains x 3 relations
+    scoped = links.find_by_entity("candidate", shared, run_id="run_A",
+                                  objective_id="obj_run_A_scinet")
+    assert len(scoped) == 3
+    assert {l["objective_id"] for l in scoped} == {"obj_run_A_scinet"}
+    assert [l["dst_id"] for l in scoped if l["dst_type"] == "campaign"] \
+        == ["camp_scinet"]
+    g = links.list_objective_graph("obj_run_A_quant", run_id="run_A")
+    assert g["n_links"] == 3 and g["n_unresolved"] == 1

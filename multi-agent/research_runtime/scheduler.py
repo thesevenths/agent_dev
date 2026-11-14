@@ -147,7 +147,9 @@ def _collect_metric_artifacts(roots: Iterable[Path]) -> list[dict[str, Any]]:
                 "path": str(path),
                 "file_sha256": _sha256_file(path),
                 "name": path.name,
-                "axis": "ood" if "ood" in path.name.lower() else "id",
+                # Classified later by CONTENT in collect_domain_provenance.
+                "axis": "unknown",
+                "axis_basis": "unclassified",
                 "dataset_version": doc.get("dataset_version"),
                 "checkpoint_sha256": doc.get("checkpoint_sha256"),
                 "evaluation_run_id": doc.get("run_id"),
@@ -175,22 +177,55 @@ def collect_domain_provenance(*, spec: "DomainSpec", dr_root: Path,
     artifacts = _collect_metric_artifacts(campaign_dirs)
 
     ood_cfg = Path(spec.ood_config_path) if spec.ood_config_path else None
-    ood_cfg_str = str(ood_cfg).lower() if ood_cfg else None
-    # Axis classification by CONTENT, not by engine file name. The ``ood``
-    # infix is only a fallback: an artifact is OOD if it was evaluated against
-    # the OOD config, or against a dataset version distinct from the ID one.
-    for a in artifacts:
-        cfg_match = bool(ood_cfg_str and a["config_path"]
-                         and str(a["config_path"]).lower() == ood_cfg_str)
-        ds_match = bool(a["dataset_version"] and spec.dataset_version
-                        and a["dataset_version"] != spec.dataset_version)
-        a["axis"] = "ood" if (cfg_match or ds_match
-                              or "ood" in a["name"].lower()) else "id"
-        a["axis_basis"] = ("config_path" if cfg_match else
-                           "dataset_version" if ds_match else
-                           "filename" if "ood" in a["name"].lower() else "id_default")
+    id_cfg = Path(spec.base_config)
+    # Manifests are resolved FIRST: their declared dataset_version is an
+    # authoritative content signal, not a filename convention.
     ood_manifest = _manifest_provenance(ood_cfg, project_dir)
-    id_manifest = _manifest_provenance(Path(spec.base_config), project_dir)
+    id_manifest = _manifest_provenance(id_cfg, project_dir)
+
+    def _norm_path(value: Any) -> str | None:
+        return Path(str(value)).as_posix().lower() if value else None
+
+    ood_cfg_str = _norm_path(ood_cfg)
+    id_cfg_str = _norm_path(id_cfg)
+    ood_declared = {v for v in (ood_manifest.get("dataset_version"),) if v}
+    id_declared = {v for v in (spec.dataset_version,
+                               id_manifest.get("dataset_version")) if v}
+
+    # M4.0-05: CONTENT signals dominate the FILENAME hint and can VETO it.
+    # A file named ``ood_metrics.json`` whose config_path / dataset_version
+    # clearly say ID must be classified as ID, not OOD. If content signals
+    # contradict each other, mark the axis ``unknown`` (and warn) rather than
+    # silently picking one -- an unclassified artifact never pollutes OOD stats.
+    axis_warnings: list[dict[str, Any]] = []
+    for a in artifacts:
+        cfg = _norm_path(a["config_path"])
+        ds = a["dataset_version"]
+        ood_votes: list[str] = []
+        id_votes: list[str] = []
+        if cfg and ood_cfg_str and cfg == ood_cfg_str:
+            ood_votes.append("config_path")
+        if cfg and id_cfg_str and cfg == id_cfg_str:
+            id_votes.append("config_path")
+        if ds and ds in ood_declared:
+            ood_votes.append("dataset_version")
+        if ds and ds in id_declared:
+            id_votes.append("dataset_version")
+        if ood_votes and id_votes:
+            a["axis"], a["axis_basis"] = "unknown", "content_conflict"
+            axis_warnings.append({"path": a["path"],
+                                  "reason": "contradictory content signals",
+                                  "ood_votes": ood_votes, "id_votes": id_votes})
+        elif ood_votes:
+            a["axis"], a["axis_basis"] = "ood", ood_votes[0]
+        elif id_votes:
+            a["axis"], a["axis_basis"] = "id", id_votes[0]
+        elif "ood" in a["name"].lower():
+            # No content signal at all: filename is the ONLY hint, and it is
+            # explicitly labelled unverified (never treated as authoritative).
+            a["axis"], a["axis_basis"] = "ood", "filename_unverified"
+        else:
+            a["axis"], a["axis_basis"] = "id", "id_default"
 
     ood_artifacts = [a for a in artifacts if a["axis"] == "ood"]
     id_artifacts = [a for a in artifacts if a["axis"] == "id"]
@@ -221,9 +256,10 @@ def collect_domain_provenance(*, spec: "DomainSpec", dr_root: Path,
         status = "complete" if not missing else "incomplete"
 
     return {
-        "schema_version": "m3.4-provenance-v1",
+        "schema_version": "m3.4-provenance-v2",
         "status": status,
         "missing": missing,
+        "axis_warnings": axis_warnings,
         "ood_requested": ood_requested,
         "id_dataset": {
             "dataset_version": spec.dataset_version,
