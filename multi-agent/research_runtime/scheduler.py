@@ -262,6 +262,90 @@ def collect_domain_provenance(*, spec: "DomainSpec", dr_root: Path,
 
 
 # --------------------------------------------------------------------------- #
+# P0-3 -- resume identity verification.
+#
+# A resumed domain is only trustworthy if the artifacts on disk were produced
+# by THIS run, THIS campaign, THIS baseline config and THIS frozen dataset.
+# The identity is computed at first completion and stored in the domain summary;
+# a later invocation re-computes it from the immutable inputs and compares.
+# Verification is strictly READ-ONLY: it never rewrites a historical summary,
+# registry or evidence file.
+# --------------------------------------------------------------------------- #
+
+def _domain_identity(spec: "DomainSpec", campaign_id: str,
+                     run_id: str) -> dict[str, Any]:
+    cfg = Path(spec.base_config)
+    project_dir = Path(spec.project_dir) if spec.project_dir else None
+    fdir = _resolve_frozen_dir(cfg, project_dir) if cfg.is_file() else None
+    manifest_path = fdir / "manifest.json" if fdir else None
+    return {
+        "run_id": run_id,
+        "campaign_id": campaign_id,
+        "config_path": str(cfg),
+        "config_sha256": _sha256_file(cfg) if cfg.is_file() else None,
+        "dataset_version": spec.dataset_version,
+        "dataset_sha256": (_sha256_file(manifest_path) if manifest_path else None),
+        "dataset_manifest_path": str(manifest_path) if manifest_path else None,
+    }
+
+
+def _validate_resume_identity(stored: Any, current: Mapping[str, Any],
+                              summary: Mapping[str, Any] | None = None
+                              ) -> dict[str, Any]:
+    """Compare the four required identities; fail CLOSED on any mismatch.
+
+    A v1 summary has no ``run_identity`` snapshot (it predates P0-3). It is NOT
+    silently accepted as "verified": we fall back to the two identities that
+    ARE present in every historical summary (``campaign_id`` and
+    ``dataset_version``) and label the result ``legacy_partial``. SHA-based
+    config/dataset checks are reported as unverifiable, not invented.
+    Strict mode rejects such a domain instead of reusing it.
+    """
+    summary = summary or {}
+    if not isinstance(stored, dict):
+        weak = {
+            "campaign_id": summary.get("campaign_id") == current.get("campaign_id"),
+            "dataset_version": summary.get("dataset_version") == current.get("dataset_version"),
+        }
+        return {
+            "ok": False,
+            "strict_ok": False,
+            "status": "legacy_partial" if all(weak.values()) else "legacy_mismatch",
+            "reason": ("no stored run_identity; verified campaign_id + "
+                       "dataset_version from the historical summary only"),
+            "checks": {
+                "run_id": None, "campaign_id": weak["campaign_id"],
+                "config_sha256": None, "dataset_sha256": None,
+                "dataset_version": weak["dataset_version"],
+            },
+            "stored": {"campaign_id": summary.get("campaign_id"),
+                       "dataset_version": summary.get("dataset_version")},
+            "current": {"campaign_id": current.get("campaign_id"),
+                        "dataset_version": current.get("dataset_version")},
+        }
+    checks = {
+        "run_id": stored.get("run_id") == current.get("run_id"),
+        "campaign_id": stored.get("campaign_id") == current.get("campaign_id"),
+        "config_sha256": (stored.get("config_sha256") is not None
+                          and stored.get("config_sha256") == current.get("config_sha256")),
+        "dataset_sha256": (stored.get("dataset_sha256") is not None
+                           and stored.get("dataset_sha256") == current.get("dataset_sha256")),
+        "dataset_version": stored.get("dataset_version") == current.get("dataset_version"),
+    }
+    failed = [k for k, ok in checks.items() if not ok]
+    return {
+        "ok": not failed,
+        "strict_ok": not failed,
+        "status": "verified" if not failed else "identity_mismatch",
+        "reason": ("all identities match" if not failed
+                   else f"mismatch: {', '.join(failed)}"),
+        "checks": checks,
+        "stored": {k: stored.get(k) for k in checks},
+        "current": {k: current.get(k) for k in checks},
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Domain specification
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -309,11 +393,16 @@ class UnifiedResearchScheduler:
     def __init__(self, *, run_id: str, run_root: str | Path,
                  repo_root: str | Path, domains: Iterable[DomainSpec],
                  build_runner: Callable[..., Callable] | None = None,
-                 harness_evolve: Callable[..., dict[str, Any]] | None = None):
+                 harness_evolve: Callable[..., dict[str, Any]] | None = None,
+                 strict_resume: bool = False):
         self.run_id = run_id
         self.run_root = Path(run_root).resolve()
         self.repo_root = Path(repo_root).resolve()
         self.domains: list[DomainSpec] = list(domains)
+        # P0-3: when True, a resumed domain whose identity cannot be fully
+        # verified is NOT reused. It is reported as failed WITHOUT re-running
+        # it, because re-running would overwrite historical evidence.
+        self.strict_resume = strict_resume
         # Default runner factory: the REAL engine runner used by M3.x. Tests may
         # inject a surrogate (writes fake metrics) to run engine-free.
         self._build_runner = build_runner
@@ -390,6 +479,9 @@ class UnifiedResearchScheduler:
             spec=spec, dr_root=dr_root,
             campaign_id=self._campaign_id(spec.domain))
         dom["provenance"] = prov
+        # P0-3: stamp the identity that a later resume must verify.
+        dom["run_identity"] = _domain_identity(
+            spec, self._campaign_id(spec.domain), self.run_id)
         # Disk evidence WINS over a version merely declared in a record. A
         # mismatch is retained explicitly (never silently reconciled), because
         # the historical arr_m34_001 index had ood_dataset_version=null while
@@ -441,6 +533,8 @@ class UnifiedResearchScheduler:
             # P0-2: full provenance chain travels into the summary and the
             # evidence index. Legacy summaries without it stay valid (None).
             "provenance": dom.get("provenance"),
+            # P0-3: identity snapshot used by resume verification.
+            "run_identity": dom.get("run_identity"),
             "status": "completed",
         }
 
@@ -492,15 +586,49 @@ class UnifiedResearchScheduler:
     # -- top-level run with idempotent resume ------------------------------
     def run(self) -> dict[str, Any]:
         t0 = time.time()
+        state_path = self.run_root / "scheduler_state.json"
+        history_path = self.run_root / "run_history.jsonl"
+        # Historical state is READ before anything is written, so an invocation
+        # that only resumes domains can never erase the accumulated record.
+        try:
+            previous = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        # ``completed_total`` is derived from DISK EVIDENCE (a completed
+        # domain_summary.json), not from a mutable state field. A previous
+        # invocation of the OLD scheduler could overwrite ``completed`` with
+        # [], so trusting state alone would perpetuate that data loss. The
+        # union of {disk evidence, historical state, this invocation} is
+        # monotonic and cannot be reset by a resume-only invocation.
+        previous_total = set(previous.get("completed_total")
+                             or previous.get("completed") or [])
+        disk_completed = {d.domain for d in self.domains
+                          if self._domain_complete(d.domain)}
+        accumulated_total = previous_total | disk_completed
+
         per_domain: dict[str, Any] = {}
-        completed: list[str] = []
-        skipped: list[str] = []
-        failed: list[str] = []
+        completed: list[str] = []       # completed THIS invocation (executed)
+        skipped: list[str] = []         # resumed from disk THIS invocation
+        failed: list[str] = []          # failed THIS invocation
+        validation: dict[str, Any] = {}
         for spec in self.domains:
+            expected_campaign = self._campaign_id(spec.domain)
+            current_identity = _domain_identity(
+                spec, expected_campaign, self.run_id)
             if self._domain_complete(spec.domain):
+                # STRICTLY READ-ONLY resume: never rewrite the historical
+                # domain_summary.json / candidate_registry.jsonl / engine runs.
                 data = json.loads(self._domain_summary_path(spec.domain)
                                   .read_text(encoding="utf-8"))
+                check = _validate_resume_identity(
+                    data.get("run_identity"), current_identity, data)
+                validation[spec.domain] = check
                 per_domain[spec.domain] = data
+                if self.strict_resume and not check.get("strict_ok"):
+                    # Fail CLOSED but DO NOT re-run: the engine would overwrite
+                    # the historical domain_summary / registry / artifacts.
+                    failed.append(spec.domain)
+                    continue
                 skipped.append(spec.domain)
                 continue
             try:
@@ -515,16 +643,42 @@ class UnifiedResearchScheduler:
                     "domain": spec.domain, "status": "failed",
                     "error": f"{type(exc).__name__}: {exc}",
                 }
+
+        # completed_total is the UNION of the historical record and this
+        # invocation, so a resume-only invocation can no longer reset it to [].
+        completed_total = sorted(accumulated_total | set(completed))
         elapsed = time.time() - t0
+        invocation = {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "run_id": self.run_id,
+            "completed_this_invocation": list(completed),
+            "resumed_domains": list(skipped),
+            "failed_domains": list(failed),
+            "completed_total": completed_total,
+            "resume_validation": validation,
+            "elapsed_seconds": round(elapsed, 2),
+        }
+        # APPEND-ONLY evidence of every invocation. Recovery verification must
+        # not overwrite history, so this file is never truncated or rewritten.
+        with history_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(invocation, sort_keys=True, ensure_ascii=False) + "\n")
+
         state = {
             "run_id": self.run_id,
-            "schema_version": "m3.4-scheduler-v1",
+            "schema_version": "m3.4-scheduler-v2",
             "run_root": str(self.run_root),
             "repo_root": str(self.repo_root),
             "n_domains": len(self.domains),
-            "completed": completed,
-            "skipped_resumed": skipped,
-            "failed": failed,
+            # -- P0-3 explicit, non-ambiguous counters ----------------------
+            "completed_this_invocation": list(completed),
+            "completed_total": completed_total,
+            "resumed_domains": list(skipped),
+            "failed_domains": list(failed),
+            "resume_validation": validation,
+            # -- backwards-compatible aliases (old reports / reaggregate) ---
+            "completed": list(completed),
+            "skipped_resumed": list(skipped),
+            "failed": list(failed),
             "domains": {d.domain: {
                 "synthetic_data": d.synthetic_data,
                 "dataset_version": d.dataset_version,
@@ -536,13 +690,18 @@ class UnifiedResearchScheduler:
             "elapsed_seconds": round(elapsed, 2),
             "status": "completed" if not failed else "partial_failure",
         }
-        self._atomic_write(self.run_root / "scheduler_state.json", state)
+        self._atomic_write(state_path, state)
         evidence = self._build_evidence_index(state, per_domain)
         self._atomic_write(self.run_root / "evidence_index.json", evidence)
         return {
             "run_id": self.run_id,
             "status": state["status"],
             "elapsed_seconds": state["elapsed_seconds"],
+            "completed_this_invocation": completed,
+            "completed_total": completed_total,
+            "resumed_domains": skipped,
+            "failed_domains": failed,
+            "resume_validation": validation,
             "completed": completed, "skipped_resumed": skipped, "failed": failed,
             "per_domain": per_domain,
             "scheduler_state": state,

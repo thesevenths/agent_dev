@@ -459,3 +459,214 @@ class TestOODProvenance:
         assert entry["provenance_status"] == "not_collected"
         assert entry["ood_provenance"] is None
 
+
+
+# --------------------------------------------------------------------------- #
+# P0-3 -- recovery state / identity verification / history preservation.
+# --------------------------------------------------------------------------- #
+
+def _snapshot_tree(root: Path) -> dict[str, str]:
+    return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+class TestSchedulerRecoveryState:
+    def test_resume_preserves_completed_total_and_history(self, tmp_path):
+        """Regression: a resume-only invocation used to reset `completed` to []."""
+        root = tmp_path / "run"
+        with mock.patch("research_runtime.scheduler.run_dual_layer",
+                        side_effect=_fake_dual_layer):
+            s1 = UnifiedResearchScheduler(
+                run_id="r1", run_root=root, repo_root=tmp_path,
+                domains=_specs(), build_runner=lambda *a, **k: None)
+            out1 = s1.run()
+        st1 = json.loads((root / "scheduler_state.json").read_text(encoding="utf-8"))
+        assert out1["completed_this_invocation"] == ["scinet", "embodied", "quant"]
+        assert out1["completed_total"] == ["embodied", "quant", "scinet"]
+        assert out1["resumed_domains"] == [] and out1["failed_domains"] == []
+        assert st1["schema_version"] == "m3.4-scheduler-v2"
+
+        # Snapshot ALL historical evidence before the resume invocation.
+        before = _snapshot_tree(root)
+        with mock.patch("research_runtime.scheduler.run_dual_layer",
+                        side_effect=_fake_dual_layer):
+            s2 = UnifiedResearchScheduler(
+                run_id="r1", run_root=root, repo_root=tmp_path,
+                domains=_specs(), build_runner=lambda *a, **k: None)
+            out2 = s2.run()
+        st2 = json.loads((root / "scheduler_state.json").read_text(encoding="utf-8"))
+        assert out2["completed_this_invocation"] == []
+        assert out2["completed_total"] == ["embodied", "quant", "scinet"], \
+            "history was reset by the resume invocation"
+        assert set(out2["resumed_domains"]) == {"scinet", "embodied", "quant"}
+        assert out2["failed_domains"] == []
+        assert st2["completed_total"] == st1["completed_total"]
+
+        # Every historical domain summary / registry / evidence file is
+        # byte-for-byte unchanged. Only state/index/history may change.
+        after = _snapshot_tree(root)
+        mutable = {"scheduler_state.json", "scheduler_state.json.tmp",
+                   "evidence_index.json", "evidence_index.json.tmp",
+                   "run_history.jsonl"}
+        changed = {k for k in before if k not in mutable
+                   and (k not in after or after[k] != before[k])}
+        assert not changed, f"resume overwrote historical evidence: {changed}"
+        for name in ("scinet", "embodied", "quant"):
+            p = root / name / "domain_summary.json"
+            key = p.relative_to(root).as_posix()
+            assert p.is_file() and after[key] == before[key]
+
+        hist = [json.loads(x) for x in (root / "run_history.jsonl").read_text(
+            encoding="utf-8").splitlines() if x.strip()]
+        assert len(hist) == 2
+        assert hist[0]["completed_this_invocation"] == ["scinet", "embodied", "quant"]
+        assert hist[1]["resumed_domains"] == ["scinet", "embodied", "quant"]
+        assert hist[1]["completed_total"] == ["embodied", "quant", "scinet"]
+
+    def test_new_summaries_stamp_verifiable_identity(self, tmp_path):
+        id_cfg, mpath = _make_frozen_data(tmp_path, "id_set", "id-v1")
+        specs = [DomainSpec(domain="scinet", base_config=id_cfg,
+                            dataset_version="id-v1", paired_seeds=(50,),
+                            project_dir=tmp_path / "project")]
+        root = tmp_path / "run"
+        with mock.patch("research_runtime.scheduler.run_dual_layer",
+                        side_effect=_fake_dual_layer):
+            s = UnifiedResearchScheduler(
+                run_id="r1", run_root=root, repo_root=tmp_path,
+                domains=specs, build_runner=lambda *a, **k: None)
+            s.run()
+        ident = json.loads((root / "scinet" / "domain_summary.json").read_text(
+            encoding="utf-8"))["run_identity"]
+        assert ident["run_id"] == "r1"
+        assert ident["campaign_id"] == "r1_scinet"
+        assert ident["config_sha256"] == _sha256_file(id_cfg)
+        assert ident["dataset_sha256"] == _sha256_file(mpath)
+        assert ident["dataset_version"] == "id-v1"
+        # A second invocation must VERIFY all four identities.
+        with mock.patch("research_runtime.scheduler.run_dual_layer",
+                        side_effect=_fake_dual_layer):
+            s2 = UnifiedResearchScheduler(
+                run_id="r1", run_root=root, repo_root=tmp_path,
+                domains=specs, build_runner=lambda *a, **k: None)
+            out2 = s2.run()
+        v = out2["resume_validation"]["scinet"]
+        assert v["status"] == "verified" and v["ok"] is True
+        assert all(v["checks"].values())
+
+    def test_identity_mismatch_is_reported_and_rejected_in_strict_mode(self, tmp_path):
+        id_cfg, _ = _make_frozen_data(tmp_path, "id_set", "id-v1")
+        specs = [DomainSpec(domain="scinet", base_config=id_cfg,
+                            dataset_version="id-v1", paired_seeds=(50,),
+                            project_dir=tmp_path / "project")]
+        root = tmp_path / "run"
+        with mock.patch("research_runtime.scheduler.run_dual_layer",
+                        side_effect=_fake_dual_layer):
+            UnifiedResearchScheduler(
+                run_id="r1", run_root=root, repo_root=tmp_path,
+                domains=specs, build_runner=lambda *a, **k: None).run()
+        # Mutate the baseline config => config_sha256 no longer matches.
+        id_cfg.write_text(id_cfg.read_text(encoding="utf-8") + "\n# changed\n",
+                          encoding="utf-8")
+        before = _snapshot_tree(root)
+        calls = []
+        with mock.patch("research_runtime.scheduler.run_dual_layer",
+                        side_effect=lambda **kw: (calls.append(kw) or
+                                                  _fake_dual_layer(**kw))):
+            out = UnifiedResearchScheduler(
+                run_id="r1", run_root=root, repo_root=tmp_path,
+                domains=specs, build_runner=lambda *a, **k: None,
+                strict_resume=True).run()
+        v = out["resume_validation"]["scinet"]
+        assert v["status"] == "identity_mismatch"
+        assert v["checks"]["config_sha256"] is False
+        assert out["failed_domains"] == ["scinet"]
+        assert out["resumed_domains"] == []
+        # CRITICAL: no re-run (would overwrite history), no summary rewrite.
+        assert len(calls) == 0
+        after = _snapshot_tree(root)
+        p = "scinet/domain_summary.json"
+        assert after[p] == before[p], "historical summary was overwritten"
+        # Non-strict mode still reports the mismatch but keeps legacy behaviour.
+        with mock.patch("research_runtime.scheduler.run_dual_layer",
+                        side_effect=_fake_dual_layer):
+            out3 = UnifiedResearchScheduler(
+                run_id="r1", run_root=root, repo_root=tmp_path,
+                domains=specs, build_runner=lambda *a, **k: None).run()
+        assert out3["resume_validation"]["scinet"]["status"] == "identity_mismatch"
+        assert out3["resumed_domains"] == ["scinet"]
+
+    def test_legacy_summary_is_partially_verified_not_faked(self, tmp_path):
+        """A v1 summary without run_identity must NOT be claimed 'verified'."""
+        root = tmp_path / "run" / "scinet"
+        root.mkdir(parents=True)
+        (root / "domain_summary.json").write_text(json.dumps({
+            "domain": "scinet", "status": "completed",
+            "campaign_id": "r1_scinet", "dataset_version": "id-v1",
+            "records": [], "n_accepted": 0, "n_rejected": 0,
+            "n_inconclusive": 0, "dataset_version": "id-v1",
+        }), encoding="utf-8")
+        id_cfg, _ = _make_frozen_data(tmp_path, "id_set", "id-v1")
+        specs = [DomainSpec(domain="scinet", base_config=id_cfg,
+                            dataset_version="id-v1", paired_seeds=(50,),
+                            project_dir=tmp_path / "project")]
+        before = _snapshot_tree(tmp_path / "run")
+        with mock.patch("research_runtime.scheduler.run_dual_layer",
+                        side_effect=_fake_dual_layer):
+            out = UnifiedResearchScheduler(
+                run_id="r1", run_root=tmp_path / "run", repo_root=tmp_path,
+                domains=specs, build_runner=lambda *a, **k: None).run()
+        v = out["resume_validation"]["scinet"]
+        assert v["status"] == "legacy_partial"
+        assert v["checks"]["config_sha256"] is None  # unverifiable, not fabricated
+        assert v["checks"]["campaign_id"] is True
+        assert out["resumed_domains"] == ["scinet"]
+        after = _snapshot_tree(tmp_path / "run")
+        assert after["scinet/domain_summary.json"] == before["scinet/domain_summary.json"]
+
+    def test_completed_total_recovers_from_a_state_that_was_already_clobbered(self, tmp_path):
+        """The OLD scheduler left scheduler_state.completed=[] after a resume.
+
+        completed_total must be rebuilt from the DISK domain summaries, not
+        from that clobbered field (real arr_m34_001 exhibited exactly this).
+        """
+        root = tmp_path / "run"
+        with mock.patch("research_runtime.scheduler.run_dual_layer",
+                        side_effect=_fake_dual_layer):
+            UnifiedResearchScheduler(
+                run_id="r1", run_root=root, repo_root=tmp_path,
+                domains=_specs(), build_runner=lambda *a, **k: None).run()
+        # Simulate the historical corruption: state claims nothing completed.
+        sp = root / "scheduler_state.json"
+        st = json.loads(sp.read_text(encoding="utf-8"))
+        st["completed"] = []
+        st.pop("completed_total", None)
+        sp.write_text(json.dumps(st), encoding="utf-8")
+        with mock.patch("research_runtime.scheduler.run_dual_layer",
+                        side_effect=_fake_dual_layer):
+            out = UnifiedResearchScheduler(
+                run_id="r1", run_root=root, repo_root=tmp_path,
+                domains=_specs(), build_runner=lambda *a, **k: None).run()
+        assert out["completed_this_invocation"] == []
+        assert out["completed_total"] == ["embodied", "quant", "scinet"], \
+            "disk evidence must repair a previously clobbered counter"
+        assert json.loads(sp.read_text(encoding="utf-8"))["completed_total"] == \
+            ["embodied", "quant", "scinet"]
+
+    def test_single_domain_failure_does_not_erase_completed_total(self, tmp_path):
+        specs = _specs()
+        root = tmp_path / "run"
+
+        def flaky(**kw):
+            if kw.get("domain") == "quant":
+                raise RuntimeError("engine down")
+            return _fake_dual_layer(**kw)
+
+        with mock.patch("research_runtime.scheduler.run_dual_layer",
+                        side_effect=flaky):
+            out = UnifiedResearchScheduler(
+                run_id="r1", run_root=root, repo_root=tmp_path,
+                domains=specs, build_runner=lambda *a, **k: None).run()
+        assert out["status"] == "partial_failure"
+        assert out["failed_domains"] == ["quant"]
+        assert out["completed_this_invocation"] == ["scinet", "embodied"]
+        assert out["completed_total"] == ["embodied", "scinet"]
