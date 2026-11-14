@@ -14,7 +14,7 @@ from pathlib import Path
 
 from research_runtime.research_store import ResearchStores
 
-SEED_PATH = Path(__file__).resolve().parents[1] / \
+SEED_PATH = Path(__file__).resolve().parents[2] / \
     "M4_0_runs" / "evidence" / "p1_06_db_seed.json"
 
 
