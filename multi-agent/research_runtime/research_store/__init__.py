@@ -38,6 +38,10 @@ from .hypothesis_store import (
     canonical_hypothesis,
     hypothesis_sha256,
 )
+from .objective_store import (
+    ObjectiveStore, SCHEMA_SQL as OBJECTIVE_SCHEMA, database_snapshot,
+    describe_schema, from_research_objective, schema_structure,
+)
 from .research_session_store import ResearchSessionStore, SCHEMA_SQL as SESSION_SCHEMA
 from .schemas import (
     APPROVAL_SCOPES,
@@ -50,11 +54,15 @@ from .schemas import (
     ResearchSession,
     StoredExperimentPlan,
     StoredHypothesis,
+    StoredObjective,
     safe_id,
 )
 
+# M4.0-01: the additive objectives table joins ALL_SCHEMA_SQL so a plain
+# ``ResearchStores()`` performs a single atomic, idempotent migration.
 ALL_SCHEMA_SQL = "\n".join((
     HYPOTHESIS_SCHEMA, PLAN_SCHEMA, APPROVAL_SCHEMA, SESSION_SCHEMA,
+    OBJECTIVE_SCHEMA,
 ))
 
 
@@ -73,18 +81,21 @@ class ResearchStores:
         self.plans = ExperimentPlanStore(self.db)
         self.approvals = ApprovalStore(self.db)
         self.sessions = ResearchSessionStore(self.db)
+        self.objectives = ObjectiveStore(self.db)
 
 
 __all__ = [
     "ResearchStores", "ResearchDatabase", "default_db_path",
     "HypothesisStore", "ExperimentPlanStore", "ApprovalStore",
-    "ResearchSessionStore",
+    "ResearchSessionStore", "ObjectiveStore",
     "canonical_hypothesis", "hypothesis_sha256",
     "canonical_plan", "plan_sha256",
     "canonical_bytes", "content_sha256", "safe_id",
     "StoredHypothesis", "CriticReviewRecord", "StoredExperimentPlan",
+    "StoredObjective", "from_research_objective", "describe_schema",
+    "schema_structure", "database_snapshot",
     "ApprovalRecord", "ApprovalSource", "CampaignBinding",
     "ResearchSession", "ResearchReport", "ResearchOutcome",
-    "APPROVAL_SCOPES",
+    "APPROVAL_SCOPES", "ALL_SCHEMA_SQL",
     "ResearchStoreError", "ResearchStoreConflict",
 ]

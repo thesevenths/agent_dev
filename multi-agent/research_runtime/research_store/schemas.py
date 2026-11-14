@@ -21,6 +21,7 @@ Design rules
 from __future__ import annotations
 
 import datetime
+import json
 import re
 from typing import Any, Literal
 
@@ -52,6 +53,64 @@ def safe_id(value: str, label: str = "identifier") -> str:
             or ".." in value):
         raise ValueError(f"{label} must be a safe single-segment id: {value!r}")
     return value
+
+
+class StoredObjective(BaseModel):
+    """M4.0-01 -- persisted form of ``schemas.ResearchObjective``.
+
+    Superset of the existing ResearchObjective fields plus the relationship /
+    provenance bookkeeping required by the unified knowledge model. JSON blobs
+    are stored as ``*_json`` columns in the SAME research.sqlite.
+    """
+    objective_id: str
+    domain: str = "science"
+    description: str = ""
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    success_criteria: dict[str, Any] = Field(default_factory=dict)
+    parent_objective_id: str | None = None
+    status: str = "proposed"          # proposed|active|closed|abandoned|reconstructed
+    origin_experience_id: str | None = None
+    content_sha256: str
+    created_at: str = Field(default_factory=_now)
+    provenance: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_record(self) -> "StoredObjective":
+        safe_id(self.objective_id, "objective_id")
+        if self.parent_objective_id:
+            safe_id(self.parent_objective_id, "parent_objective_id")
+        if not self.content_sha256:
+            raise ValueError("content_sha256 is required")
+        return self
+
+    @staticmethod
+    def _dump_json(value: dict[str, Any]) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+    @staticmethod
+    def _load_json(raw: str | None) -> dict[str, Any]:
+        if not raw:
+            return {}
+        try:
+            out = json.loads(raw)
+            return out if isinstance(out, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+
+    @classmethod
+    def from_row(cls, row: Any) -> "StoredObjective":
+        return cls(
+            objective_id=row["objective_id"], domain=row["domain"],
+            description=row["description"],
+            constraints=cls._load_json(row["constraints_json"]),
+            success_criteria=cls._load_json(row["success_criteria_json"]),
+            parent_objective_id=row["parent_objective_id"],
+            status=row["status"],
+            origin_experience_id=row["origin_experience_id"],
+            content_sha256=row["content_sha256"],
+            created_at=row["created_at"],
+            provenance=cls._load_json(row["provenance_json"]),
+        )
 
 
 class StoredHypothesis(BaseModel):
