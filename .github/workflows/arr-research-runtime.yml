@@ -95,13 +95,26 @@ jobs:
           # crashes collection; none of these tests need any external plugin.
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         run: |
+          set +e
           python -m pytest \
             research_runtime/tests/test_m3_0_statistics.py \
             research_runtime/tests/test_m3_2_embodied_real_data.py \
             research_runtime/tests/test_m3_3_scinet_ood.py \
             research_runtime/tests/test_m3_4_scheduler.py \
             research_runtime/tests/test_m3_4_embodied_horizon.py \
-            -q
+            -q > m3_pytest.log 2>&1
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            # Job logs need repo admin to download; re-publish the failure
+            # lines as annotations so a red matrix is diagnosable publicly.
+            grep -E "^(FAILED |ERROR |E   |[0-9]+ (failed|error))|AssertionError|Error:|ModuleNotFoundError|ImportError" m3_pytest.log \
+              | tail -40 \
+              | while IFS= read -r line; do echo "::error::$line"; done
+            tail -80 m3_pytest.log
+          else
+            tail -5 m3_pytest.log
+          fi
+          exit "$rc"
 
       - name: Verify CLI safety defaults + frozen statistical protocol
         # Independent smoke: the production entry point must default to
