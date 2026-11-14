@@ -42,6 +42,9 @@ from .objective_store import (
     ObjectiveStore, SCHEMA_SQL as OBJECTIVE_SCHEMA, database_snapshot,
     describe_schema, from_research_objective, schema_structure,
 )
+from .entity_link_store import (
+    EntityLinkStore, SCHEMA_SQL as ENTITY_LINK_SCHEMA, sha256_file,
+)
 from .research_session_store import ResearchSessionStore, SCHEMA_SQL as SESSION_SCHEMA
 from .schemas import (
     APPROVAL_SCOPES,
@@ -58,11 +61,11 @@ from .schemas import (
     safe_id,
 )
 
-# M4.0-01: the additive objectives table joins ALL_SCHEMA_SQL so a plain
+# M4.0-01/02: the two additive tables join ALL_SCHEMA_SQL so a plain
 # ``ResearchStores()`` performs a single atomic, idempotent migration.
 ALL_SCHEMA_SQL = "\n".join((
     HYPOTHESIS_SCHEMA, PLAN_SCHEMA, APPROVAL_SCHEMA, SESSION_SCHEMA,
-    OBJECTIVE_SCHEMA,
+    OBJECTIVE_SCHEMA, ENTITY_LINK_SCHEMA,
 ))
 
 
@@ -82,12 +85,13 @@ class ResearchStores:
         self.approvals = ApprovalStore(self.db)
         self.sessions = ResearchSessionStore(self.db)
         self.objectives = ObjectiveStore(self.db)
+        self.links = EntityLinkStore(self.db, workspace=Path.cwd())
 
 
 __all__ = [
     "ResearchStores", "ResearchDatabase", "default_db_path",
     "HypothesisStore", "ExperimentPlanStore", "ApprovalStore",
-    "ResearchSessionStore", "ObjectiveStore",
+    "ResearchSessionStore", "ObjectiveStore", "EntityLinkStore", "sha256_file",
     "canonical_hypothesis", "hypothesis_sha256",
     "canonical_plan", "plan_sha256",
     "canonical_bytes", "content_sha256", "safe_id",
