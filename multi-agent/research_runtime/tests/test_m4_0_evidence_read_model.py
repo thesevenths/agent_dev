@@ -22,11 +22,18 @@ def view():
     return UnifiedEvidenceReader(WS).query_run(RUN)
 
 
-def test_all_six_carriers_are_read(view):
+def test_all_available_carriers_are_read(view):
+    """CI has no git-ignored evidence.jsonl / research.sqlite. Assert that
+    EVERY carrier actually present in the checkout is read, and never weaken
+    the assertion to a fixed subset."""
+    expected = {"evidence_index", "domain_summary", "candidate_registry",
+                "engine_metrics", "evidence_bundle"}
+    jsonl = WS / "research_runtime" / "_data" / "evidence.jsonl"
+    if jsonl.is_file():
+        expected.add("evidence_jsonl")
     kinds = {c["carrier"] for c in view["carriers"]}
-    assert kinds == {"evidence_index", "domain_summary", "candidate_registry",
-                     "engine_metrics", "evidence_jsonl", "evidence_bundle"}
-    assert view["n_carriers_read"] == 6
+    assert kinds == expected, (kinds, expected)
+    assert view["n_carriers_read"] == len(expected)
     assert all(c["sha256"] for c in view["carriers"])
     assert all(c["path"] and "\\" not in c["path"] for c in view["carriers"])
 
@@ -129,3 +136,32 @@ def test_synthetic_multi_carrier_dedup(tmp_path: Path):
     assert target[0]["checkpoint_sha256"] == ["c" * 64]
     assert target[0]["evaluation_run_ids"] == ["ev1"]
     assert "inconclusive" in v["raw_verdict_census"]
+
+
+def test_sixth_carrier_evidence_jsonl_with_synthetic_workspace(tmp_path: Path):
+    """Cover the append-only ledger carrier deterministically in CI, where the
+    38 MB runtime evidence.jsonl is git-ignored and absent. A small synthetic
+    ledger is a TEST FIXTURE, never presented as historical evidence."""
+    run = "run_jsonl_probe"
+    root = tmp_path / "M3_4_runs" / run
+    root.mkdir(parents=True)
+    (root / "evidence_index.json").write_text(
+        json.dumps({"run_id": run, "domains": {}}), encoding="utf-8")
+    data_dir = tmp_path / "research_runtime" / "_data"
+    data_dir.mkdir(parents=True)
+    matching = {"at": "t", "event_type": "result",
+                "payload": {"run_id": run, "experiment_id": "exp_probe",
+                            "result": {"run_id": run,
+                                       "checkpoint": {"sha256": "a" * 64}}}}
+    noise = {"at": "t", "event_type": "result",
+             "payload": {"run_id": "ANOTHER_RUN", "experiment_id": "exp_other"}}
+    (data_dir / "evidence.jsonl").write_text(
+        json.dumps(noise) + "\n" + json.dumps(matching) + "\n", encoding="utf-8")
+    v = UnifiedEvidenceReader(tmp_path).query_run(run)
+    assert "evidence_jsonl" in {c["carrier"] for c in v["carriers"]}
+    c = next(x for x in v["carriers"] if x["carrier"] == "evidence_jsonl")
+    assert c["n_records"] == 1, "structural run_id check must exclude the noise line"
+    ents = [e for e in v["evidence"] if "evidence_jsonl" in e["carriers"]]
+    assert len(ents) == 1
+    assert ents[0]["checkpoint_sha256"] == ["a" * 64]
+    assert ents[0]["evaluation_run_ids"] == [run]

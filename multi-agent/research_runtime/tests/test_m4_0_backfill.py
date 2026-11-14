@@ -20,22 +20,24 @@ from research_runtime.research_store import ResearchStores, database_snapshot
 from research_runtime.research_store.entity_link_store import (
     UNRESOLVED_SENTINEL, EntityLinkStore,
 )
+from research_runtime.tests.m4_0_seed_helper import build_equivalent_db
 
 WS = Path(__file__).resolve().parents[2]      # multi-agent/
 sys_path_root = WS
 if str(sys_path_root) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(sys_path_root))
 RUN_ROOT = WS / "M3_4_runs" / "arr_m34_001"
-REAL_DB = WS / "research_runtime" / "_data" / "research.sqlite"
 
 
 @pytest.fixture()
 def env(tmp_path: Path):
     db = tmp_path / "research.sqlite"
-    shutil.copy2(REAL_DB, db)
-    # The real DB has already been backfilled once. Tests must start from a
-    # CLEAN relation layer while KEEPING the P1-06 historical rows, so the
-    # assertions are independent of the operator's local DB state.
+    # Works both locally (copy of the real runtime DB) and in CI (rebuild from
+    # the committed READ-ONLY export of the real P1-06 rows).
+    meta = build_equivalent_db(db, workspace=WS)
+    assert meta["source"] in ("real_db_copy", "committed_p1_06_seed")
+    # Start from a CLEAN relation layer while KEEPING the P1-06 historical rows,
+    # independent of the operator's local DB state.
     conn = sqlite3.connect(str(db))
     conn.execute("DELETE FROM entity_links")
     conn.execute("DELETE FROM objectives")
