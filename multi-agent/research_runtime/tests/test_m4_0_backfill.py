@@ -162,3 +162,121 @@ def test_source_paths_are_posix_paths(env):
     ).fetchall()
     assert rows
     assert all("\\" not in p[0] for p in rows)
+
+
+def test_reconstructed_objective_candidate_edges_are_never_confirmed(env):
+    """P1-02 invariant on REAL history: every objective->candidate (drives)
+    edge is 'reconstructed', because the objective is M4.0-reconstructed and
+    the edge is therefore M4.0-built. No such edge may ever be 'confirmed',
+    even for a double-source-confirmed candidate. The candidate->campaign
+    edge (explicit campaign_id) remains 'confirmed'."""
+    tmp, db = env
+    _run(env, "recon")
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    oc = conn.execute(
+        "SELECT src_id, status FROM entity_links "
+        "WHERE src_type='objective' AND dst_type='candidate' "
+        "AND relation='drives'").fetchall()
+    assert oc, "expected objective->candidate edges"
+    assert all(r["status"] == "reconstructed" for r in oc), \
+        [(r["src_id"], r["status"]) for r in oc]
+    cc = conn.execute(
+        "SELECT status FROM entity_links "
+        "WHERE src_type='candidate' AND dst_type='campaign' "
+        "AND relation='evaluated_in'").fetchall()
+    assert cc
+    assert all(r["status"] == "confirmed" for r in cc)
+
+
+def _synthetic_backfill_env(tmp_path: Path):
+    db = tmp_path / "research.sqlite"
+    ResearchStores(db)                      # create ALL tables idempotently
+    conn = sqlite3.connect(str(db))
+    conn.execute("DELETE FROM entity_links")
+    conn.execute("DELETE FROM objectives")
+    conn.commit()
+    conn.close()
+    return tmp_path, db
+
+
+def _write_synthetic_run_root(tmp_path: Path, run: str, domain: str = "scinet",
+                              confirmed_fps=("fp_a",), missing_fps=("fp_b",)):
+    root = tmp_path / "M3_4_runs" / run
+    (root / domain).mkdir(parents=True)
+    decisions = {fp: {"decision": "inconclusive"}
+                 for fp in list(confirmed_fps) + list(missing_fps)}
+    ev_index = {
+        "run_id": run,
+        "domains": {domain: {
+            "campaign_id": f"{run}_{domain}",
+            "dataset_version": "v1",
+            "decisions": decisions,
+            "ood_provenance": {"ood_dataset": {"dataset_version": "o1"},
+                               "ood_metrics": {"artifacts": []}}}}}
+    (root / "evidence_index.json").write_text(
+        json.dumps(ev_index, sort_keys=True), encoding="utf-8")
+    (root / "scheduler_state.json").write_text("{}", encoding="utf-8")
+    (root / domain / "domain_summary.json").write_text(
+        json.dumps({"records": [{"decision": "inconclusive"}]}), encoding="utf-8")
+    reg_lines = [json.dumps({"event": "register", "fingerprint": fp})
+                 for fp in confirmed_fps]
+    (root / domain / "candidate_registry.jsonl").write_text(
+        ("\n".join(reg_lines) + "\n") if reg_lines else "", encoding="utf-8")
+    return root
+
+
+def test_integrity_report_splits_relation_categories(env):
+    """P1-02 -- the cross-system integrity report must SEPARATELY report the
+    three relation categories (candidate identity confirmation, the
+    reconstructed objective->candidate relation, and the confirmed
+    candidate->campaign relation) instead of conflating them."""
+    tmp, db = env
+    _run(env, "integ")
+    from M4_0_runs.validate_integrity import validate
+    rep = validate(db_path=db, workspace=WS, out=tmp / "integ.json")
+    n_cand = rep["n_candidates"]
+    assert n_cand > 0
+    # Every objective->candidate edge is reconstructed (the objective is
+    # M4.0-reconstructed), so this count equals the candidate count.
+    assert rep["n_objective_candidate_relation_reconstructed"] == n_cand
+    # Every candidate is attached to its explicit campaign_id -> confirmed.
+    assert rep["n_campaign_relation_confirmed"] == n_cand
+    # Candidate identity confirmation must equal the registry-confirmed count
+    # and be reported per candidate without being conflated into the
+    # reconstructed objective->candidate edge.
+    assert (rep["n_candidate_identity_confirmed"]
+            == rep["n_candidates_confirmed_by_registry"])
+    for c in rep["candidates"]:
+        assert c["objective_candidate_relation_reconstructed"] is True
+        assert c["campaign_relation_confirmed"] is True
+        assert (c["candidate_identity_confirmed"]
+                == c["fingerprint_confirmed_by_registry"])
+
+
+def test_double_source_confirmed_candidate_still_reconstructed(tmp_path: Path):
+    """P1-02 COUNTER-EXAMPLE: a candidate whose fingerprint appears in BOTH the
+    evidence_index decision AND the candidate_registry register event is
+    double-source confirmed -- yet its objective->candidate edge must STILL be
+    'reconstructed' (the objective is M4.0-reconstructed, not native). The
+    double-source proof is preserved as a DISTINCT identity_confirmed_by link,
+    which must be ABSENT for a candidate confirmed by only one source."""
+    run = "synx"
+    _write_synthetic_run_root(tmp_path, run, confirmed_fps=("fp_a",),
+                             missing_fps=("fp_b",))
+    tmp, db = _synthetic_backfill_env(tmp_path)
+    backfill(run_root=tmp / "M3_4_runs" / run, db_path=db, workspace=tmp_path,
+             report_path=tmp / "rep.json")
+    links = EntityLinkStore(ResearchStores(db).db, workspace=tmp_path)
+    for fp, expect_identity_link in (("fp_a", True), ("fp_b", False)):
+        cid = "candidate:" + fp
+        oc = [l for l in links.find_by_entity("candidate", cid, run_id=run,
+                                              direction="in")
+              if l["src_type"] == "objective" and l["dst_type"] == "candidate"]
+        assert oc and oc[0]["status"] == "reconstructed", (fp, oc)
+        out = links.find_by_entity("candidate", cid, run_id=run, direction="out")
+        cc = [l for l in out if l["dst_type"] == "campaign"]
+        assert cc and cc[0]["status"] == "confirmed", (fp, cc)
+        id_links = [l for l in out if l["relation"] == "identity_confirmed_by"]
+        assert bool(id_links) == expect_identity_link, \
+            (fp, expect_identity_link, id_links)

@@ -48,6 +48,12 @@ def validate(*, db_path: Path, workspace: Path, out: Path) -> dict[str, Any]:
     reverse_ok = 0
     sha_ok = 0
     confirmed_candidates = 0
+    # P1-02 -- the three relation categories are counted SEPARATELY so a
+    # double-source-confirmed candidate can never be mistaken for a native
+    # objective->candidate relationship.
+    n_candidate_identity_confirmed = 0
+    n_objective_candidate_relation_reconstructed = 0
+    n_campaign_relation_confirmed = 0
 
     for domain in sorted(ev_index.get("domains", {})):
         entry = ev_index["domains"][domain]
@@ -76,6 +82,15 @@ def validate(*, db_path: Path, workspace: Path, out: Path) -> dict[str, Any]:
             to_campaign = [l for l in fwd if l["dst_type"] == "campaign"]
             to_objective = [l for l in rev if l["src_type"] == "objective"]
             unresolved = [l for l in fwd if l["status"] == "unresolved"]
+            # P1-02 -- the objective->candidate edge is reconstructed by
+            # construction (the objective is M4.0-reconstructed). A candidate's
+            # double-source identity confirmation is a SEPARATE relation.
+            obj_cand_reconstructed = any(
+                l["src_type"] == "objective" and l["dst_type"] == "candidate"
+                and l["status"] == "reconstructed" for l in rev)
+            campaign_confirmed = any(l["status"] == "confirmed"
+                                    for l in to_campaign)
+            identity_confirmed = fp in reg_fps
             evidence_links = [l for l in links.find_by_entity(
                 "campaign", campaign_id, run_id=RUN_ID,
                 objective_id=oid, direction="out")
@@ -94,8 +109,13 @@ def validate(*, db_path: Path, workspace: Path, out: Path) -> dict[str, Any]:
                   len(unresolved) == 4 and bool(evidence_links) and
                   verified == len([l for l in evidence_links
                                    if l["source_sha256"]]))
-            if fp in reg_fps:
+            if identity_confirmed:
                 confirmed_candidates += 1
+                n_candidate_identity_confirmed += 1
+            if obj_cand_reconstructed:
+                n_objective_candidate_relation_reconstructed += 1
+            if campaign_confirmed:
+                n_campaign_relation_confirmed += 1
             if not ok:
                 problems.append({"domain": domain, "candidate": cid,
                                  "reason": "incomplete chain",
@@ -106,7 +126,10 @@ def validate(*, db_path: Path, workspace: Path, out: Path) -> dict[str, Any]:
                                  "sha_verified": verified})
             candidates.append({
                 "domain": domain, "candidate": cid,
-                "fingerprint_confirmed_by_registry": fp in reg_fps,
+                "fingerprint_confirmed_by_registry": identity_confirmed,
+                "candidate_identity_confirmed": identity_confirmed,
+                "objective_candidate_relation_reconstructed": obj_cand_reconstructed,
+                "campaign_relation_confirmed": campaign_confirmed,
                 "objective": oid, "campaign": campaign_id,
                 "campaign_links": len(to_campaign),
                 "objective_links": len(to_objective),
@@ -132,6 +155,10 @@ def validate(*, db_path: Path, workspace: Path, out: Path) -> dict[str, Any]:
         "run_id": RUN_ID,
         "n_candidates": len(candidates),
         "n_candidates_confirmed_by_registry": confirmed_candidates,
+        "n_candidate_identity_confirmed": n_candidate_identity_confirmed,
+        "n_objective_candidate_relation_reconstructed":
+            n_objective_candidate_relation_reconstructed,
+        "n_campaign_relation_confirmed": n_campaign_relation_confirmed,
         "n_reverse_queries_ok": reverse_ok,
         "n_evidence_sha_verified": sha_ok,
         "n_unresolved_relations": validation["n_unresolved"],

@@ -161,7 +161,7 @@ def backfill(*, run_root: Path, db_path: Path, workspace: Path,
             objective_id=kw.pop("objective_id", ""),
             src_type=src_type, src_id=src_id, dst_type="evidence",
             dst_id="sha256:" + digest, relation=relation,
-            status="confirmed", basis="sha256",
+            status="confirmed", basis=kw.pop("basis", "sha256"),
             source_path=rp, source_sha256=digest,
             notes=notes, **kw)
         return "sha256:" + digest
@@ -178,6 +178,7 @@ def backfill(*, run_root: Path, db_path: Path, workspace: Path,
         oid = f"obj_{run_id}_{domain}"
         summary_path = run_root / domain / "domain_summary.json"
         src_sha = sha256_file(run_root / "evidence_index.json")
+        evidence_index_src_path = rel(run_root / "evidence_index.json")
         obj = ResearchObjective(
             objective_id=oid, domain=domain,
             description=(f"M4.0 RECONSTRUCTED root for historical run {run_id} "
@@ -194,7 +195,7 @@ def backfill(*, run_root: Path, db_path: Path, workspace: Path,
             provenance={"basis": "m4_0_reconstruction_not_native",
                         "run_id": run_id, "campaign_id": campaign_id,
                         "evidence_index_sha256": src_sha,
-                        "source_path": "M3_4_runs/arr_m34_001/evidence_index.json"})
+                        "source_path": evidence_index_src_path})
         stores.objectives.save(rec)
         reconstructed_objectives.append(oid)
 
@@ -218,27 +219,53 @@ def backfill(*, run_root: Path, db_path: Path, workspace: Path,
 
         registry = _registry_fingerprints(
             run_root / domain / "candidate_registry.jsonl")
+        registry_path = run_root / domain / "candidate_registry.jsonl"
         decisions = entry.get("decisions") or {}
         for fp in sorted(decisions):
             confirmed = fp in registry
             cand_id = "candidate:" + fp
+            # P1-02 -- the reconstructed objective is M4.0-built (the
+            # historical run never persisted a native objective), so the edge
+            # IT drives to a candidate is, by construction, reconstructed. A
+            # candidate's double-source confirmation proves the CANDIDATE's own
+            # identity -- NOT that this objective->candidate edge is a native
+            # historical fact. Therefore this edge is ALWAYS 'reconstructed';
+            # the separate identity_confirmed_by link below preserves the
+            # double-source proof without masquerading as a native relation.
             add(run_id=run_id, objective_id=oid,
                 src_type="objective", src_id=oid, dst_type="candidate",
                 dst_id=cand_id, relation="drives",
-                status="reconstructed" if not confirmed else "confirmed",
+                status="reconstructed",
                 basis="hyp_fingerprint",
-                source_path="M3_4_runs/arr_m34_001/evidence_index.json",
+                source_path=evidence_index_src_path,
                 source_sha256=src_sha,
-                notes=("candidate fingerprint present in BOTH evidence_index "
-                       "decisions and candidate_registry register events"
+                notes=("objective is M4.0-reconstructed (no native objective in "
+                       "the historical run); the edge is M4.0-built. Candidate "
+                       "double-source identity confirmation, if any, is recorded "
+                       "by a separate identity_confirmed_by link."
                        if confirmed else
-                       "fingerprint only in evidence_index; registry confirmation missing"))
+                       "objective is M4.0-reconstructed; candidate fingerprint "
+                       "appears only in evidence_index (registry confirmation "
+                       "missing), so its identity is single-source"))
             add(run_id=run_id, objective_id=oid,
                 src_type="candidate", src_id=cand_id, dst_type="campaign",
                 dst_id=campaign_id, relation="evaluated_in",
                 status="confirmed", basis="explicit_campaign_id",
-                source_path="M3_4_runs/arr_m34_001/evidence_index.json",
+                source_path=evidence_index_src_path,
                 source_sha256=src_sha)
+            # P1-02 -- preserve the candidate's double-source identity
+            # confirmation as a DISTINCT, explicit relation. It is NEVER
+            # conflated with the reconstructed objective->candidate edge above.
+            # Only recorded when BOTH the evidence_index decision AND the
+            # candidate_registry register event name this fingerprint.
+            if confirmed and registry_path.is_file():
+                evidence_link("candidate", cand_id, registry_path,
+                              objective_id=oid,
+                              relation="identity_confirmed_by",
+                              basis="double_source_registry",
+                              notes=("fingerprint present in BOTH evidence_index "
+                                     "decisions and candidate_registry register "
+                                     "events: candidate identity confirmed"))
             # Honest gaps: the M3.4 run never wrote a hypothesis / plan /
             # session / experience into research.sqlite. Do NOT guess them.
             for missing_type in ("hypothesis", "experiment_plan",
