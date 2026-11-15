@@ -80,8 +80,13 @@ def test_real_engine_full_chain_writes_experience(tmp_path):
         state_dir=tmp_path / "director", objective_id=oid,
         source_experiment_id="exp_baseline")
 
-    # Human grant is applied out-of-band; execute re-verifies the store (no bypass).
-    final = director.run_to_completion(approved_by="human", source="human")
+    # Human grant is applied OUT OF BAND (a genuine store write, exactly what the
+    # approval_cli console does). The Director never grants for itself.
+    director.run_to_awaiting_approval()
+    service.stores.approvals.grant(
+        director.context.approval_id, approved_by="alice", source="human",
+        current_resource_sha256=director.context.plan_sha256)
+    final = director.run_to_completion()
     assert final["state"] == "COMPLETED"
 
     rep = service.get_research_report(session_id=director.context.session_id)

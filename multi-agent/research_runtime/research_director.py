@@ -41,7 +41,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .director_recovery import reconcile_director_state
 from .director_state_machine import (
@@ -131,7 +131,6 @@ class ResearchDirector:
                  objective_id: str, domain: str = "scinet",
                  director_id: str | None = None,
                  source_experiment_id: str = "",
-                 approval_granter: Callable[[str, str], None] | None = None,
                  max_retries: int = 1):
         self.service = service
         self.objective_store = objective_store
@@ -139,7 +138,6 @@ class ResearchDirector:
         self.objective_id = objective_id
         self.domain = domain
         self.source_experiment_id = source_experiment_id
-        self.approval_granter = approval_granter
         self.max_retries = max(0, int(max_retries))
         self.sm = DirectorStateMachine()
         self.director_id = director_id or (
@@ -321,44 +319,62 @@ class ResearchDirector:
             self._halt(E_FAIL, S_FAILED, f"request_approval: {exc}")
             raise
 
-    def approve_approval(self, *, approved_by: str = "human",
-                         source: str = "human") -> None:
-        """OUT-OF-BAND human grant, mirrored from ``approval_cli``.
-
-        This is a thin convenience wrapper; the Director never treats it as the
-        authority -- ``execute()`` re-checks the store. If no ``approval_granter``
-        is wired, the caller (the real human console) performs the grant instead.
-        """
-        if self.approval_granter is not None:
-            self.approval_granter(self.context.approval_id,
-                                  self.context.plan_sha256)
-            return
-        # Default: drive the trusted store directly (used by tests / real flow
-        # where the harness already exposes the store).
-        self.service.stores.approvals.grant(
-            self.context.approval_id, approved_by=approved_by, source=source,
-            current_resource_sha256=self.context.plan_sha256)
-
     def execute(self) -> dict[str, Any]:
-        """AWAITING_APPROVAL -> EXECUTING (only with a granted, SHA-bound approval)."""
+        """AWAITING_APPROVAL -> EXECUTING (only with a granted, SHA-bound approval).
+
+        Fail-closed. Any of the following refuses execution WITHOUT granting
+        anything itself:
+          * no ``approval_id`` bound,
+          * the approval record is missing,
+          * approval ``status != 'approved'`` (pending / rejected / revoked),
+          * the approval is bound to a *different* plan resource,
+          * the plan record is missing,
+          * either side is missing its SHA (incomplete binding),
+          * the Plan SHA and Approval SHA disagree (plan changed after approval).
+        The Director has NO ``approve`` capability -- the grant must already
+        exist out of band (the ``approval_cli`` console writes ``status='approved'``
+        bound to the exact Plan SHA).
+        """
         self._guard_current(S_AWAITING_APPROVAL, E_EXECUTE)
-        # Approval integrity: granted AND plan sha matches the approval sha.
+        # (1) An approval must be bound and present in the store.
+        if not self.context.approval_id:
+            raise DirectorError("no approval_id bound; cannot execute")
         approval = self.service.stores.approvals.get(self.context.approval_id)
         if approval is None:
             raise DirectorError("approval record missing; cannot execute")
-        # The out-of-band console grant sets status='approved' (never 'granted');
+        # Only an explicit human/system_policy grant may authorise execution;
         # a non-approved approval (pending/rejected/revoked) must not execute.
         if getattr(approval, "status", None) != "approved":
             raise DirectorError(
-                "approval is not granted; human must grant via the console "
-                "before execution (no bypass via recovery)")
-        current_sha = ""
-        plan = self.service.stores.plans.get(self.context.plan_id)
-        if plan is not None:
-            current_sha = getattr(plan, "plan_sha256", "") or ""
-        if current_sha and current_sha != getattr(approval, "resource_sha256", ""):
+                "approval is not granted (status="
+                f"{getattr(approval, 'status', None)!r}); a human must grant via "
+                "the out-of-band console before execution (no bypass via recovery)")
+        # (2) The approval must be bound to THIS plan.
+        if not self.context.plan_id:
+            raise DirectorError("no plan_id bound; cannot execute")
+        if getattr(approval, "resource_id", "") != self.context.plan_id:
             raise DirectorError(
-                "plan SHA changed after approval; old approval is invalid. "
+                f"approval is bound to a different resource "
+                f"({getattr(approval, 'resource_id', '')!r}); cannot execute")
+        # (3) The plan must exist and be readable.
+        plan = self.service.stores.plans.get(self.context.plan_id)
+        if plan is None:
+            raise DirectorError(
+                f"plan {self.context.plan_id!r} not found in the store; "
+                "cannot verify the Plan/Approval binding")
+        # (4) The SHA binding must be COMPLETE and CONSISTENT. Fail-closed on a
+        #     missing hash OR a mismatch (a plan edit after approval invalidates
+        #     the old approval).
+        plan_sha = getattr(plan, "plan_sha256", "") or ""
+        approval_sha = getattr(approval, "resource_sha256", "") or ""
+        if not plan_sha or not approval_sha:
+            raise DirectorError(
+                "Plan/Approval SHA binding is incomplete "
+                f"(plan_sha256={plan_sha!r}, approval_sha256={approval_sha!r}); "
+                "refusing to execute (fail-closed)")
+        if plan_sha != approval_sha:
+            raise DirectorError(
+                "plan SHA changed after approval; the old approval is invalid. "
                 "Re-create the plan and re-request approval.")
         try:
             run = self.service.run_research_campaign(
@@ -493,19 +509,56 @@ class ResearchDirector:
                 "approval_id": self.context.approval_id,
                 "plan_id": self.context.plan_id}
 
-    def run_to_completion(self, *, approved_by: str = "human",
-                          source: str = "human") -> dict[str, Any]:
-        """Full chain IDLE -> COMPLETED (Step 3 path), granting approval en route.
+    def _approval_granted_and_bound(self) -> bool:
+        """Pure observation: is there a genuine, SHA-bound grant in the store?
 
-        The human grant is applied via ``approve_approval``; ``execute`` still
-        re-verifies the store, so this never bypasses the gate.
+        Never grants. Returns True only if the store holds an ``approved`` record
+        whose ``resource_id`` equals this plan AND whose ``resource_sha256`` equals
+        the plan's CURRENT sha. Used by ``run_to_completion`` to decide whether to
+        proceed or stop at AWAITING_APPROVAL.
+        """
+        if not self.context.approval_id or not self.context.plan_id:
+            return False
+        approval = self.service.stores.approvals.get(self.context.approval_id)
+        if approval is None:
+            return False
+        if getattr(approval, "status", None) != "approved":
+            return False
+        if getattr(approval, "resource_id", "") != self.context.plan_id:
+            return False
+        plan = self.service.stores.plans.get(self.context.plan_id)
+        if plan is None:
+            return False
+        plan_sha = getattr(plan, "plan_sha256", "") or ""
+        approval_sha = getattr(approval, "resource_sha256", "") or ""
+        return bool(plan_sha) and plan_sha == approval_sha
+
+    def run_to_completion(self) -> dict[str, Any]:
+        """Drive the chain IDLE -> COMPLETED, but NEVER auto-approve.
+
+        The human grant must already exist OUT OF BAND (the ``approval_cli``
+        console writes a status='approved' record bound to the exact Plan SHA).
+        Without an external grant the Director stops at AWAITING_APPROVAL: it does
+        not grant for itself and does not call the campaign gate. If the approval
+        is present and SHA-bound, it proceeds through execute/compare/record/
+        finalize.
+
+        Returns the context dict. On a stop-without-approval the state stays
+        AWAITING_APPROVAL and ``campaign_id`` remains empty.
         """
         if self.context.state == S_IDLE:
             self.run_to_awaiting_approval()
         if self.context.state != S_AWAITING_APPROVAL:
             raise DirectorError(
                 f"expected AWAITING_APPROVAL, got {self.context.state}")
-        self.approve_approval(approved_by=approved_by, source=source)
+        # The human grant is observed from the store ONLY. If it is absent or
+        # was revoked, stop here -- never approve, never execute.
+        if not self._approval_granted_and_bound():
+            return {
+                "state": S_AWAITING_APPROVAL,
+                "approval_id": self.context.approval_id,
+                "stopped_reason": "awaiting external human approval",
+            }
         self.execute()
         self.compare()
         self.record_experience()
