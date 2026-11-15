@@ -31,7 +31,7 @@
 | D | Discovery 边界明确 | ✅ | P1-04：`P1_04_reader_contract.md` 明确两套 Reader 边界；`DiscoveryEvidenceAdapter` 只委托统一读模型，静态校验不出现 `default_evidence_provider`。 |
 | E | 历史 Evidence/metrics/verdict/records 不变 | ✅ | 所有脚本 READ-ONLY；`backfill.py` 失败即抛（SHA 快照前后一致）；`default_evidence_provider`、统计门、12 步链未改。 |
 | F | 全量回归无退化 | ✅ | 本提交前 151 passed + 29 subtests passed + 0 failed（CI 模块全集本地重跑）。 |
-| G | GitHub Actions 实测符合预期 | ⏳ | workflow 已纳入 2 个新 M4.0.1 测试模块，等待远端 Actions 跑 6/6 matrix（见 §4）。 |
+| G | GitHub Actions 实测符合预期 | ✅ | 远端三个 workflow 在 HEAD `049c4241` 全部通过：ARR Research Runtime **6/6**（run `43614676916`）、ARR 1.0 Integration **9/9**（run `43614676881`）、Pre-commit checks **1/1**（run `43614676883`）。详见 `M4_0_1_runs/github_actions_final.json`。 |
 | H | 每逻辑修改独立 commit 全推送 | ✅ | P1-01~P1-04 各自独立 commit 并推送；本提交为 P1-05。 |
 | I | 不开发 M4.1 / 不建 Director / 不改变统计门 | ✅ | P1-04 仅交付契约 + 只读适配器 + 测试；未实现 M4.1；未建 Director；未改统计门槛。 |
 
@@ -68,8 +68,11 @@ backfill `links_created={arr_m34_001: 155, p1_06: 10}`、`n_unresolved=36`（4 �
   fail-closed 本地验证（与 M4.0 设计一致）。
 - **3 个引擎 skip**：SciNet / Embodied / Quant 真实引擎运行不在本 engine-free gate 内执行
   （其真实数据测试 `test_m3_2/3_3/3_4_embodied_horizon` 读取已提交的历史产物，仍 engine-free）。
-- **Pre-commit**：本仓库当前无 pre-commit 步骤；CI 通过 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`
-  规避可选 langsmith 插件崩溃，确保收集稳定。
+- **Pre-commit checks**：远端 `Pre-commit checks` workflow 在 HEAD `049c4241` 上 **1/1 成功**
+  （run `43614676883`）。CI 通过 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` 规避可选 langsmith
+  插件崩溃，确保收集稳定。
+- **最终验收证据**：`M4_0_1_runs/github_actions_final.json` 记录三个 Run ID 与 jobs 数；远端
+  Actions 成功取代本地 151-passed 回归，作为条件 G 的最终验收（本地回归仍作为提交前门禁）。
 
 ---
 
