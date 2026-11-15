@@ -141,9 +141,13 @@ def test_unknown_arm_is_rejected():
 
 # --------------------------------------------------------------------- independent blind review
 def test_blind_strips_arm_and_ranker_signals_or_rejects():
+    # P0-02: the blinded payload carries ONLY an opaque review_id; the raw
+    # objective_id (which can encode an arm, e.g. block_1_A) NEVER appears.
     b = blind(_objective())
-    assert b.objective_id == "obj_1"
+    assert b.review_id.startswith("rev_") and len(b.review_id) > 20
+    assert "objective_id" not in b.to_dict()
     assert "arm" not in b.to_dict() and "rank_score" not in b.to_dict()
+    assert "obj_1" not in str(b.to_dict())
     leaked = _objective() | {"arm": "C", "rank_score": 0.9}
     with pytest.raises(ValueError) as exc:
         blind(leaked)

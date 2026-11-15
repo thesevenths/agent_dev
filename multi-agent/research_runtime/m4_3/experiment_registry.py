@@ -118,9 +118,14 @@ class RunRecord:
     arm: str
     outcome: str = "interrupted"          # RUN_OUTCOMES
     objective_id: str = ""
-    # objective-quality evidence (for independent review)
+    # objective-quality evidence (P0-02 independent BLIND review)
     evidence_refs: list[str] = field(default_factory=list)
-    quality_review: dict[str, Any] = field(default_factory=dict)
+    # opaque review_id only; the raw objective_id -> arm mapping is SEALED in
+    # the BlindingLedger and never stored on the reviewer-visible payload.
+    review_id: str = ""
+    quality_review: dict[str, Any] = field(default_factory=dict)  # PRIMARY human-blind review
+    independent_reviews: list[dict[str, Any]] = field(default_factory=list)
+    automated_scores: list[dict[str, Any]] = field(default_factory=list)
     # execution evidence (P0-01: DERIVED from the real read-only gate adapter,
     # never caller-supplied). ``gate_evidence`` is the full persisted evidence
     # chain that produced ``gate_steps_passed`` / ``external_approval``.

@@ -42,9 +42,13 @@ from .experiment_registry import (
     ARMS, ARM_DESCRIPTIONS, RUN_OUTCOMES, ExperimentRegistry, FrozenProtocol,
     RunRecord,
 )
+from .blind_review import (
+    FORBIDDEN_BLIND_FIELDS, REVIEW_KIND_HUMAN_BLIND, BlindingLedger,
+    BlindingViolation, IndependentReviewer, ReviewPanel,
+)
 from .metrics import (
     ALL_METRICS, PRIMARY_METRICS, SAFETY_METRICS, SECONDARY_METRICS,
-    IndependentReviewer, QualityReview, blind, frozen_metric_contract,
+    frozen_metric_contract,
 )
 from .research_service_gate import (
     FORGED_GATE_KEYS, GATED_OUTCOMES, GateAdapter, GateEvidence, GateRunRef,
@@ -157,13 +161,24 @@ class EvaluationHarness:
     """
 
     def __init__(self, *, protocol: FrozenProtocol,
-                 reviewer: IndependentReviewer,
+                 reviewer: IndependentReviewer | None = None,
+                 review_panel: ReviewPanel | None = None,
+                 blinding: BlindingLedger | None = None,
                  objective_selector: Callable[[ArmContext], dict[str, Any]] | None = None,
                  gate_adapter: GateAdapter | None = None,
                  default_gate_ref: GateRunRef | None = None):
+        # P0-02: a Pilot defaults to >= 2 independent blind human reviewers.
+        # A single ``reviewer`` is accepted for engine-free contract tests, but
+        # ``assert_pilot_review_ready()`` refuses to start without >= 2.
+        if review_panel is None:
+            if reviewer is None:
+                raise ProtocolViolation("at least one reviewer is required")
+            review_panel = ReviewPanel([reviewer])
+        self.reviewer = reviewer
+        self.review_panel = review_panel
+        self.blinding = blinding or BlindingLedger()
         self.registry = ExperimentRegistry(protocol=protocol)
         self.protocol = protocol
-        self.reviewer = reviewer
         self.objective_selector = objective_selector
         # ONE adapter shared by A/B/C -> the SAME ResearchService entry point.
         self.gate_adapter = gate_adapter
@@ -171,6 +186,22 @@ class EvaluationHarness:
         self._primary_frozen = tuple(protocol.primary_metrics)
         self._contexts: dict[str, dict[str, ArmContext]] = {}
         self._blocks_finalized: set[str] = set()
+
+    # ------------------------------------------------- P0-02 pilot review gate
+    def assert_pilot_review_ready(self) -> None:
+        """Pilot default: >= 2 DISTINCT independent, blind human reviewers."""
+        if not self.review_panel.is_independent:
+            raise ProtocolViolation(
+                "Pilot requires at least two independent blind human reviewers "
+                "(distinct reviewer_id, review_kind=human_blind)")
+
+    def unblind(self) -> None:
+        """Allowed ONLY after the review phase is complete (P0-02 #6)."""
+        self.blinding.unblind()
+
+    def arm_mapping(self, review_id: str) -> dict[str, Any]:
+        """SEALED until unblind(); reviewers must never see the arm."""
+        return self.blinding.arm_mapping(review_id)
 
     # ------------------------------------------------------------- arm setup
     def add_block(self, spec: BlockSpec, *, candidate_budget: int,
@@ -228,21 +259,39 @@ class EvaluationHarness:
             objective = self.objective_selector(ctx)
         if not objective or not objective.get("objective_id"):
             raise ProtocolViolation("selected objective has no objective_id")
-        # Ranker signals must NEVER leak into the blinded review payload.
-        forbidden = {"arm", "rank_score", "rank_breakdown", "ranker_version"}
+        # P0-02: strip EVERY group/Ranker/identity field before review. A C-arm
+        # selector may legitimately return a ranked candidate, but the reviewer
+        # must never see those signals. ``objective_id`` is kept ONLY for the
+        # sealed mapping (it never reaches the blinded payload).
+        forbidden = FORBIDDEN_BLIND_FIELDS - {"objective_id"}
         if forbidden.intersection(objective):
-            # Strip rather than fail: the SELECTOR may legitimately return a
-            # ranked candidate (arm C), but review must stay blind.
-            objective = {k: v for k, v in objective.items() if k not in forbidden}
+            objective = {k: v for k, v in objective.items()
+                         if k not in forbidden}
+        # Seal the opaque review_id -> (objective_id, arm, ...) mapping apart
+        # from the reviewer-visible payload.
+        blinded = self.blinding.seal(
+            objective, arm=arm, block_id=block_id,
+            snapshot_id=ctx.snapshot_id)
         self.registry.register_run(
             block_id=block_id, arm=arm, objective_id=objective["objective_id"],
             evidence_refs=list(objective.get("evidence_refs") or []),
+            review_id=blinded.review_id,
             notes={"selection_context": ctx.to_dict(),
-                   "objective": objective})
-        # Independent, blind, fixed-rubric review (Ranker cannot score itself).
-        review = self.reviewer.review(objective)
+                   "review_id": blinded.review_id})
+        # Independent, blind, fixed-rubric review by the WHOLE panel.
+        reviews = self.review_panel.review(blinded)
+        human = [r for r in reviews if r.is_human_blind]
+        automated = [r for r in reviews if not r.is_human_blind]
+        for r in reviews:
+            self.blinding.record_review(r)   # append-only, never overwritten
+        if not human:
+            raise ProtocolViolation(
+                "at least one independent human blind review is required")
         self.registry.update(
-            f"{block_id}_{arm}", quality_review=review.to_dict())
+            f"{block_id}_{arm}",
+            quality_review=human[0].to_dict(),   # PRIMARY human-blind review
+            independent_reviews=[r.to_dict() for r in human],
+            automated_scores=[r.to_dict() for r in automated])
         return objective
 
     # ------------------------------------------------------------- outcomes

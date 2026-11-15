@@ -12,9 +12,15 @@ from .evaluation_harness import (
 from .experiment_registry import (
     ARMS, ExperimentRegistry, FrozenProtocol, RunRecord,
 )
+from .blind_review import (
+    FORBIDDEN_BLIND_FIELDS, REVIEW_KIND_AUTOMATED, REVIEW_KIND_HUMAN_BLIND,
+    REVIEW_KINDS, REVIEW_RUBRIC_VERSION, RUBRIC_DIMENSIONS, RUBRIC_SCALE,
+    BlindedObjective, BlindingEntry, BlindingLedger, BlindingViolation,
+    IndependentReviewer, QualityReview, ReviewPanel, blind,
+)
 from .metrics import (
     ALL_METRICS, PRIMARY_METRICS, SAFETY_METRICS, SECONDARY_METRICS,
-    IndependentReviewer, blind, frozen_metric_contract,
+    frozen_metric_contract,
 )
 from .research_service_gate import (
     GATE_STEP_COUNT, GATED_OUTCOMES, UNGATED_OUTCOMES, FORGED_GATE_KEYS,
@@ -24,8 +30,13 @@ from .research_service_gate import (
 __all__ = [
     "EvaluationHarness", "ProtocolViolation", "ArmContext", "BlockSpec",
     "build_arm_context", "ExperimentRegistry", "FrozenProtocol", "RunRecord",
-    "ARMS", "IndependentReviewer", "blind", "frozen_metric_contract",
+    "ARMS", "IndependentReviewer", "QualityReview", "ReviewPanel",
+    "BlindedObjective", "BlindingEntry", "BlindingLedger", "BlindingViolation",
+    "blind", "frozen_metric_contract",
     "PRIMARY_METRICS", "SECONDARY_METRICS", "SAFETY_METRICS", "ALL_METRICS",
+    "REVIEW_RUBRIC_VERSION", "RUBRIC_DIMENSIONS", "RUBRIC_SCALE",
+    "REVIEW_KINDS", "REVIEW_KIND_HUMAN_BLIND", "REVIEW_KIND_AUTOMATED",
+    "FORBIDDEN_BLIND_FIELDS",
     "GATE_STEP_COUNT", "GATED_OUTCOMES", "UNGATED_OUTCOMES", "FORGED_GATE_KEYS",
     "GateAdapter", "GateEvidence", "GateRunRef", "ResearchServiceGateAdapter",
 ]
