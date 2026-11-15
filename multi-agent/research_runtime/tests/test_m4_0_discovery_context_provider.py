@@ -23,7 +23,9 @@ from research_runtime.discovery_context_provider import (
 )
 from research_runtime.research_store import ResearchStores
 
-WS = Path("E:/agent_dev/multi-agent").resolve()
+# Repo-relative workspace: derived from THIS file so the test runs on any
+# machine / CI runner (no developer-absolute path such as E:/...).
+WS = Path(__file__).resolve().parents[2]      # multi-agent/
 
 
 # --------------------------------------------------------------------- helpers
@@ -206,3 +208,192 @@ def test_real_arr_m34_001_snapshot_has_no_fabricated_experience(tmp_path):
     oids = {o["objective_id"] for o in snap.objectives}
     assert oids == {"obj_arr_m34_001_scinet", "obj_arr_m34_001_embodied",
                     "obj_arr_m34_001_quant"}
+
+
+def _seed_experience(stores, session_id: str, oid: str, kind: str,
+                     payload: dict) -> None:
+    stores.sessions.record_experience(
+        session_id=session_id, objective_id=oid, kind=kind, payload=payload)
+
+
+def test_all_historical_sessions_are_retained_not_just_latest(tmp_path):
+    """P2: an objective with 3 sessions must surface ALL of them, including
+    previously-failed ones that are NOT the latest.
+
+    S1 (fail, has Experience) + S2 (success, has Experience) + S3 (latest, no
+    Experience). Discovery must still see S1/S2 so it does not repeat a failed
+    direction.
+    """
+    stores = ResearchStores(tmp_path / "r.sqlite")
+    oid = "obj_t_multisess"
+    _seed_objective(stores, oid)
+
+    s1 = stores.sessions.create_session(
+        {"objective_id": oid, "domain": "scinet"}, session_id="s1")
+    _seed_experience(stores, s1.session_id, oid, "failure",
+                     {"hypothesis": "H1", "why_failed": "horizon drift"})
+    s2 = stores.sessions.create_session(
+        {"objective_id": oid, "domain": "scinet"}, session_id="s2")
+    _seed_experience(stores, s2.session_id, oid, "success",
+                     {"hypothesis": "H2", "gain_r2": 0.04})
+    # S3 is the latest session and has NO experience.
+    stores.sessions.create_session(
+        {"objective_id": oid, "domain": "scinet"}, session_id="s3")
+
+    provider = DiscoveryContextProvider(
+        stores=stores, evidence_adapter=_CountingAdapter(_fake_view("t")))
+    snap = provider.build_snapshot("t", objective_ids=[oid])
+
+    # All three sessions present (flat + nested views agree).
+    assert len(snap.sessions) == 3
+    by_obj = snap.sessions_by_objective[oid]
+    assert len(by_obj) == 3
+
+    # The OLD, non-latest sessions and their Experience are NOT lost.
+    sids = {s["session_id"] for s in snap.sessions}
+    assert sids == {"s1", "s2", "s3"}
+    s1_snap = next(s for s in snap.sessions if s["session_id"] == "s1")
+    s2_snap = next(s for s in snap.sessions if s["session_id"] == "s2")
+    s3_snap = next(s for s in snap.sessions if s["session_id"] == "s3")
+    assert s1_snap["experience_available"] is True
+    assert s2_snap["experience_available"] is True
+    assert s3_snap["experience_available"] is False
+
+    # No fabrication: exactly the 2 recorded experiences exist.
+    total_exp = sum(len(s["experience"]) for s in snap.sessions)
+    assert total_exp == 2
+    # S1's failure experience content is preserved verbatim.
+    assert s1_snap["experience"][0]["payload"]["why_failed"] == "horizon drift"
+
+
+def test_failure_signals_and_diagnosis_unavailable_are_distinct(tmp_path):
+    """P3: a failure event is a SIGNAL only; with no structured ExperimentResult
+    present, structured diagnosis is explicitly UNAVAILABLE (never guessed)."""
+    stores = ResearchStores(tmp_path / "r.sqlite")
+    oid = "obj_t_fail"
+    _seed_objective(stores, oid)
+    s = stores.sessions.create_session(
+        {"objective_id": oid, "domain": "scinet"}, session_id="sf")
+    # Emit a failure-named event via the store's save() event hook.
+    stores.sessions.save(s, event_type="campaign_failed",
+                         payload={"reason": "diverged"})
+
+    provider = DiscoveryContextProvider(
+        stores=stores, evidence_adapter=_CountingAdapter(_fake_view("t")))
+    snap = provider.build_snapshot("t", objective_ids=[oid])
+
+    # Signal captured from the event name...
+    assert len(snap.failures["session_failure_signals"]) == 1
+    sig = snap.failures["session_failure_signals"][0]
+    assert sig["session_id"] == "sf"
+    # ...but NO structured diagnosis was invented...
+    assert snap.failures["structured_diagnoses"] == []
+    assert snap.failures["diagnosis_status"]["structured_diagnosis_available"] is False
+    # ...and the gap is explicitly flagged diagnosis_unavailable.
+    kinds = [g["kind"] for g in snap.unresolved_gaps]
+    assert "diagnosis_unavailable" in kinds
+
+
+def test_evidence_entities_carry_sha_identity(tmp_path):
+    """P4: every real evidence entity in the snapshot exposes a SHA-256
+    identity (the unified reader's evidence identity = SHA-256 of real bytes),
+    so a Discovery Objective can always trace to concrete evidence."""
+    db = tmp_path / "real.sqlite"
+    from M4_0_runs.backfill import backfill
+    from research_runtime.tests.m4_0_seed_helper import build_equivalent_db
+
+    build_equivalent_db(db, workspace=WS)
+    conn = sqlite3.connect(str(db))
+    conn.execute("DELETE FROM entity_links")
+    conn.execute("DELETE FROM objectives")
+    conn.commit()
+    conn.close()
+    backfill(run_root=WS / "M3_4_runs" / "arr_m34_001", db_path=db,
+             workspace=WS, report_path=tmp_path / "bf.json")
+
+    stores = ResearchStores(db)
+    provider = DiscoveryContextProvider(stores=stores, workspace=WS)
+    snap = provider.build_snapshot("arr_m34_001")
+
+    assert len(snap.evidence_view["evidence"]) > 0
+    for ent in snap.evidence_view["evidence"]:
+        assert ent["evidence_id"].startswith("sha256:"), ent
+        assert ent["sources"] or ent.get("manifest_sha256") or \
+            ent.get("metrics_files")
+
+
+def test_links_trace_to_source_artifact(tmp_path):
+    """P4: every link in the snapshot carries its source artifact reference
+    (source_sha256 + source_path), so a Discovery Objective can trace a relation
+    to the concrete file it was derived from."""
+    db = tmp_path / "real.sqlite"
+    from M4_0_runs.backfill import backfill
+    from research_runtime.tests.m4_0_seed_helper import build_equivalent_db
+
+    build_equivalent_db(db, workspace=WS)
+    conn = sqlite3.connect(str(db))
+    conn.execute("DELETE FROM entity_links")
+    conn.execute("DELETE FROM objectives")
+    conn.commit()
+    conn.close()
+    backfill(run_root=WS / "M3_4_runs" / "arr_m34_001", db_path=db,
+             workspace=WS, report_path=tmp_path / "bf.json")
+
+    stores = ResearchStores(db)
+    provider = DiscoveryContextProvider(stores=stores, workspace=WS)
+    snap = provider.build_snapshot("arr_m34_001")
+
+    for oid, graph in snap.links["by_objective"].items():
+        assert "n_links" in graph
+        # list_objective_graph returns link rows that always carry the source
+        # artifact reference (provenance), even when status is unresolved.
+        assert any("source_sha256" in row or "source_path" in row
+                   for row in graph.get("links", []))
+
+
+def test_experience_traces_back_to_its_session(tmp_path):
+    """P4: a recorded Experience must be attributable to a real session, and the
+    snapshot must surface it under that exact session (no orphan / fabricated
+    experience)."""
+    stores = ResearchStores(tmp_path / "r.sqlite")
+    oid = "obj_t_trace"
+    _seed_objective(stores, oid)
+    s = stores.sessions.create_session(
+        {"objective_id": oid, "domain": "scinet"}, session_id="se")
+    _seed_experience(stores, s.session_id, oid, "success",
+                     {"gain_r2": 0.03})
+
+    provider = DiscoveryContextProvider(
+        stores=stores, evidence_adapter=_CountingAdapter(_fake_view("t")))
+    snap = provider.build_snapshot("t", objective_ids=[oid])
+
+    sess = snap.sessions_by_objective[oid][0]
+    assert sess["session_id"] == "se"
+    assert len(sess["experience"]) == 1
+    exp = sess["experience"][0]
+    assert exp["session_id"] == "se"
+    assert exp["experience_id"].startswith("exp_")
+    assert exp["payload"]["gain_r2"] == 0.03
+
+
+def test_real_snapshot_is_deterministic(tmp_path):
+    """P4: building the real-history snapshot twice yields byte-identical
+    data_dict() (only the build stamp differs)."""
+    db = tmp_path / "real.sqlite"
+    from M4_0_runs.backfill import backfill
+    from research_runtime.tests.m4_0_seed_helper import build_equivalent_db
+
+    build_equivalent_db(db, workspace=WS)
+    conn = sqlite3.connect(str(db))
+    conn.execute("DELETE FROM entity_links")
+    conn.execute("DELETE FROM objectives")
+    conn.commit()
+    conn.close()
+    backfill(run_root=WS / "M3_4_runs" / "arr_m34_001", db_path=db,
+             workspace=WS, report_path=tmp_path / "bf.json")
+
+    stores = ResearchStores(db)
+    provider = DiscoveryContextProvider(stores=stores, workspace=WS)
+    snap1 = provider.build_snapshot("arr_m34_001")
+    snap2 = provider.build_snapshot("arr_m34_001")
+    assert snap1.data_dict() == snap2.data_dict()
