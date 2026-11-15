@@ -46,6 +46,38 @@ history equality per block.
 10. The **primary metric is frozen** — no post-hoc change, no exclusion of
     unfavourable experiments.
 
+### 2.1 Evidence & execution boundaries (M4.3-01.1 P1-02, executable)
+
+These are enforced by `evidence_boundary.py` at `add_block()` time — they are
+code, not prose. Any breach raises `EvidenceBoundaryViolation` (fail-closed).
+
+* **Arm A** reads ONLY the current evidence of the research opportunity.
+* **Arms B/C** read the SAME historical Evidence / Experience / Failure.
+* All three arms share ONE research-opportunity Snapshot, one Block and one
+  Seed; the Snapshot / Block / Seed hierarchy is preserved in `paired_metrics()`.
+* **Current vs historical evidence are separated by EXPLICIT, DISJOINT ID
+  sets** (`current_evidence_ids` / `historical_ids`). When not supplied, the
+  harness derives stable IDs from the records (explicit id key, else a content
+  hash) and still enforces disjointness. An explicit set that disagrees with the
+  actual records is rejected (no phantom / omitted evidence).
+* **No arm may read a reserved (frozen) final split.** The validator scans both
+  current and historical payloads, including nested metadata and split-valued
+  keys, against `RESERVED_FINAL_SPLITS` plus the frozen-split aliases in
+  `protocol.yaml`. The held-out validation split remains usable.
+* **Per-block budgets are fixed**: candidate budget, human-selection time
+  budget and Campaign Budget are positive, recorded with the block, and (when
+  the protocol freezes a Campaign Budget) must equal it exactly. A block cannot
+  be re-added with a different budget.
+* **Every block retains all three arms' COMPLETE records**, including failed /
+  interrupted / invalid / INCONCLUSIVE outcomes. Nothing is dropped.
+
+### 2.2 What is explicitly NOT in this stage
+
+Pilot (M4.3-02), Confirmatory (M4.3-03) and the Value Report (M4.3-04) are NOT
+started. No significance or value conclusion is drawn anywhere in the harness:
+`paired_metrics()["significance_conclusion"]` is `None`. Engine-free and
+real-engine results are reported separately.
+
 ## 3. Metrics (frozen vocabulary)
 
 **Primary**

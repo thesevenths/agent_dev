@@ -47,6 +47,10 @@ from .blind_review import (
     FORBIDDEN_BLIND_FIELDS, REVIEW_KIND_HUMAN_BLIND, BlindingLedger,
     BlindingViolation, IndependentReviewer, ReviewPanel,
 )
+from .evidence_boundary import (
+    BlockBudget, EvidenceBoundaryViolation, EvidencePartition,
+    validate_block_budget, validate_evidence_partition,
+)
 from .metrics import (
     ALL_METRICS, METRIC_CATEGORIES, METRIC_FORMULA_VERSION,
     METRIC_DEFINITIONS, PRIMARY_METRICS, SAFETY_METRICS, SECONDARY_METRICS,
@@ -135,7 +139,14 @@ def build_arm_context(*, arm: str, snapshot_id: str, seed: int,
 
 @dataclass
 class BlockSpec:
-    """ONE research opportunity with the SAME context for all three arms."""
+    """ONE research opportunity with the SAME context for all three arms.
+
+    P1-02: current and historical evidence are separated by EXPLICIT,
+    DISJOINT ID sets (``current_evidence_ids`` / ``historical_ids``). When left
+    empty the harness DERIVES them from the records' explicit IDs (or a stable
+    content hash) and still enforces disjointness. No arm may read a frozen
+    final split. ``campaign_budget`` is fixed per block.
+    """
     block_id: str
     snapshot_id: str
     seed: int
@@ -143,6 +154,10 @@ class BlockSpec:
     historical_experience: list[dict[str, Any]] = field(default_factory=list)
     historical_evidence: list[dict[str, Any]] = field(default_factory=list)
     historical_failure: list[dict[str, Any]] = field(default_factory=list)
+    # explicit ID sets (P1-02)
+    current_evidence_ids: tuple[str, ...] = ()
+    historical_ids: tuple[str, ...] = ()
+    campaign_budget: dict[str, Any] = field(default_factory=dict)
 
 
 class EvaluationHarness:
@@ -193,6 +208,14 @@ class EvaluationHarness:
         self._primary_frozen = tuple(protocol.primary_metrics)
         self._contexts: dict[str, dict[str, ArmContext]] = {}
         self._blocks_finalized: set[str] = set()
+        self._partitions: dict[str, EvidencePartition] = {}
+        self._budgets: dict[str, BlockBudget] = {}
+
+    def evidence_partition(self, block_id: str) -> EvidencePartition:
+        return self._partitions[block_id]
+
+    def block_budget(self, block_id: str) -> BlockBudget:
+        return self._budgets[block_id]
 
     @classmethod
     def recover(cls, *, protocol: FrozenProtocol,
@@ -239,6 +262,26 @@ class EvaluationHarness:
                   human_time_budget_s: float) -> dict[str, ArmContext]:
         if spec.block_id in self._contexts:
             raise ProtocolViolation(f"block {spec.block_id!r} already added")
+        # (P1-02) Validate BOTH boundaries BEFORE persisting anything:
+        # explicit disjoint current/history ID sets + no frozen final split,
+        # and fixed per-block budgets. Fail closed, no silent fixes.
+        partition = validate_evidence_partition(
+            snapshot_id=spec.snapshot_id,
+            current_evidence=spec.current_evidence,
+            historical_experience=spec.historical_experience,
+            historical_evidence=spec.historical_evidence,
+            historical_failure=spec.historical_failure,
+            explicit_current_ids=(tuple(spec.current_evidence_ids)
+                                  if spec.current_evidence_ids else None),
+            explicit_historical_ids=(tuple(spec.historical_ids)
+                                     if spec.historical_ids else None))
+        budget = validate_block_budget(
+            candidate_budget=candidate_budget,
+            human_time_budget_s=human_time_budget_s,
+            campaign_budget=(spec.campaign_budget
+                             or self.protocol.campaign_budget
+                             or self.protocol.budget),
+            protocol_campaign_budget=(self.protocol.campaign_budget or None))
         self.registry.create_block(
             block_id=spec.block_id, snapshot_id=spec.snapshot_id,
             seed=spec.seed,
@@ -249,7 +292,11 @@ class EvaluationHarness:
                       # snapshot SHA covers the shared opportunity only.
                       "historical_experience": spec.historical_experience,
                       "historical_evidence": spec.historical_evidence,
-                      "historical_failure": spec.historical_failure})
+                      "historical_failure": spec.historical_failure,
+                      "evidence_partition": partition.to_dict(),
+                      "block_budget": budget.to_dict()})
+        self._partitions[spec.block_id] = partition
+        self._budgets[spec.block_id] = budget
         contexts: dict[str, ArmContext] = {}
         # Rule #1/#3/#4: identical snapshot, seed, budgets for every arm.
         # Rule #2: a BlockSpec describes ONE shared research opportunity, but
