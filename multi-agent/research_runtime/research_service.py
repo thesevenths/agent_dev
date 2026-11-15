@@ -317,16 +317,35 @@ class ResearchService:
     def propose_research_hypotheses(self, *, objective_id: str,
                                     source_experiment_id: str,
                                     session_id: str = "",
-                                    hypotheses_json: str = "") -> dict[str, Any]:
+                                    hypotheses_json: str = "",
+                                    objective_evidence_refs: list[str] | None = None,
+                                    objective_hint: str = "",
+                                    objective_intervention: dict[str, Any] | None = None
+                                    ) -> dict[str, Any]:
         return self._guard(self._propose, objective_id, source_experiment_id,
-                           session_id, hypotheses_json)
+                           session_id, hypotheses_json,
+                           objective_evidence_refs=objective_evidence_refs,
+                           objective_hint=objective_hint,
+                           objective_intervention=objective_intervention)
 
     def _propose(self, objective_id: str, source_experiment_id: str,
-                 session_id: str, hypotheses_json: str) -> dict[str, Any]:
+                 session_id: str, hypotheses_json: str,
+                 objective_evidence_refs: list[str] | None = None,
+                 objective_hint: str = "",
+                 objective_intervention: dict[str, Any] | None = None
+                 ) -> dict[str, Any]:
         session = self._session(session_id, objective_id)
         provider = self.deps.evidence_provider or default_evidence_provider
         result, reports = provider(source_experiment_id)
         skip_reasons: list[str] = []
+        # Objective context threaded into the generator so the resulting hypotheses
+        # carry the Objective's own research target / evidence / hint / intervention
+        # as provenance. Never used to bypass the deterministic Critic gate.
+        objective_context = {
+            "evidence_refs": list(objective_evidence_refs or []),
+            "hypothesis_hint": objective_hint or "",
+            "proposed_intervention": dict(objective_intervention or {}),
+        }
 
         if hypotheses_json.strip():
             # An operator/LLM may SUPPLY a hypothesis, but it is never trusted:
@@ -341,6 +360,13 @@ class ResearchService:
                 payload = dict(item)
                 payload["objective_id"] = objective_id
                 payload["source_experiment_id"] = source_experiment_id
+                # Fold the Objective's evidence refs into provenance.
+                if objective_context["evidence_refs"]:
+                    _ev = list(payload.get("evidence_refs") or [])
+                    for _r in objective_context["evidence_refs"]:
+                        if _r not in _ev:
+                            _ev.append(_r)
+                    payload["evidence_refs"] = _ev
                 try:
                     proposals.append(Hypothesis.model_validate(payload))
                 except Exception as exc:
@@ -349,7 +375,9 @@ class ResearchService:
                         f"hypothesis rejected by schema validation: {exc}")
         else:
             manager = self._manager()
-            proposals = manager.propose(result, reports, objective_id)
+            proposals = manager.propose(
+                result, reports, objective_id,
+                objective_context=objective_context)
             proposer = getattr(manager, "proposer", None)
             skip_reasons = list(getattr(proposer, "skipped_reasons", []) or [])
             skip_reasons += [str(item) for item in (manager.rejections or [])]
@@ -460,14 +488,40 @@ class ResearchService:
             # The status is derived from the persisted verdict, never from input.
             reviewed.append(Hypothesis.model_validate(
                 stored.hypothesis).model_copy(update={"status": "approved"}))
+        # ---- P1: Objective-consistent metric + unsupported-metric guard ----
+        # The Plan metric/direction defaults to the domain policy, but if the
+        # Objective's success_criteria names a metric we honour it ONLY when the
+        # DomainPolicy supports it. An unsupported metric is rejected explicitly
+        # (never silently swapped to the domain default).
+        metric, direction = self.domain.primary_metric, self.domain.metric_direction
+        obj_rec = self.stores.objectives.get(objective_id)
+        if obj_rec is not None:
+            _sc = getattr(obj_rec, "success_criteria", None) or {}
+            _req = _sc.get("metric") if isinstance(_sc, dict) else None
+            if _req:
+                if not self.domain.is_metric_supported(_req):
+                    return {
+                        "ok": False,
+                        "error_code": "unsupported_metric",
+                        "metric": _req,
+                        "supported_metrics": list(
+                            self.domain.supported_metrics
+                            or (self.domain.primary_metric,)),
+                        "note": ("Objective requests a metric not supported by "
+                                 "DomainPolicy; refusing to silently swap to the "
+                                 "domain default. Re-issue the Objective with a "
+                                 "supported metric or widen the domain policy."),
+                    }
+                metric = _req
+                direction = _sc.get("direction") or self.domain.metric_direction
         pid = plan_id or "plan_" + uuid.uuid4().hex[:12]
         plan = build_experiment_plan(
             plan_id=pid, objective_id=objective_id,
             baseline_experiment_id=f"baseline_{pid}",
             dataset_version=self.domain.dataset_version,
             hypotheses=reviewed,
-            primary_metric=self.domain.primary_metric,
-            metric_direction=self.domain.metric_direction,  # type: ignore[arg-type]
+            primary_metric=metric,
+            metric_direction=direction,  # type: ignore[arg-type]
             paired_seeds=list(self.domain.paired_seeds),
             guardrails=dict(self.domain.guardrails),
             max_parallel=1,

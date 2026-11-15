@@ -226,10 +226,15 @@ class ResearchDirector:
             warn = f"objective status is {status!r}, expected 'proposed'"
         else:
             warn = ""
+        # P1 (M4-E2E-01.1): the Session must persist the REAL Objective
+        # Description + Success Criteria, not a Director-supplied placeholder.
+        obj_description = getattr(rec, "description", "") or ""
+        obj_success = getattr(rec, "success_criteria", None) or {}
         try:
             sess = self.service.start_research_session(
                 objective_id=self.objective_id,
-                description="ARR autonomous research director",
+                description=obj_description,
+                success_criteria_json=json.dumps(obj_success),
                 session_id="")
             if not sess.get("ok"):
                 raise DirectorError(f"start_research_session failed: {sess}")
@@ -247,11 +252,24 @@ class ResearchDirector:
         self._guard_current(S_OBJECTIVE_SELECTED, E_PROPOSE_HYPOTHESES)
         try:
             src = self.source_experiment_id or "exp_baseline"
+            # P1: read the Objective's full context (Evidence References /
+            # Hypothesis Hint / Proposed Intervention) and wire it into the
+            # generator so the resulting hypotheses explicitly correspond to THIS
+            # Objective.
+            obj_rec = self.objective_store.get(self.objective_id)
+            obj_constraints = (getattr(obj_rec, "constraints", None) or {}
+                               if obj_rec is not None else {})
+            obj_evidence_refs = list(obj_constraints.get("evidence_refs") or [])
+            obj_hint = obj_constraints.get("hypothesis_hint") or ""
+            obj_intervention = dict(obj_constraints.get("proposed_intervention") or {})
             proposed = self.service.propose_research_hypotheses(
                 objective_id=self.objective_id,
                 source_experiment_id=src,
                 session_id=self.context.session_id,
-                hypotheses_json="")  # autonomous; grounded in real evidence
+                hypotheses_json="",  # autonomous; grounded in real evidence
+                objective_evidence_refs=obj_evidence_refs,
+                objective_hint=obj_hint,
+                objective_intervention=obj_intervention)
             if not proposed.get("ok"):
                 raise DirectorError(f"propose failed: {proposed}")
             hids = [h["hypothesis_id"] for h in proposed.get("hypotheses", [])]

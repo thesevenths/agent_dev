@@ -41,6 +41,11 @@ class ResearchDomainPolicy:
     intervention_policy: Mapping[str, dict[str, Any]] = field(default_factory=dict)
     primary_metric: str = ""
     metric_direction: str = "minimize"
+    # Metrics an Objective may request for this domain. Empty => ONLY the domain's
+    # own primary_metric is permitted. A non-empty allow-list widens it. An
+    # Objective that requests a metric outside this set must be rejected as
+    # 'unsupported' (never silently swapped to the domain default).
+    supported_metrics: tuple[str, ...] = ()
     guardrails: dict[str, dict[str, Any]] = field(default_factory=dict)
     paired_seeds: tuple[int, ...] = (42, 43, 44, 45, 46)
     evaluation_split: str = "validation"
@@ -60,6 +65,19 @@ class ResearchDomainPolicy:
     def expected_jobs(n_candidates: int, n_seeds: int) -> int:
         """Every trial is exactly one train + one evaluation job."""
         return (1 + n_candidates) * n_seeds * 2
+
+    def is_metric_supported(self, metric: str) -> bool:
+        """Whether an Objective-requested metric is acceptable to this domain.
+
+        Empty ``supported_metrics`` means only ``primary_metric`` is allowed; a
+        non-empty allow-list widens it. A metric outside this set must be rejected
+        as 'unsupported' rather than silently swapped to the domain default.
+        """
+        if not metric:
+            return False
+        if metric == self.primary_metric:
+            return True
+        return bool(self.supported_metrics) and metric in self.supported_metrics
 
     def override_error(self, key: Any, value: Any) -> str | None:
         """One config override's preflight verdict. None means allowed."""

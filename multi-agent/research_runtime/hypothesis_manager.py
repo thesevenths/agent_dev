@@ -31,6 +31,7 @@ from pydantic import ValidationError
 from .hypothesis_critic import HypothesisCritic
 from .failure_diagnoser import HORIZON_DEGRADATION_FACTOR
 from .schemas import (
+    CONFIG_KEY_RE,
     CandidateExperiment,
     ExperimentPlan,
     ExperimentResult,
@@ -129,8 +130,32 @@ class RuleBasedProposer:
 
     def propose(self, result: ExperimentResult,
                 failure_reports: Sequence[FailureReport | dict] | None,
-                objective_id: str) -> list[Hypothesis]:
+                objective_id: str,
+                objective_context: dict[str, Any] | None = None
+                ) -> list[Hypothesis]:
         self.skipped_reasons = []
+        # P1 (M4-E2E-01.1): the generator RECEIVES the Objective's research
+        # target / Evidence References / Hypothesis Hint / Proposed Intervention
+        # as provenance so the hypothesis explicitly corresponds to the current
+        # Objective. It never bypasses the deterministic Critic gate, nor does it
+        # override the domain-injected intervention policy unless the Objective
+        # supplies a REAL dotted config-path override.
+        objective_context = objective_context or {}
+        obj_evidence_refs = [str(r) for r in
+                             (objective_context.get("evidence_refs") or [])
+                             if str(r).strip()]
+        obj_hint = str(objective_context.get("hypothesis_hint") or "").strip()
+        obj_intervention = dict(objective_context.get("proposed_intervention") or {})
+        # Only REAL dotted config-path overrides flow into the experiment plan;
+        # semantic hint keys (e.g. 'axis', 'rationale') are kept as provenance.
+        obj_config_overrides = {
+            k: v for k, v in obj_intervention.items()
+            if isinstance(k, str) and "." in k and CONFIG_KEY_RE.match(k)
+        }
+        if obj_intervention and not obj_config_overrides:
+            self.skipped_reasons.append(
+                "objective proposed_intervention carried as provenance only "
+                "(no dotted config-path override supplied)")
         reports = [report for report in (failure_reports or [])
                    if _is_horizon_report(report)]
         if not reports:
@@ -144,12 +169,18 @@ class RuleBasedProposer:
                 "no metric family shows measurable horizon degradation")
             return []
 
-        intervention = self.intervention_policy.get(HORIZON_DIAGNOSIS)
+        intervention = copy.deepcopy(
+            self.intervention_policy.get(HORIZON_DIAGNOSIS) or {})
         if not intervention:
             self.skipped_reasons.append(
                 "no intervention policy injected for this diagnosis; "
                 "refusing to invent a root cause")
             return []
+        # Objective-aligned overrides are ADDED on top of the policy-derived
+        # intervention (never silently replacing it), keeping the plan consistent
+        # with the Objective when it supplies real config keys.
+        for k, v in obj_config_overrides.items():
+            intervention[k] = v
 
         proposals: list[Hypothesis] = []
         for family, _, longest in families:
@@ -159,6 +190,20 @@ class RuleBasedProposer:
                 failure_id = _report_id(report)
                 if failure_id:
                     refs.append(f"failure:{failure_id}")
+            # The Objective's own evidence references ride along as provenance.
+            for r in obj_evidence_refs:
+                if r not in refs:
+                    refs.append(r)
+            confounders = ["training budget", "optimization instability",
+                           "random seed variance"]
+            # The Objective's hint / proposed intervention are recorded as
+            # provenance so the hypothesis explicitly corresponds to the Objective.
+            if obj_hint:
+                confounders.append(f"objective_hint: {obj_hint}")
+            if obj_intervention:
+                confounders.append(
+                    "objective_proposed_intervention: "
+                    + json.dumps(obj_intervention, sort_keys=True, default=str))
             slug = _NON_ALNUM_RE.sub("_", family).strip("_").upper()
             proposals.append(Hypothesis(
                 hypothesis_id=f"H_HORIZON_{slug}",
@@ -184,8 +229,7 @@ class RuleBasedProposer:
                     f"On the held-out validation split, {longest} does not "
                     "improve across the paired seeds relative to baseline."
                 ],
-                confounders=["training budget", "optimization instability",
-                             "random seed variance"],
+                confounders=confounders,
                 confidence=0.5,
             ))
         return proposals
@@ -207,7 +251,8 @@ class LLMProposer:
 
     def _prompt(self, result: ExperimentResult,
                 failure_reports: Sequence[FailureReport | dict] | None,
-                objective_id: str) -> str:
+                objective_id: str,
+                objective_context: dict[str, Any] | None = None) -> str:
         reports = [
             report.model_dump() if hasattr(report, "model_dump") else report
             for report in (failure_reports or [])
@@ -217,6 +262,7 @@ class LLMProposer:
             "source_experiment_id": result.experiment_id,
             "metrics": result.metrics,
             "failure_reports": reports,
+            "objective_context": dict(objective_context or {}),
             "allowed_intervention_keys": (sorted(self.allowed)
                                          if self.allowed is not None else None),
             "instructions": (
@@ -253,11 +299,14 @@ class LLMProposer:
 
     def propose(self, result: ExperimentResult,
                 failure_reports: Sequence[FailureReport | dict] | None,
-                objective_id: str) -> list[Hypothesis]:
+                objective_id: str,
+                objective_context: dict[str, Any] | None = None
+                ) -> list[Hypothesis]:
         self.rejections = []
         try:
             raw = self.generate(
-                self._prompt(result, failure_reports, objective_id)
+                self._prompt(result, failure_reports, objective_id,
+                             objective_context=objective_context)
             )
         except Exception as exc:  # an unavailable model must never break the loop
             self.rejections.append(f"generator failed: {type(exc).__name__}: {exc}")
@@ -269,10 +318,20 @@ class LLMProposer:
             return []
 
         proposals: list[Hypothesis] = []
+        obj_evidence_refs = [str(r) for r in
+                             (objective_context or {}).get("evidence_refs") or []
+                             if str(r).strip()]
         for item in items:
             # The evidence source is NOT up to the model: force the real ids.
             item["objective_id"] = objective_id
             item["source_experiment_id"] = result.experiment_id
+            # The Objective's own evidence references ride along as provenance.
+            if obj_evidence_refs:
+                _ev = list(item.get("evidence_refs") or [])
+                for _r in obj_evidence_refs:
+                    if _r not in _ev:
+                        _ev.append(_r)
+                item["evidence_refs"] = _ev
             try:
                 hypothesis = Hypothesis.model_validate(item)
             except ValidationError as exc:
@@ -303,10 +362,14 @@ class HypothesisManager:
 
     def propose(self, result: ExperimentResult,
                 failure_reports: Sequence[FailureReport | dict] | None,
-                objective_id: str) -> list[Hypothesis]:
+                objective_id: str,
+                objective_context: dict[str, Any] | None = None
+                ) -> list[Hypothesis]:
         self.rejections = []
         try:
-            raw = self.proposer.propose(result, failure_reports, objective_id)
+            raw = self.proposer.propose(
+                result, failure_reports, objective_id,
+                objective_context=objective_context)
         except Exception as exc:
             self.rejections.append({
                 "stage": "propose",
