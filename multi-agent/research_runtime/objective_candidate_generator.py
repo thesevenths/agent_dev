@@ -35,6 +35,56 @@ from .discovery_context_provider import DiscoverySnapshot
 _NEGATIVE_VERDICTS = {"rejected", "inconclusive", "fail", "failed"}
 
 
+# ---------------------------------------------------------------------------
+# Failure evidence reference contract (M4.3-00 / P0-01)
+# ---------------------------------------------------------------------------
+# A failure evidence ref has exactly one of these shapes:
+#     session:<session_id>:event:<event_type>
+#     objective:<objective_id>:event:<event_type>
+# The scope prefix selects WHICH id field is authoritative (a session id must
+# never be verifiable through the ``objective:`` prefix, or vice versa). Both
+# the id AND the event_type must come from a REAL
+# ``failures.session_failure_signals`` entry. The generator builds refs from
+# those signals and the Critic resolves them against the SAME signals, so a
+# fabricated event, an unknown id, or a scope-mismatched id can never be
+# grounded. Plain entity refs (``session:<id>`` / ``objective:<id>``) remain
+# supported for traceability to a real session/objective.
+FAILURE_REF_SCOPES = ("session", "objective")
+FAILURE_ID_FIELD = {"session": "session_id", "objective": "objective_id"}
+
+
+def make_failure_ref(signal: dict[str, Any]) -> str:
+    """Build the canonical evidence ref for ONE real failure signal."""
+    sid = str(signal.get("session_id") or "")
+    oid = str(signal.get("objective_id") or "")
+    etype = str(signal.get("event_type") or "fail")
+    if sid:
+        return f"session:{sid}:event:{etype}"
+    return f"objective:{oid}:event:{etype}"
+
+
+def parse_failure_ref(ref: str) -> tuple[str, str, str | None] | None:
+    """Parse a failure/entity ref -> ``(scope, id, event_type|None)`` or None.
+
+    ``event_type`` is ``None`` for a plain entity ref (``session:<id>`` /
+    ``objective:<id>``). Anything malformed -- wrong scope, missing id, missing
+    ``event`` marker, missing/extra segments -- returns ``None`` so it can never
+    be treated as grounded evidence.
+    """
+    if not ref or ":" not in ref:
+        return None
+    parts = ref.split(":")
+    scope = parts[0]
+    if scope not in FAILURE_REF_SCOPES:
+        return None
+    if len(parts) == 2 and parts[1]:                 # plain entity ref
+        return (scope, parts[1], None)
+    if (len(parts) == 4 and parts[2] == "event"
+            and parts[1] and parts[3]):              # event ref
+        return (scope, parts[1], parts[3])
+    return None
+
+
 def _short_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
@@ -235,8 +285,10 @@ class ObjectiveCandidateGenerator:
             sid = sig.get("session_id") or ""
             etype = sig.get("event_type", "fail")
             cid = _candidate_id("failure", f"{oid}|{sid}|{etype}")
-            ref = f"session:{sid}:event:{etype}" if sid else \
-                f"objective:{oid}:event:{etype}"
+            # M4.3-00 / P0-01: build the ref through the SAME canonical contract
+            # the Critic resolves against, so the id scope + event type always
+            # match a real stored failure signal.
+            ref = make_failure_ref(sig)
             out.append(ObjectiveCandidate(
                 candidate_id=cid,
                 domain=self.domain,

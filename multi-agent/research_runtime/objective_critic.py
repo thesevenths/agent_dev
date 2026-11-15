@@ -22,11 +22,57 @@ import re
 from typing import Any
 
 from .discovery_context_provider import DiscoverySnapshot
-from .objective_candidate_generator import ObjectiveCandidate
+from .objective_candidate_generator import (
+    FAILURE_ID_FIELD, ObjectiveCandidate, parse_failure_ref,
+)
 
 # Refs we accept as resolvable, keyed by their colon-delimited prefix.
 _RESOLVABLE_PREFIXES = ("sha256:", "domain:", "session:", "objective:",
                         "experience:")
+
+
+def _resolve_entity_ref(ref: str, snapshot: DiscoverySnapshot) -> bool:
+    """M4.3-00 / P0-01: resolve ``session:`` / ``objective:`` refs strictly.
+
+    An EVENT ref (``<scope>:<id>:event:<type>``) is real ONLY when
+    ``snapshot.failures.session_failure_signals`` contains a signal whose id
+    field -- selected by the ref's scope (``session_id`` for ``session:``,
+    ``objective_id`` for ``objective:``) -- equals ``<id>`` AND whose
+    ``event_type`` equals ``<type>``. This rejects:
+      * fabricated events (real id, non-existent event type),
+      * unknown ids,
+      * scope/type confusion (an objective id cited under a ``session:`` ref),
+      * malformed refs (handled by ``parse_failure_ref`` -> None).
+
+    A PLAIN entity ref (``<scope>:<id>``, no event) resolves against the real
+    session/objective ids in the snapshot, with the same scope discipline.
+    Unlike the old logic, session ids and objective ids are NEVER pooled into
+    one undirected id set.
+    """
+    parsed = parse_failure_ref(ref)
+    if parsed is None:
+        return False
+    scope, rid, etype = parsed
+    id_field = FAILURE_ID_FIELD[scope]
+
+    if etype is not None:
+        signals = (snapshot.failures or {}).get("session_failure_signals", []) or []
+        for sig in signals:
+            if (str(sig.get(id_field) or "") == rid
+                    and str(sig.get("event_type") or "") == etype):
+                return True
+        return False
+
+    # Plain entity ref: match a real session_id / objective_id (never the other
+    # kind), across both the flat and nested session views.
+    for s in (snapshot.sessions or []):
+        if str(s.get(id_field) or "") == rid:
+            return True
+    for lst in (snapshot.sessions_by_objective or {}).values():
+        for s in lst:
+            if str(s.get(id_field) or "") == rid:
+                return True
+    return False
 
 
 def _normalise(text: str) -> str:
@@ -63,17 +109,7 @@ def _resolve_ref(ref: str, snapshot: DiscoverySnapshot) -> bool:
             return str(domains[name].get("ood_dataset_version")) == parts[3]
         return False
     if prefix in ("session:", "objective:"):
-        ids = set()
-        for s in snapshot.sessions:
-            ids.add(s.get("session_id") or "")
-            ids.add(s.get("objective_id") or "")
-        for lst in (snapshot.sessions_by_objective or {}).values():
-            for s in lst:
-                ids.add(s.get("session_id") or "")
-                ids.add(s.get("objective_id") or "")
-        return prefix + ":" in ref and any(
-            ref.startswith(f"{prefix}:{i}:") or ref == f"{prefix}:{i}"
-            for i in ids if i)
+        return _resolve_entity_ref(ref, snapshot)
     if prefix == "experience:":
         # A SPECIFIC Experience id (session_id or objective_id) must resolve to a
         # real, non-empty Experience record. "Some experience exists somewhere"
