@@ -103,6 +103,10 @@ class DiscoverySnapshot:
     objectives: list[dict[str, Any]]
     links: dict[str, Any]
     sessions: list[dict[str, Any]]
+    # P2: nested view -- objective_id -> [session dict]. Lets Discovery see the
+    # FULL session history per objective (not just the latest), with events /
+    # reports / experience attached. sessions[] is the flat form of the same.
+    sessions_by_objective: dict[str, list[dict[str, Any]]]
     experience_available: bool
     failures: dict[str, Any]
     provenance: dict[str, Any]
@@ -117,6 +121,7 @@ class DiscoverySnapshot:
             "objectives": self.objectives,
             "links": self.links,
             "sessions": self.sessions,
+            "sessions_by_objective": self.sessions_by_objective,
             "experience_available": self.experience_available,
             "failures": self.failures,
             "provenance": self.provenance,
@@ -175,6 +180,7 @@ class DiscoveryContextProvider:
 
         objectives = self._load_objectives(objective_ids)
         sessions = self._load_sessions(objective_ids)
+        sessions_by_objective = self._group_sessions(sessions)
         links = self._load_links(run_id, objective_ids)
         failures = self._load_failures(view, sessions)
         provenance = self._build_provenance(
@@ -192,11 +198,19 @@ class DiscoveryContextProvider:
             objectives=objectives,
             links=links,
             sessions=sessions,
+            sessions_by_objective=sessions_by_objective,
             experience_available=any_experience,
             failures=failures,
             provenance=provenance,
             unresolved_gaps=unresolved_gaps,
         )
+
+    @staticmethod
+    def _group_sessions(sessions: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        by_objective: dict[str, list[dict[str, Any]]] = {}
+        for s in sessions:
+            by_objective.setdefault(s["objective_id"], []).append(s)
+        return by_objective
 
     # -- sub-reads (all READ-ONLY, all post-snapshot) -------------------
     def _load_objectives(self, objective_ids: list[str]) -> list[dict[str, Any]]:
@@ -209,43 +223,72 @@ class DiscoveryContextProvider:
         return out
 
     def _load_sessions(self, objective_ids: list[str]) -> list[dict[str, Any]]:
+        """P2: read EVERY historical session for each objective.
+
+        Uses ``ResearchSessionStore.sessions_for_objective`` (deterministic
+        created_at ASC, session_id ASC) instead of the single-latest
+        ``session_for_objective``. Discovery must see the full session history
+        so it does not repeat a previously-failed direction. A missing objective
+        still yields exactly one placeholder (so traceability/indexing is stable).
+        """
         out: list[dict[str, Any]] = []
         for oid in objective_ids:
-            session = self.stores.sessions.session_for_objective(oid)
-            if session is None:
+            sessions = self.stores.sessions.sessions_for_objective(oid)
+            if not sessions:
                 out.append({
                     "objective_id": oid,
                     "session_available": False,
                     "session_id": None,
                     "session_status": None,
+                    "session_index": None,
                     "events": [],
                     "reports": [],
                     "experience": [],
                     "experience_available": False,
                 })
                 continue
-            sid = session.session_id
-            exp = self.stores.sessions.experience(sid)
-            out.append({
-                "objective_id": oid,
-                "session_available": True,
-                "session_id": sid,
-                "session_status": getattr(session, "status", None),
-                "events": self.stores.sessions.events(sid),
-                "reports": [_obj_to_dict(r) for r
-                            in self.stores.sessions.reports_for_session(sid)],
-                # (2) NO FABRICATION: experience is echoed verbatim; if empty,
-                # experience_available is False and the gap is recorded upstream.
-                "experience": exp,
-                "experience_available": len(exp) > 0,
-            })
+            for idx, session in enumerate(sessions):
+                sid = session.session_id
+                exp = self.stores.sessions.experience(sid)
+                # Enrich each experience with its owning session_id so an
+                # experience is always traceable to the exact session it was
+                # recorded under (the store's experience() row omits it).
+                exp = [{**e, "session_id": sid} for e in exp]
+                out.append({
+                    "objective_id": oid,
+                    "session_available": True,
+                    "session_id": sid,
+                    "session_status": getattr(session, "status", None),
+                    "session_index": idx,
+                    "events": self.stores.sessions.events(sid),
+                    # (2) NO FABRICATION: experience is echoed verbatim; if empty,
+                    # experience_available is False and the gap is recorded
+                    # upstream. Historical sessions with real Experience surface
+                    # it; later runs accumulate more -- nothing is synthesised.
+                    "reports": [_obj_to_dict(r) for r
+                                in self.stores.sessions.reports_for_session(sid)],
+                    "experience": exp,
+                    "experience_available": len(exp) > 0,
+                })
         return out
 
     def _load_links(self, run_id: str,
                     objective_ids: list[str]) -> dict[str, Any]:
         by_objective: dict[str, Any] = {}
         for oid in objective_ids:
-            by_objective[oid] = self.stores.links.list_objective_graph(oid, run_id)
+            graph = self.stores.links.list_objective_graph(oid, run_id)
+            # P4 traceability: list_objective_graph reduces edges and DROPS the
+            # source artifact reference. Pull the FULL link rows (which carry
+            # source_sha256 + source_path) so every relation in the snapshot can
+            # be traced back to the concrete file it was derived from.
+            full_rows = self.stores.links.find_by_objective(oid, run_id=run_id)
+            by_objective[oid] = {
+                "n_links": graph["n_links"],
+                "n_confirmed": graph["n_confirmed"],
+                "n_reconstructed": graph["n_reconstructed"],
+                "n_unresolved": graph["n_unresolved"],
+                "links": full_rows,
+            }
         return {
             "run_stats": self.stores.links.stats(run_id=run_id),
             "by_objective": by_objective,
@@ -253,24 +296,51 @@ class DiscoveryContextProvider:
 
     def _load_failures(self, view: dict[str, Any],
                        sessions: list[dict[str, Any]]) -> dict[str, Any]:
-        # Honest, stored-only failure signals. We do NOT manufacture
-        # FailureReports here; the FailureDiagnoser is wired for later sub-steps
-        # that receive real ExperimentResult objects.
+        """P3: honest, boundary-explicit failure accounting.
+
+        Three distinct layers, never conflated:
+
+          * ``evidence_unresolved``  -- evidence carriers that could not be
+            resolved to a real file (from the unified view).
+          * ``session_failure_signals`` -- session EVENTS whose name matches a
+            failure marker. These are *signals only*: they are event names, not
+            structured ExperimentResults, so they carry no scientific conclusion.
+          * ``structured_diagnoses``  -- real FailureReports. During snapshot
+            building there is NO ExperimentResult available (historical runs have
+            none), so this is ALWAYS empty here. Structured diagnosis is produced
+            only by ``diagnose_result(result)`` on a real result -- it is never
+            inferred from log text.
+
+        ``diagnosis_status`` documents the boundary so a downstream consumer can
+        never mistake a signal for a verdict.
+        """
         evidence_unresolved = view.get("unresolved", [])
-        session_failure_events: list[dict[str, Any]] = []
+        session_failure_signals: list[dict[str, Any]] = []
         for s in sessions:
+            if not s.get("session_available"):
+                continue
             for ev in s.get("events", []):
                 etype = str(ev.get("event_type", "")).lower()
                 if any(m in etype for m in _FAILURE_EVENT_MARKERS):
-                    session_failure_events.append({
+                    session_failure_signals.append({
                         "objective_id": s["objective_id"],
                         "session_id": s.get("session_id"),
+                        "session_index": s.get("session_index"),
                         "event_type": ev.get("event_type"),
                         "created_at": ev.get("created_at"),
                     })
         return {
             "evidence_unresolved": evidence_unresolved,
-            "session_failure_events": session_failure_events,
+            "session_failure_signals": session_failure_signals,
+            "structured_diagnoses": [],
+            "diagnosis_status": {
+                "mode": "snapshot_build",
+                "structured_diagnosis_available": False,
+                "note": ("no ExperimentResult is available during snapshot "
+                         "building; FailureDiagnoser runs only via "
+                         "diagnose_result() on a real result -- failure "
+                         "conclusions are NEVER inferred from log text"),
+            },
         }
 
     def _build_provenance(self, run_id: str, view: dict[str, Any],
@@ -340,6 +410,19 @@ class DiscoveryContextProvider:
                 "kind": "evidence_unresolved",
                 "detail": u,
                 "reason": "evidence carrier could not be resolved to a real file",
+            })
+        # P3: failure signals exist but no structured ExperimentResult is present
+        # to run FailureDiagnoser -- diagnosis is explicitly UNAVAILABLE, never
+        # guessed from log text.
+        if failures.get("session_failure_signals"):
+            gaps.append({
+                "kind": "diagnosis_unavailable",
+                "detail": {
+                    "n_signals": len(failures["session_failure_signals"]),
+                },
+                "reason": ("failure signals observed but no structured "
+                           "ExperimentResult available to run FailureDiagnoser; "
+                           "diagnosis must not be inferred from log text"),
             })
         return gaps
 

@@ -118,6 +118,21 @@ class ResearchSessionStore:
             return None
         return ResearchSession.model_validate(_load(rows[0]["record_json"], {}))
 
+    def sessions_for_objective(self, objective_id: str) -> list[ResearchSession]:
+        """ALL sessions for an objective, deterministically ordered.
+
+        Unlike :meth:`session_for_objective` (which returns only the latest),
+        Discovery needs the FULL session history -- including previously-failed
+        directions -- so it does not propose a direction that already failed.
+        Order is ``created_at ASC, session_id ASC`` (deterministic, stable
+        across runs and Python versions).
+        """
+        rows = self.db.rows(
+            """SELECT record_json FROM research_sessions WHERE objective_id=?
+               ORDER BY created_at ASC, session_id ASC""", (objective_id,))
+        return [ResearchSession.model_validate(_load(r["record_json"], {}))
+                for r in rows]
+
     def unique_session(self) -> ResearchSession | None:
         """Resolve an omitted session_id ONLY when unambiguous.
 
