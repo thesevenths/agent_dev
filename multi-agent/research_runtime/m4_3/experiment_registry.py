@@ -121,9 +121,12 @@ class RunRecord:
     # objective-quality evidence (for independent review)
     evidence_refs: list[str] = field(default_factory=list)
     quality_review: dict[str, Any] = field(default_factory=dict)
-    # execution evidence
+    # execution evidence (P0-01: DERIVED from the real read-only gate adapter,
+    # never caller-supplied). ``gate_evidence`` is the full persisted evidence
+    # chain that produced ``gate_steps_passed`` / ``external_approval``.
     gate_steps_passed: int = 0
     external_approval: bool = False
+    gate_evidence: dict[str, Any] = field(default_factory=dict)
     campaign_id: str = ""
     compute_units: float = 0.0
     wall_time_s: float = 0.0

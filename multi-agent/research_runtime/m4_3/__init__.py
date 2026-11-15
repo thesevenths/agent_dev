@@ -16,10 +16,16 @@ from .metrics import (
     ALL_METRICS, PRIMARY_METRICS, SAFETY_METRICS, SECONDARY_METRICS,
     IndependentReviewer, blind, frozen_metric_contract,
 )
+from .research_service_gate import (
+    GATE_STEP_COUNT, GATED_OUTCOMES, UNGATED_OUTCOMES, FORGED_GATE_KEYS,
+    GateAdapter, GateEvidence, GateRunRef, ResearchServiceGateAdapter,
+)
 
 __all__ = [
     "EvaluationHarness", "ProtocolViolation", "ArmContext", "BlockSpec",
     "build_arm_context", "ExperimentRegistry", "FrozenProtocol", "RunRecord",
     "ARMS", "IndependentReviewer", "blind", "frozen_metric_contract",
     "PRIMARY_METRICS", "SECONDARY_METRICS", "SAFETY_METRICS", "ALL_METRICS",
+    "GATE_STEP_COUNT", "GATED_OUTCOMES", "UNGATED_OUTCOMES", "FORGED_GATE_KEYS",
+    "GateAdapter", "GateEvidence", "GateRunRef", "ResearchServiceGateAdapter",
 ]

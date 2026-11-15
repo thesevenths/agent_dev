@@ -60,8 +60,21 @@ def _block(spec_id: str = "block_1", snapshot: str = "snap_1") -> BlockSpec:
         historical_failure=[{"event_type": "train_failed"}])
 
 
-def _harness() -> EvaluationHarness:
-    return EvaluationHarness(protocol=_protocol(), reviewer=_reviewer())
+@pytest.fixture
+def gate():
+    """REAL engine-free ResearchService gate chain (P0-01)."""
+    from tests.rt_tests.m4_3_gate import build_gate_fixture
+    fx = build_gate_fixture()
+    yield fx
+    fx.close()
+
+
+def _harness(gate=None) -> EvaluationHarness:
+    # P0-01: completed outcomes MUST be backed by a real read-only gate
+    # adapter over real persisted records; there is no optimistic default.
+    kw = (dict(gate_adapter=gate.adapter, default_gate_ref=gate.ref)
+          if gate is not None else {})
+    return EvaluationHarness(protocol=_protocol(), reviewer=_reviewer(), **kw)
 
 
 # --------------------------------------------------------------------- groups/context
@@ -200,8 +213,8 @@ def test_primary_metric_cannot_be_changed_post_hoc():
 
 
 # --------------------------------------------------------------------- complete retention
-def test_all_outcomes_are_retained_and_gate_approval_recorded():
-    h = _harness()
+def test_all_outcomes_are_retained_and_gate_approval_recorded(gate):
+    h = _harness(gate)
     # Three blocks with different outcomes, all paired A/B/C.
     outcomes = ("valid_finding", "inconclusive", "failed")
     for i, oc in enumerate(outcomes):
@@ -210,9 +223,10 @@ def test_all_outcomes_are_retained_and_gate_approval_recorded():
         h.add_block(spec, candidate_budget=1, human_time_budget_s=10.0)
         for arm in ARMS:
             h.select_objective(bid, arm, objective=_objective(f"{bid}_{arm}"))
+            # P0-01: no caller-supplied gate verdict; derived from persisted
+            # Approval/Campaign/Report/Experience via the real adapter.
             h.record_outcome(
-                bid, arm, outcome=oc, gate_steps_passed=12,
-                external_approval=True, compute_units=2.0, wall_time_s=5.0)
+                bid, arm, outcome=oc, compute_units=2.0, wall_time_s=5.0)
     runs = h.registry.all_runs()
     assert len(runs) == 9
     # NOTHING was dropped: inconclusive + failed are present in the denominator.
@@ -227,30 +241,46 @@ def test_all_outcomes_are_retained_and_gate_approval_recorded():
     assert h.registry.complete_blocks() == ["block_0", "block_1", "block_2"]
 
 
-def test_approval_bypass_and_frozen_split_are_safety_counts():
-    h = _harness()
+def test_approval_bypass_and_frozen_split_are_safety_counts(gate):
+    h = _harness(gate)
     h.add_block(_block(), candidate_budget=1, human_time_budget_s=1.0)
     for arm in ARMS:
         h.select_objective("block_1", arm, objective=_objective(f"o_{arm}"))
-    h.record_outcome("block_1", "A", outcome="valid_finding",
-                     external_approval=False, frozen_split_violation=True)
-    h.record_outcome("block_1", "B", outcome="invalid",
-                     external_approval=True)
-    h.record_outcome("block_1", "C", outcome="interrupted",
-                     external_approval=True, gate_steps_passed=12)
+    from research_runtime.m4_3.research_service_gate import GateRunRef
+    # P0-01: approval_bypass is DERIVED from a genuinely missing Approval
+    # record (a gate_ref pointing at a non-existent approval), not claimed.
+    no_approval = GateRunRef(
+        session_id="no_such_session", plan_id="no_such_plan",
+        approval_id="no_such_approval", campaign_id="no_such_campaign")
+    # A real interruption is retained even with no gate evidence; the missing
+    # approval is recorded as a bypass (fail-closed for completed outcomes).
+    h.record_outcome("block_1", "A", outcome="interrupted",
+                     gate_ref=no_approval, frozen_split_violation=True)
+    h.record_outcome("block_1", "B", outcome="invalid")   # real gate ref
+    h.record_outcome("block_1", "C", outcome="interrupted")  # real gate ref
     m = h.compute_metrics()
-    assert m["approval_bypass_count"] == 1
+    assert m["approval_bypass_count"] == 1   # only A lacks a real Approval
     assert m["frozen_split_violation_count"] == 1
     assert m["invalid_experiment_rate"] == round(1 / 3, 6)
+    # The forged-key path is gone entirely.
+    with pytest.raises(ProtocolViolation):
+        h.record_outcome("block_1", "A", outcome="valid_finding",
+                         external_approval=False)
 
 
-def test_completed_arm_must_pass_all_12_gate_steps():
-    h = _harness()
+def test_completed_arm_must_pass_all_12_gate_steps(gate):
+    # P0-01: a completed arm needs the FULL real gate chain; a caller cannot
+    # claim a partial/passing step count at all.
+    h = _harness(gate)
     h.add_block(_block(), candidate_budget=1, human_time_budget_s=1.0)
     h.select_objective("block_1", "A", objective=_objective())
     with pytest.raises(ProtocolViolation):
         h.record_outcome("block_1", "A", outcome="valid_finding",
                          gate_steps_passed=11)
+    # A missing persisted artefact also blocks a completed outcome.
+    gate.break_experience_rows()
+    with pytest.raises(ProtocolViolation):
+        h.record_outcome("block_1", "A", outcome="valid_finding")
 
 
 # --------------------------------------------------------------------- frozen protocol / stage gates
@@ -269,8 +299,8 @@ def test_confirmatory_refuses_unfrozen_protocol():
     assert len(frozen.freeze_sha256()) == 64
 
 
-def test_registry_preserves_snapshot_seed_hierarchy():
-    h = _harness()
+def test_registry_preserves_snapshot_seed_hierarchy(gate):
+    h = _harness(gate)
     h.add_block(_block(), candidate_budget=1, human_time_budget_s=1.0)
     for arm in ARMS:
         h.select_objective("block_1", arm, objective=_objective(f"o_{arm}"))

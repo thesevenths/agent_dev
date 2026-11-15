@@ -1,10 +1,13 @@
-"""M4.3-01 -- A/B/C Evaluation Harness (NO ResearchService modification).
+"""M4.3-01 / M4.3-01.1 -- A/B/C Evaluation Harness (NO ResearchService modification).
 
 This is an INDEPENDENT experiment protocol/executor module. It does NOT create
-a second ResearchService / Planner / Decision Engine. All three arms go through
-the SAME existing 12-step fail-closed gate (represented here by a read-only
-``gate_adapter`` that the operator wires to the real service); the harness only
-orchestrates arm context, records outcomes, and computes metrics.
+a second ResearchService / Planner / Decision Engine, and it NEVER re-implements
+or relaxes the 12-step fail-closed gate. All three arms go through the SAME
+existing gate: ``ResearchServiceGateAdapter`` is a READ-ONLY observer bound to
+ONE real ResearchService, and every recorded gate verdict is DERIVED from that
+service's persisted Approval / Campaign / Report / Experience records (P0-01).
+A caller can no longer *claim* ``gate_steps_passed=12`` or
+``external_approval=True``: those values come from ``GateEvidence`` only.
 
 Groups (spec M4.3-01):
   A  Manual                  -- human picks an Objective from CURRENT evidence,
@@ -36,11 +39,15 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .experiment_registry import (
-    ARMS, ARM_DESCRIPTIONS, ExperimentRegistry, FrozenProtocol, RunRecord,
+    ARMS, ARM_DESCRIPTIONS, RUN_OUTCOMES, ExperimentRegistry, FrozenProtocol,
+    RunRecord,
 )
 from .metrics import (
     ALL_METRICS, PRIMARY_METRICS, SAFETY_METRICS, SECONDARY_METRICS,
     IndependentReviewer, QualityReview, blind, frozen_metric_contract,
+)
+from .research_service_gate import (
+    FORGED_GATE_KEYS, GATED_OUTCOMES, GateAdapter, GateEvidence, GateRunRef,
 )
 
 # Fixed, frozen arm-context rules. A must NOT see Experience; B and C see the
@@ -139,19 +146,28 @@ class EvaluationHarness:
     and returning a candidate objective dict (for A/B a human decision is
     represented by this callback; for C the operator wires the real
     ``ObjectiveDiscovery``). ``reviewer`` is an ``IndependentReviewer``.
-    ``gate_adapter`` is a READ-ONLY adapter that the operator wires to the real
-    ResearchService; the harness NEVER bypasses or re-implements the gate.
+
+    ``gate_adapter`` (P0-01) MUST be a real ``GateAdapter`` bound to ONE
+    ResearchService. It is not optional decoration: ``record_outcome`` calls
+    ``inspect()`` for EVERY outcome and derives the gate verdict, step count and
+    external-approval flag from the persisted records. There is no optimistic
+    default and no caller-supplied verdict. A harness built without an adapter
+    is FAIL-CLOSED: no completed outcome (``valid_finding`` etc.) can be
+    recorded, because no real gate evidence can be produced.
     """
 
     def __init__(self, *, protocol: FrozenProtocol,
                  reviewer: IndependentReviewer,
                  objective_selector: Callable[[ArmContext], dict[str, Any]] | None = None,
-                 gate_adapter: Any = None):
+                 gate_adapter: GateAdapter | None = None,
+                 default_gate_ref: GateRunRef | None = None):
         self.registry = ExperimentRegistry(protocol=protocol)
         self.protocol = protocol
         self.reviewer = reviewer
         self.objective_selector = objective_selector
+        # ONE adapter shared by A/B/C -> the SAME ResearchService entry point.
         self.gate_adapter = gate_adapter
+        self.default_gate_ref = default_gate_ref
         self._primary_frozen = tuple(protocol.primary_metrics)
         self._contexts: dict[str, dict[str, ArmContext]] = {}
         self._blocks_finalized: set[str] = set()
@@ -231,31 +247,77 @@ class EvaluationHarness:
 
     # ------------------------------------------------------------- outcomes
     def record_outcome(self, block_id: str, arm: str, *, outcome: str,
-                       gate_steps_passed: int = 12,
-                       external_approval: bool = True,
+                       gate_ref: GateRunRef | None = None,
                        paired_seeds: list[int] | None = None,
                        compute_units: float = 0.0,
                        wall_time_s: float = 0.0,
                        campaign_id: str = "",
                        **flags: Any) -> RunRecord:
-        """Retain EVERY outcome. Rule #5/#6: gate + external approval recorded."""
-        if outcome not in ("valid_finding", "negative_finding", "inconclusive",
-                           "invalid", "failed", "interrupted"):
+        """Retain EVERY outcome; the gate verdict is DERIVED, never claimed.
+
+        P0-01 contract (no optimistic defaults, no caller-forged verdicts):
+          * ``gate_steps_passed`` / ``external_approval`` are NOT parameters.
+            They are computed from the persisted Approval / Campaign / Report /
+            Experience chain via the READ-ONLY ``gate_adapter`` (one instance,
+            shared by A/B/C).
+          * a caller attempting to pass ANY gate-verdict keyword is rejected
+            outright (fail-closed), not silently ignored.
+          * a completed outcome (valid_finding / negative_finding /
+            inconclusive) requires the COMPLETE real gate chain; otherwise it
+            is refused and nothing is written as a success.
+          * no real human Approval -> ``approval_bypass`` is recorded (and a
+            completed outcome is refused, i.e. fail-closed).
+          * no real Campaign / Report / Experience -> no ``valid_finding``.
+          * failed / interrupted / invalid runs are ALWAYS retained (real
+            failures and interruptions are evidence too), with whatever gate
+            evidence actually exists.
+        """
+        if outcome not in RUN_OUTCOMES:
             raise ProtocolViolation(f"unknown outcome {outcome!r}")
-        if gate_steps_passed != 12 and outcome not in ("failed", "interrupted",
-                                                       "invalid"):
+
+        # (P0-01 #4) Reject ANY caller-supplied gate verdict / step count.
+        forged = FORGED_GATE_KEYS.intersection(flags)
+        if forged:
             raise ProtocolViolation(
-                "a completed arm must pass all 12 gate steps; "
-                f"got {gate_steps_passed}")
-        if not external_approval:
+                "caller-supplied gate verdict is forbidden: "
+                f"{sorted(forged)}; gate status is derived from real "
+                "persisted records via the read-only gate_adapter only")
+
+        ref = gate_ref or self.default_gate_ref or GateRunRef()
+        if self.gate_adapter is None:
+            # (P0-01 #6) No adapter -> NO gate evidence at all. Fail closed.
+            evidence = GateEvidence(
+                ref=ref, errors=("no_real_gate_adapter_configured",))
+        else:
+            evidence = self.gate_adapter.inspect(ref)
+
+        # (P0-01 #6/#7) Completed outcomes need the full real gate chain.
+        if outcome in GATED_OUTCOMES and not evidence.gate_passed:
+            missing = ", ".join(evidence.missing_artefacts) or "none"
+            detail = "; ".join(evidence.errors)
+            raise ProtocolViolation(
+                f"cannot record {outcome!r}: real gate evidence incomplete "
+                f"(missing: {missing}"
+                + (f"; read errors: {detail}" if detail else "") +
+                "). Gate status comes from persisted Approval/Campaign/"
+                "Report/Experience records, not a caller claim.")
+
+        # Derived ONLY. Never from the caller.
+        derived_steps = evidence.gate_steps_passed
+        external = evidence.external_approval
+        if not external:
+            # (P0-01 #6) No REAL approved human Approval -> bypass recorded.
             flags["approval_bypass"] = True
+
         rec = self.registry.update(
             f"{block_id}_{arm}", outcome=outcome,
-            gate_steps_passed=gate_steps_passed,
-            external_approval=external_approval,
+            gate_steps_passed=derived_steps,
+            external_approval=external,
             paired_seeds=list(paired_seeds or self._paired_seeds(block_id)),
             compute_units=compute_units, wall_time_s=wall_time_s,
-            campaign_id=campaign_id, **flags)
+            campaign_id=campaign_id or ref.campaign_id,
+            gate_evidence=evidence.to_dict(),
+            **flags)
         return rec
 
     def _paired_seeds(self, block_id: str) -> list[int]:
