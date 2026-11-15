@@ -19,7 +19,7 @@ from research_runtime.discovery_context_provider import DiscoverySnapshot
 from research_runtime.objective_candidate_generator import (
     ObjectiveCandidate, ObjectiveCandidateGenerator,
 )
-from research_runtime.objective_critic import ObjectiveCritic
+from research_runtime.objective_critic import ObjectiveCritic, _resolve_ref
 from research_runtime.objective_discovery import ObjectiveDiscovery
 from research_runtime.objective_ranker import RANKER_VERSION, ObjectiveRanker
 from research_runtime.research_store import ResearchStores
@@ -306,4 +306,67 @@ def _noop_store():
     from pathlib import Path
     path = Path(tempfile.mkdtemp()) / "noop.sqlite"
     return ResearchStores(path).objectives
+
+
+# --------------------------------------------------------------------- P2: evidence ref verification hardening (M4-E2E-01.1)
+def test_experience_ref_resolves_to_specific_experience():
+    """P2: ``experience:<id>`` must verify a SPECIFIC recorded Experience."""
+    critic = ObjectiveCritic()
+    snap = _make_experience_snapshot("r_p2", with_experience=True)
+    # The recorded Experience is bound to session 's_round1'.
+    assert _resolve_ref("experience:s_round1", snap) is True
+    # A fabricated id must NOT resolve -- no specific Experience exists for it.
+    assert _resolve_ref("experience:does_not_exist", snap) is False
+
+    good = ObjectiveCandidate(
+        candidate_id="cand_exp", domain="scinet",
+        description="refine from recorded experience",
+        evidence_refs=["experience:s_round1"],
+        source_objective_ids=[], hypothesis_hint="h",
+        proposed_intervention={"axis": "x"},
+        success_criteria={"criterion": "improve", "measurable": True},
+        budget={"max_campaign_rounds": 1}, provenance={},
+        generation_source="historical_experience")
+    passed, errors = critic.critique(good, snapshot=snap)
+    assert passed is True, errors
+
+    # A candidate citing a fabricated experience id is rejected as unverifiable.
+    bad = ObjectiveCandidate(
+        candidate_id="cand_exp_bad", domain="scinet",
+        description="refine from recorded experience",
+        evidence_refs=["experience:does_not_exist"],
+        source_objective_ids=[], hypothesis_hint="h",
+        proposed_intervention={"axis": "x"},
+        success_criteria={"criterion": "improve", "measurable": True},
+        budget={"max_campaign_rounds": 1}, provenance={},
+        generation_source="historical_experience")
+    passed2, errors2 = critic.critique(bad, snapshot=snap)
+    assert passed2 is False
+    assert any("resolv" in e.lower() for e in errors2)
+
+
+def test_domain_ood_ref_resolves_to_exact_version():
+    """P2: ``domain:<d>:ood_dataset_version:<v>`` must match the EXACT version."""
+    critic = ObjectiveCritic()
+    snap = _make_snapshot()  # provenance.domains.scinet.ood_dataset_version = ood_v2
+
+    # Exact version resolves; a wrong/fabricated version does NOT.
+    assert _resolve_ref("domain:scinet:ood_dataset_version:ood_v2", snap) is True
+    assert _resolve_ref("domain:scinet:ood_dataset_version:ood_v9", snap) is False
+    assert _resolve_ref("domain:other:ood_dataset_version:ood_v2", snap) is False
+
+    # An OOD candidate citing the WRONG version has insufficient evidence and is
+    # rejected (its only ref fails to resolve), never silently accepted.
+    bad = ObjectiveCandidate(
+        candidate_id="cand_ood_bad", domain="scinet",
+        description="close the ood generalisation gap",
+        evidence_refs=["domain:scinet:ood_dataset_version:ood_v9"],
+        source_objective_ids=[], hypothesis_hint="h",
+        proposed_intervention={"axis": "x"},
+        success_criteria={"criterion": "reduce ood gap", "measurable": True},
+        budget={"max_campaign_rounds": 1}, provenance={},
+        generation_source="id_ood_gap")
+    passed, errors = critic.critique(bad, snapshot=snap)
+    assert passed is False
+    assert any("resolv" in e.lower() for e in errors)
 

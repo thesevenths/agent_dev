@@ -45,10 +45,23 @@ def _resolve_ref(ref: str, snapshot: DiscoverySnapshot) -> bool:
                (snapshot.evidence_view or {}).get("evidence", [])}
         return ref in ids
     if prefix == "domain:":
-        # domain:<name>:... -> provenance.domains must contain <name>
+        # domain:<name>[:ood_dataset_version:<v>] -> provenance.domains must
+        # contain <name> AND, when a version is specified, it must MATCH exactly.
         parts = ref.split(":")
-        return parts[1] in (snapshot.evidence_view or {}).get(
+        if len(parts) < 2:
+            return False
+        name = parts[1]
+        domains = (snapshot.evidence_view or {}).get(
             "provenance", {}).get("domains", {})
+        if name not in domains:
+            return False
+        if len(parts) == 2:
+            return True
+        # domain:<name>:ood_dataset_version:<v> -> verify the EXACT version so a
+        # fabricated or stale ood_dataset_version cannot masquerade as real.
+        if len(parts) >= 4 and parts[2] == "ood_dataset_version":
+            return str(domains[name].get("ood_dataset_version")) == parts[3]
+        return False
     if prefix in ("session:", "objective:"):
         ids = set()
         for s in snapshot.sessions:
@@ -62,12 +75,17 @@ def _resolve_ref(ref: str, snapshot: DiscoverySnapshot) -> bool:
             ref.startswith(f"{prefix}:{i}:") or ref == f"{prefix}:{i}"
             for i in ids if i)
     if prefix == "experience:":
-        # An experience ref resolves only if a real Experience is recorded.
-        for s in snapshot.sessions:
-            if s.get("experience_available"):
-                return True
-        for lst in (snapshot.sessions_by_objective or {}).values():
-            if any(s.get("experience_available") for s in lst):
+        # A SPECIFIC Experience id (session_id or objective_id) must resolve to a
+        # real, non-empty Experience record. "Some experience exists somewhere"
+        # is NOT sufficient -- a fabricated id must not verify.
+        rid = ref[len(prefix):]
+        if not rid:
+            return False
+        for s in (snapshot.sessions or []):
+            sid = s.get("session_id") or ""
+            oid = s.get("objective_id") or ""
+            exp = s.get("experience") or []
+            if (rid == sid or rid == oid) and exp:
                 return True
         return False
     return False
