@@ -20,6 +20,9 @@ drives the REAL engine unchanged. Run it manually:
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +32,8 @@ from research_runtime.research_director import ResearchDirector
 from research_runtime.research_environment import build_default_research_service
 from research_runtime.settings import DEFAULT_SCINET_DIR
 from research_runtime.research_store import ResearchStores
+
+ROOT = Path(__file__).resolve().parents[2]
 
 # ---- gating ---------------------------------------------------------------
 _SCIENT_PRESENT = bool(DEFAULT_SCINET_DIR) and os.path.isdir(str(DEFAULT_SCINET_DIR))
@@ -64,8 +69,8 @@ def _make_snapshot(run_id: str) -> DiscoverySnapshot:
 
 def test_real_engine_full_chain_writes_experience(tmp_path):
     # REAL service: real SciNet++ adapter / runner / comparator (no fakes).
-    service = build_default_research_service(
-        "scinet", db_path=tmp_path / "research.sqlite")
+    db_path = tmp_path / "research.sqlite"
+    service = build_default_research_service("scinet", db_path=db_path)
 
     # Discovery on a real-shaped snapshot -> a Proposed Objective.
     store = ResearchStores(tmp_path / "objectives.sqlite")
@@ -80,12 +85,18 @@ def test_real_engine_full_chain_writes_experience(tmp_path):
         state_dir=tmp_path / "director", objective_id=oid,
         source_experiment_id="exp_baseline")
 
-    # Human grant is applied OUT OF BAND (a genuine store write, exactly what the
-    # approval_cli console does). The Director never grants for itself.
+    # The Director reaches the AWAITING_APPROVAL gate but NEVER grants for itself
+    # (P0 closure). The human grant is applied OUT OF BAND by the SEPARATE
+    # approval_cli process -- exactly the path a human operator uses. It is the
+    # ONLY way to write source="human"; the engine/subprocess boundary is tested,
+    # not just the Director boundary.
     director.run_to_awaiting_approval()
-    service.stores.approvals.grant(
-        director.context.approval_id, approved_by="alice", source="human",
-        current_resource_sha256=director.context.plan_sha256)
+    grant = subprocess.run(
+        [sys.executable, "-m", "research_runtime.research_store.approval_cli",
+         "--db", str(db_path), "grant", director.context.approval_id,
+         "--approved-by", "alice", "--yes"],
+        cwd=str(ROOT), capture_output=True, text=True)
+    assert grant.returncode == 0, grant.stderr
     final = director.run_to_completion()
     assert final["state"] == "COMPLETED"
 
