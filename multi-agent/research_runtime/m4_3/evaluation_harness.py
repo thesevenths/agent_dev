@@ -36,6 +36,7 @@ Pilot or Confirmatory runs by itself.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from .experiment_registry import (
@@ -166,7 +167,9 @@ class EvaluationHarness:
                  blinding: BlindingLedger | None = None,
                  objective_selector: Callable[[ArmContext], dict[str, Any]] | None = None,
                  gate_adapter: GateAdapter | None = None,
-                 default_gate_ref: GateRunRef | None = None):
+                 default_gate_ref: GateRunRef | None = None,
+                 db_path: str | Path | None = None, db: Any = None,
+                 store: Any = None, registry: ExperimentRegistry | None = None):
         # P0-02: a Pilot defaults to >= 2 independent blind human reviewers.
         # A single ``reviewer`` is accepted for engine-free contract tests, but
         # ``assert_pilot_review_ready()`` refuses to start without >= 2.
@@ -177,7 +180,10 @@ class EvaluationHarness:
         self.reviewer = reviewer
         self.review_panel = review_panel
         self.blinding = blinding or BlindingLedger()
-        self.registry = ExperimentRegistry(protocol=protocol)
+        # P0-03: optional durable registry (ARR SQLite). ``registry`` lets a
+        # recovered registry be injected directly.
+        self.registry = registry or ExperimentRegistry(
+            protocol=protocol, store=store, db_path=db_path, db=db)
         self.protocol = protocol
         self.objective_selector = objective_selector
         # ONE adapter shared by A/B/C -> the SAME ResearchService entry point.
@@ -186,6 +192,30 @@ class EvaluationHarness:
         self._primary_frozen = tuple(protocol.primary_metrics)
         self._contexts: dict[str, dict[str, ArmContext]] = {}
         self._blocks_finalized: set[str] = set()
+
+    @classmethod
+    def recover(cls, *, protocol: FrozenProtocol,
+                db_path: str | Path | None = None, db: Any = None,
+                reviewer: IndependentReviewer | None = None,
+                gate_adapter: GateAdapter | None = None,
+                default_gate_ref: GateRunRef | None = None
+                ) -> EvaluationHarness:
+        """P0-03: rebuild the harness after a process restart."""
+        reg = ExperimentRegistry.recover(
+            protocol=protocol, db_path=db_path, db=db)
+        return cls(protocol=protocol, reviewer=reviewer or IndependentReviewer(
+            reviewer_id="recovered_reviewer",
+            scorer=lambda _b: {d: 0 for d in
+                               frozen_metric_contract()["rubric_dimensions"]}
+            | {"reason": "recovered; no new review"}),
+            registry=reg, gate_adapter=gate_adapter,
+            default_gate_ref=default_gate_ref)
+
+    def export(self) -> dict[str, Any]:
+        return self.registry.export()
+
+    def verify_integrity(self) -> bool:
+        return self.registry.verify_integrity()
 
     # ------------------------------------------------- P0-02 pilot review gate
     def assert_pilot_review_ready(self) -> None:
@@ -210,7 +240,15 @@ class EvaluationHarness:
             raise ProtocolViolation(f"block {spec.block_id!r} already added")
         self.registry.create_block(
             block_id=spec.block_id, snapshot_id=spec.snapshot_id,
-            seed=spec.seed)
+            seed=spec.seed,
+            snapshot={"block_id": spec.block_id,
+                      "snapshot_id": spec.snapshot_id, "seed": spec.seed,
+                      "current_evidence": spec.current_evidence,
+                      # P1-02: history is separated by EXPLICIT ID sets; the
+                      # snapshot SHA covers the shared opportunity only.
+                      "historical_experience": spec.historical_experience,
+                      "historical_evidence": spec.historical_evidence,
+                      "historical_failure": spec.historical_failure})
         contexts: dict[str, ArmContext] = {}
         # Rule #1/#3/#4: identical snapshot, seed, budgets for every arm.
         # Rule #2: a BlockSpec describes ONE shared research opportunity, but
@@ -284,6 +322,7 @@ class EvaluationHarness:
         automated = [r for r in reviews if not r.is_human_blind]
         for r in reviews:
             self.blinding.record_review(r)   # append-only, never overwritten
+            self.registry.record_review(r.to_dict())   # P0-03 durable
         if not human:
             raise ProtocolViolation(
                 "at least one independent human blind review is required")
@@ -358,15 +397,29 @@ class EvaluationHarness:
             # (P0-01 #6) No REAL approved human Approval -> bypass recorded.
             flags["approval_bypass"] = True
 
-        rec = self.registry.update(
+        # (P0-03 #6) Persist ALL trusted IDs from the real gate evidence, plus
+        # the frozen Protocol / Snapshot SHA, so an exported registry is
+        # self-contained. Experience ID comes from the persisted Experience
+        # refs, never from a caller claim.
+        exp_refs = evidence.report_experience_refs
+        rec = self.registry.finalize(
             f"{block_id}_{arm}", outcome=outcome,
             gate_steps_passed=derived_steps,
             external_approval=external,
             paired_seeds=list(paired_seeds or self._paired_seeds(block_id)),
             compute_units=compute_units, wall_time_s=wall_time_s,
             campaign_id=campaign_id or ref.campaign_id,
+            plan_id=ref.plan_id, approval_id=ref.approval_id,
+            report_id=ref.report_id,
+            experience_id=(exp_refs[0] if exp_refs else ""),
             gate_evidence=evidence.to_dict(),
             **flags)
+        if outcome in ("failed", "interrupted", "invalid"):
+            # (P0-03 #9) REAL failure / interruption is retained as an event.
+            self.registry.append_event(
+                scope=f"run:{rec.run_id}", event_type=outcome,
+                payload={"outcome": outcome, "block_id": block_id, "arm": arm,
+                         "campaign_id": rec.campaign_id})
         return rec
 
     def _paired_seeds(self, block_id: str) -> list[int]:

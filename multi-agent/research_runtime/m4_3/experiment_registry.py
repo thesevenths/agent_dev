@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .metrics import ALL_METRICS, PRIMARY_METRICS, frozen_metric_contract
@@ -118,6 +119,18 @@ class RunRecord:
     arm: str
     outcome: str = "interrupted"          # RUN_OUTCOMES
     objective_id: str = ""
+    # ---------------------------------------------------------------- P0-03
+    # All trusted IDs + frozen hashes are persisted so an exported registry is
+    # self-contained and verifiable after a restart.
+    plan_id: str = ""
+    approval_id: str = ""
+    campaign_id: str = ""
+    report_id: str = ""
+    experience_id: str = ""
+    protocol_sha256: str = ""
+    snapshot_sha256: str = ""
+    finalized: bool = False
+    finalized_at: str = ""
     # objective-quality evidence (P0-02 independent BLIND review)
     evidence_refs: list[str] = field(default_factory=list)
     # opaque review_id only; the raw objective_id -> arm mapping is SEALED in
@@ -132,7 +145,6 @@ class RunRecord:
     gate_steps_passed: int = 0
     external_approval: bool = False
     gate_evidence: dict[str, Any] = field(default_factory=dict)
-    campaign_id: str = ""
     compute_units: float = 0.0
     wall_time_s: float = 0.0
     paired_seeds: list[int] = field(default_factory=list)
@@ -152,25 +164,42 @@ class RunRecord:
         return self.outcome == "valid_finding"
 
     @property
+    def is_finalized(self) -> bool:
+        return self.finalized
+
+    @property
     def objective_quality(self) -> float:
         return float(self.quality_review.get("total") or 0.0)
 
 
 class ExperimentRegistry:
-    """Append-only registry of blocked, paired A/B/C runs."""
+    """Registry of blocked, paired A/B/C runs with an append-only audit trail.
 
-    def __init__(self, *, protocol: FrozenProtocol):
+    P0-03: with ``store`` (or ``db_path``/``db``) the registry persists every
+    Block / Run / Review / Event into ARR's SQLite. ``update`` can NEVER
+    silently overwrite a FINALIZED run, a duplicate run is refused, and a
+    process restart recovers unfinished blocks via :meth:`recover`.
+    """
+
+    def __init__(self, *, protocol: FrozenProtocol, store: Any = None,
+                 db_path: str | Path | None = None, db: Any = None):
+        from .registry_store import RegistryStore
         self.protocol = protocol
         self.blocks: dict[str, Block] = {}
         self.runs: dict[str, RunRecord] = {}
         self._frozen_hash = protocol.freeze_sha256()
+        if store is None and (db_path is not None or db is not None):
+            store = RegistryStore(db=db, db_path=db_path)
+        self.store = store
+        self._snapshot_sha: dict[str, str] = {}
 
     @property
     def freeze_sha256(self) -> str:
         return self._frozen_hash
 
     # ------------------------------------------------------------- blocks
-    def create_block(self, *, block_id: str, snapshot_id: str, seed: int) -> Block:
+    def create_block(self, *, block_id: str, snapshot_id: str, seed: int,
+                     snapshot: Any = None) -> Block:
         if block_id in self.blocks:
             raise ValueError(f"block {block_id!r} already exists")
         if snapshot_id not in self.protocol.snapshot_ids:
@@ -180,6 +209,13 @@ class ExperimentRegistry:
                 raise ValueError(
                     f"snapshot {snapshot_id!r} is not in the frozen snapshot set")
         block = Block(block_id=block_id, snapshot_id=snapshot_id, seed=seed)
+        from .registry_store import snapshot_sha256
+        sha = snapshot_sha256(snapshot if snapshot is not None
+                              else {"snapshot_id": snapshot_id, "seed": seed})
+        self._snapshot_sha[block_id] = sha
+        if self.store is not None:
+            self.store.save_block(block, protocol_sha256=self._frozen_hash,
+                                  snapshot_sha256=sha)
         self.blocks[block_id] = block
         return block
 
@@ -200,23 +236,129 @@ class ExperimentRegistry:
             raise ValueError(f"unknown outcome {outcome!r}")
         rec = RunRecord(
             run_id=run_id, block_id=block_id,
-            snapshot_id=block.snapshot_id, seed=block.seed, arm=arm, **kwargs)
+            snapshot_id=block.snapshot_id, seed=block.seed, arm=arm,
+            protocol_sha256=self._frozen_hash,
+            snapshot_sha256=self._snapshot_sha.get(block_id, ""), **kwargs)
+        if self.store is not None:
+            self.store.save_run(rec, protocol_sha256=self._frozen_hash,
+                                snapshot_sha256=rec.snapshot_sha256)
         self.runs[run_id] = rec
         block.arms[arm] = run_id
         return rec
 
     def update(self, run_id: str, **changes: Any) -> RunRecord:
-        """Complete / amend a run. Outcomes are retained, never deleted."""
+        """Amend a NON-finalized run. A finalized run is IMMUTABLE (P0-03)."""
         rec = self.runs.get(run_id)
         if rec is None:
             raise ValueError(f"unknown run {run_id!r}")
+        if rec.finalized:
+            from .registry_store import RegistryConflict
+            raise RegistryConflict(
+                f"run {run_id!r} is finalized; completed runs cannot be "
+                "overwritten (append-only audit)")
         if "outcome" in changes and changes["outcome"] not in RUN_OUTCOMES:
             raise ValueError(f"unknown outcome {changes['outcome']!r}")
         for key, value in changes.items():
             if not hasattr(rec, key):
                 raise ValueError(f"unknown RunRecord field {key!r}")
             setattr(rec, key, value)
+        if self.store is not None:
+            self.store.update_run(rec, changes=changes)
         return rec
+
+    def finalize(self, run_id: str, **changes: Any) -> RunRecord:
+        """FINALIZE exactly once (record_outcome). No double execution."""
+        rec = self.runs.get(run_id)
+        if rec is None:
+            raise ValueError(f"unknown run {run_id!r}")
+        if rec.finalized:
+            from .registry_store import RegistryConflict
+            raise RegistryConflict(
+                f"run {run_id!r} already finalized; refusing a second outcome "
+                "(no duplicate campaign / no budget re-consumption)")
+        for key, value in changes.items():
+            if not hasattr(rec, key):
+                raise ValueError(f"unknown RunRecord field {key!r}")
+            setattr(rec, key, value)
+        rec.finalized = True
+        from datetime import datetime, timezone
+        rec.finalized_at = datetime.now(timezone.utc).isoformat(
+            timespec="seconds")
+        if self.store is not None:
+            self.store.finalize_run(rec, changes=changes)
+        return rec
+
+    def record_review(self, review: dict[str, Any]) -> None:
+        """Persist an independent review (append-only, never overwritten)."""
+        if self.store is not None:
+            self.store.save_review(review)
+
+    def append_event(self, *, scope: str, event_type: str,
+                     payload: dict[str, Any]) -> None:
+        """Record a REAL failure / interruption / recovery event."""
+        if self.store is not None:
+            self.store.append_event(scope=scope, event_type=event_type,
+                                    payload=payload)
+
+    # --------------------------------------------------- P0-03 recovery
+    @classmethod
+    def recover(cls, *, protocol: FrozenProtocol,
+                db_path: str | Path | None = None, db: Any = None,
+                store: Any = None) -> ExperimentRegistry:
+        """Rebuild a registry after a process restart (incl. incomplete blocks)."""
+        from .registry_store import RegistryStore
+        if store is None:
+            store = RegistryStore(db=db, db_path=db_path)
+        reg = cls(protocol=protocol, store=store)
+        for b in store.load_blocks():
+            reg.blocks[b["block_id"]] = Block(
+                block_id=b["block_id"], snapshot_id=b["snapshot_id"],
+                seed=int(b["seed"]),
+                arms={k: v for k, v in (b.get("arms") or {}).items()})
+            reg._snapshot_sha[b["block_id"]] = b.get("snapshot_sha256", "")
+        for d in store.load_runs():
+            known = {f for f in RunRecord.__dataclass_fields__}
+            rec = RunRecord(**{k: v for k, v in d.items() if k in known})
+            reg.runs[rec.run_id] = rec
+            if rec.block_id in reg.blocks:
+                reg.blocks[rec.block_id].arms[rec.arm] = rec.run_id
+        store.append_event(
+            scope="registry", event_type="registry_recovered",
+            payload={"n_blocks": len(reg.blocks), "n_runs": len(reg.runs),
+                     "protocol_sha256": reg._frozen_hash,
+                     "incomplete_blocks": reg.unfinished_blocks()})
+        return reg
+
+    def unfinished_blocks(self) -> list[str]:
+        """Blocks where at least one arm is NOT yet FINALIZED (P0-03 recovery).
+
+        ``complete_blocks()`` means "all three arms REGISTERED" (paired
+        analysis). Recovery needs the stronger notion: every arm has a final,
+        immutable outcome. A crash after registering all arms but before
+        finalizing them MUST still be recoverable.
+        """
+        out = []
+        for bid, block in self.blocks.items():
+            arms = [self.runs.get(rid) for rid in block.arms.values()]
+            if (len(arms) < len(ARMS)
+                    or any(r is None or not r.finalized for r in arms)):
+                out.append(bid)
+        return sorted(out)
+
+    def finalized_blocks(self) -> list[str]:
+        return sorted(bid for bid in self.blocks
+                      if bid not in self.unfinished_blocks())
+
+    # ------------------------------------------------------------ export
+    def export(self) -> dict[str, Any]:
+        if self.store is None:
+            return {"persisted": False, **self.to_dict()}
+        return {"persisted": True, **self.store.export()}
+
+    def verify_integrity(self) -> bool:
+        if self.store is None:
+            return False
+        return self.store.verify_integrity()
 
     # ------------------------------------------------------------ queries
     def runs_for_block(self, block_id: str) -> dict[str, RunRecord]:
