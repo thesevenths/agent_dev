@@ -715,15 +715,8 @@ class ResearchService:
                 plan_id, approval_id, scope="run_campaign")
             session = self._session(session_id, plan.objective_id)
 
-            existing = self.stores.sessions.campaign_for(
-                plan_id, approval_id, digest)
-            if existing is not None:
-                status = self.deps.runner_factory().get_status(existing.campaign_id)
-                return {"ok": True, "already_submitted": True,
-                        "campaign_id": existing.campaign_id,
-                        "status": status.get("status"), "summary": status.get("summary"),
-                        "note": "duplicate submission ignored; no new jobs were created"}
-
+            # Round cap must be enforced BEFORE any launch / re-launch, so a
+            # crashed-then-recovered run cannot silently consume extra budget.
             rounds = self.stores.sessions.campaigns_for_objective(plan.objective_id)
             if len(rounds) >= session.max_campaign_rounds:
                 raise ResearchGateError(
@@ -732,23 +725,55 @@ class ResearchService:
                     f"campaigns (cap={session.max_campaign_rounds}); propose a "
                     "new experiment only after an explicit human decision")
 
-            campaign_id = make_campaign_id(plan_id, approval_id, digest)
-            binding = CampaignBinding(
-                campaign_id=campaign_id, plan_id=plan_id, approval_id=approval_id,
-                plan_sha256=digest, objective_id=plan.objective_id,
-                session_id=session.session_id)
-            bound, created = self.stores.sessions.bind_campaign(binding)
-            if not created:
-                status = self.deps.runner_factory().get_status(bound.campaign_id)
-                return {"ok": True, "already_submitted": True,
-                        "campaign_id": bound.campaign_id,
-                        "status": status.get("status"), "summary": status.get("summary")}
+            existing = self.stores.sessions.campaign_for(
+                plan_id, approval_id, digest)
+            if existing is not None:
+                # A binding exists. Idempotent skip is ONLY correct when the
+                # campaign was ACTUALLY launched (a CampaignRecord is persisted).
+                # If the launch crashed before the runner wrote its record, the
+                # persisted binding is the execution INTENT: re-launch it exactly
+                # once -- never silently skip a run that never happened.
+                record = self.deps.campaign_store.load_campaign(
+                    existing.campaign_id)
+                if record is not None:
+                    status = self.deps.runner_factory().get_status(
+                        existing.campaign_id)
+                    return {"ok": True, "already_submitted": True,
+                            "campaign_id": existing.campaign_id,
+                            "status": status.get("status"),
+                            "summary": status.get("summary"),
+                            "note": ("duplicate submission ignored; no new jobs "
+                                     "were created")}
+                # Crashed-before-launch: reuse the SAME campaign id and re-launch.
+                campaign_id = existing.campaign_id
+            else:
+                campaign_id = make_campaign_id(plan_id, approval_id, digest)
+                binding = CampaignBinding(
+                    campaign_id=campaign_id, plan_id=plan_id,
+                    approval_id=approval_id, plan_sha256=digest,
+                    objective_id=plan.objective_id,
+                    session_id=session.session_id)
+                bound, created = self.stores.sessions.bind_campaign(binding)
+                if not created:
+                    # A concurrent caller already bound this triple. Reuse its id
+                    # and apply the SAME "record present => skip" rule.
+                    record = self.deps.campaign_store.load_campaign(
+                        bound.campaign_id)
+                    if record is not None:
+                        status = self.deps.runner_factory().get_status(
+                            bound.campaign_id)
+                        return {"ok": True, "already_submitted": True,
+                                "campaign_id": bound.campaign_id,
+                                "status": status.get("status"),
+                                "summary": status.get("summary")}
+                    campaign_id = bound.campaign_id
 
-            # Only NOW is approved_hypothesis_ids derived -- from the persisted,
-            # hash-bound Critic verdicts, never from an Agent tool argument.
+            # Persisted intent reached (binding present, no completed record):
+            # launch EXACTLY once. The campaign id is stable, so the runner
+            # dedups by it and a recovered run cannot double-execute.
             approved_ids = [c.hypothesis_id for c in plan.candidates]
             run_spec = CampaignRunSpec(
-                campaign_id=bound.campaign_id,
+                campaign_id=campaign_id,
                 objective_id=plan.objective_id, plan_id=plan_id,
                 baseline_config_path=self.domain.baseline_config_path,
                 dataset_version=plan.dataset_version,
@@ -759,20 +784,20 @@ class ResearchService:
                 max_total_seconds=self.domain.max_total_seconds,
                 approved_hypothesis_ids=approved_ids,
             )
-            session.link("campaign_ids", [bound.campaign_id])
+            session.link("campaign_ids", [campaign_id])
             session.status = "running"
             self.stores.sessions.save(
                 session, event_type="campaign_submitted",
-                payload={"campaign_id": bound.campaign_id,
+                payload={"campaign_id": campaign_id,
                          "plan_sha256": digest, "approval_id": approval_id,
                          "approved_hypothesis_ids": approved_ids})
             record = self.deps.runner_factory().run(plan, run_spec)
             self.stores.sessions.save(
                 session, event_type="campaign_finished",
-                payload={"campaign_id": bound.campaign_id,
+                payload={"campaign_id": campaign_id,
                          "status": record.status})
             return {
-                "ok": True, "campaign_id": bound.campaign_id,
+                "ok": True, "campaign_id": campaign_id,
                 "plan_id": plan_id, "approval_id": approval_id,
                 "plan_sha256": digest, "status": record.status,
                 "total_trials": len(record.trials),
