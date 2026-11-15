@@ -11,6 +11,24 @@ trustworthily -- NOT when a candidate scored better.
 
 Serial, seed-outer execution is enforced. Every state transition is written
 to SQLite with an append-only event before the corresponding engine call.
+
+M4.3-00 / P0-03 -- REAL execution semantics (statement of truth)
+-----------------------------------------------------------------
+Idempotency is enforced on the DETERMINISTIC job id (uuid5 of
+campaign_id:trial_id:stage), which is computed and PERSISTED (with the exact
+ExperimentSpec) BEFORE the engine submit -- see ``TrialRunner.execute``'s
+``train_spec_persisted`` / ``evaluation_spec_persisted`` events. On recovery an
+existence-based probe reuses that SAME id, and an engine whose primary key
+rejects duplicate ids is defence in depth. The failure window "job submitted
+but job-id event not yet written" is therefore CLOSED: the id is already on
+disk, so recovery re-waits / re-collects the same job instead of submitting a
+second training task. An UNDECIDABLE probe (engine unreachable) PAUSES the
+campaign rather than resubmitting.
+
+This guarantees AT-MOST-ONE SUBMISSION per deterministic job id and
+RESUME-IN-PLACE from persisted state. It does NOT claim strict exactly-once
+execution: submit and result collection are separated by a failure window, and
+the engine's own physical execution/dedup semantics are outside this layer.
 """
 from __future__ import annotations
 
@@ -264,12 +282,19 @@ class CampaignRunner:
             run_spec: CampaignRunSpec) -> CampaignRecord:
         existing = self.store.load_campaign(run_spec.campaign_id)
         if existing is not None:
-            if run_spec.resume:
+            # (M4.3-00 / P0-03 #3/#4/#5) An EXISTING record is NOT automatically
+            # "already submitted". Only a TERMINAL record is a genuine idempotent
+            # no-op. An in-flight record (preflighting / running / paused) is a
+            # crash-recovery request: RESUME from persisted state so no training
+            # job is ever submitted twice. Silently returning ``existing`` here
+            # used to discard an unfinished execution and could strand jobs.
+            terminal = existing.status in CAMPAIGN_TERMINAL_STATUSES
+            if run_spec.resume or not terminal:
                 return self.resume(run_spec.campaign_id)
             self.store.append_event(run_spec.campaign_id,
                                     "duplicate_run_ignored",
                                     payload={"plan_id": run_spec.plan_id})
-            return existing                      # idempotent, no new jobs
+            return existing                      # terminal: idempotent, no new jobs
 
         schedule = self._preflight(plan, run_spec)
         record = CampaignRecord(

@@ -60,6 +60,68 @@ from .schemas import (
 from . import llm_client
 
 
+# ---------------------------------------------------------------------------
+# Campaign execution state + REAL execution semantics (M4.3-00 / P0-03)
+# ---------------------------------------------------------------------------
+# A persisted CampaignRecord is NOT the same thing as "already submitted". Only
+# a TERMINAL record is a genuine idempotent no-op; an in-flight record is a
+# RECOVERY request that must resume from persisted state instead of re-launching.
+CAMPAIGN_STATE_NOT_STARTED = "not_started"      # binding exists, no record yet
+CAMPAIGN_STATE_PREFLIGHTING = "preflighting"    # record created, configs in progress
+CAMPAIGN_STATE_RUNNING = "running"              # execution entered, jobs in flight
+CAMPAIGN_STATE_PAUSED = "paused"                # recoverably halted
+CAMPAIGN_STATE_TERMINAL = "terminal"            # completed / failed / cancelled
+
+# States that MUST be recovered (never treated as a fresh submission).
+CAMPAIGN_RECOVERABLE_STATES = frozenset({
+    CAMPAIGN_STATE_PREFLIGHTING, CAMPAIGN_STATE_RUNNING, CAMPAIGN_STATE_PAUSED,
+})
+
+
+def classify_campaign_state(record: Any | None) -> str:
+    """Classify a persisted CampaignRecord WITHOUT executing anything.
+
+    Five distinct states (spec M4.3-00 / P0-03 #3/#4). An UNKNOWN status is
+    conservatively treated as an in-flight recoverable campaign: we never
+    silently re-submit an execution we cannot classify.
+    """
+    if record is None:
+        return CAMPAIGN_STATE_NOT_STARTED
+    status = str(getattr(record, "status", "") or "")
+    if status in CAMPAIGN_TERMINAL_STATUSES:
+        return CAMPAIGN_STATE_TERMINAL
+    if status == "paused":
+        return CAMPAIGN_STATE_PAUSED
+    if status in ("created", "preflighting"):
+        return CAMPAIGN_STATE_PREFLIGHTING
+    if status == "running":
+        return CAMPAIGN_STATE_RUNNING
+    return CAMPAIGN_STATE_RUNNING  # unknown -> fail-safe: recover, never re-submit
+
+
+# STATEMENT OF TRUTH -- deliberately NOT "strict exactly-once execution".
+# Idempotency is enforced at two levels:
+#   * Campaign level: UNIQUE(plan_id, approval_id, plan_sha256) maps a request
+#     to ONE binding / ONE stable campaign_id; repeated submissions never mint
+#     a second campaign.
+#   * Job level: a DETERMINISTIC job_id (uuid5 of campaign/trial/stage) is
+#     persisted BEFORE the engine submit ("persist before execute"). On recovery
+#     an existence-based probe reuses the SAME id; an engine whose primary key
+#     rejects duplicate ids is defence in depth; an undecidable probe PAUSES
+#     rather than resubmitting.
+# What this guarantees: AT-MOST-ONE SUBMISSION per deterministic job id and
+# RESUME-IN-PLACE from persisted state (re-wait / re-collect the same job),
+# never a fresh training job. What it does NOT guarantee: that the underlying
+# engine physically executed a job exactly once -- submit and result collection
+# are separated by a failure window, and the engine's own dedup semantics live
+# outside this layer. We therefore do NOT claim strict exactly-once execution.
+EXECUTION_SEMANTICS = (
+    "at-most-once submission per deterministic job id + resume-in-place from "
+    "persisted state; underlying engine execution count is not strictly "
+    "exactly-once and depends on the engine's own idempotency key enforcement"
+)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -710,43 +772,50 @@ class ResearchService:
 
     def _run_campaign(self, plan_id: str, approval_id: str,
                       session_id: str) -> dict[str, Any]:
+        """M4.3-00 / P0-03 -- launch-or-recover a campaign, fail-closed.
+
+        Decision is driven by the REAL persisted CampaignRecord state, not by
+        the mere existence of a binding:
+
+          * ``terminal``      -> a genuine idempotent no-op (``already_submitted``).
+          * ``not_started``   -> execution INTENT exists but no record was ever
+                                 written (crash before launch). Launch ONCE with
+                                 the stable campaign id; NEVER skip silently.
+          * ``preflighting`` / ``running`` / ``paused`` -> an IN-FLIGHT record.
+                                 This is a RECOVERY request, not a fresh submit:
+                                 set ``resume=True`` so the runner reconciles
+                                 from persisted state and reuses deterministic
+                                 job ids via an existence probe. We must NEVER
+                                 re-submit training jobs that were already
+                                 submitted, and must NOT report ``already_``
+                                 ``submitted`` for a run that is not finished.
+
+        The per-objective round cap is a cap on NEW campaign bindings. It is
+        enforced ONLY on the path that is about to CREATE a new binding. A
+        recovery / duplicate request for an EXISTING binding must never be
+        blocked as if it were a new campaign (the crashed run's binding is the
+        same round, not an extra one) -- this is the P0-03 #1/#2 regression.
+        """
         with self._run_lock:
             plan, stored, approval, digest = self._authorize(
                 plan_id, approval_id, scope="run_campaign")
             session = self._session(session_id, plan.objective_id)
 
-            # Round cap must be enforced BEFORE any launch / re-launch, so a
-            # crashed-then-recovered run cannot silently consume extra budget.
-            rounds = self.stores.sessions.campaigns_for_objective(plan.objective_id)
-            if len(rounds) >= session.max_campaign_rounds:
-                raise ResearchGateError(
-                    "round_limit_reached",
-                    f"objective {plan.objective_id!r} already has {len(rounds)} "
-                    f"campaigns (cap={session.max_campaign_rounds}); propose a "
-                    "new experiment only after an explicit human decision")
-
             existing = self.stores.sessions.campaign_for(
                 plan_id, approval_id, digest)
-            if existing is not None:
-                # A binding exists. Idempotent skip is ONLY correct when the
-                # campaign was ACTUALLY launched (a CampaignRecord is persisted).
-                # If the launch crashed before the runner wrote its record, the
-                # persisted binding is the execution INTENT: re-launch it exactly
-                # once -- never silently skip a run that never happened.
-                record = self.deps.campaign_store.load_campaign(
-                    existing.campaign_id)
-                if record is not None:
-                    status = self.deps.runner_factory().get_status(
-                        existing.campaign_id)
-                    return {"ok": True, "already_submitted": True,
-                            "campaign_id": existing.campaign_id,
-                            "status": status.get("status"),
-                            "summary": status.get("summary"),
-                            "note": ("duplicate submission ignored; no new jobs "
-                                     "were created")}
-                # Crashed-before-launch: reuse the SAME campaign id and re-launch.
-                campaign_id = existing.campaign_id
-            else:
+
+            if existing is None:
+                # (M4.3-00 / P0-03 #1/#2) round cap: NEW BINDING ONLY. A request
+                # whose binding already exists (recovery / duplicate) never
+                # consumes a new round and must not be blocked here.
+                rounds = self.stores.sessions.campaigns_for_objective(
+                    plan.objective_id)
+                if len(rounds) >= session.max_campaign_rounds:
+                    raise ResearchGateError(
+                        "round_limit_reached",
+                        f"objective {plan.objective_id!r} already has {len(rounds)} "
+                        f"campaigns (cap={session.max_campaign_rounds}); propose a "
+                        "new experiment only after an explicit human decision")
                 campaign_id = make_campaign_id(plan_id, approval_id, digest)
                 binding = CampaignBinding(
                     campaign_id=campaign_id, plan_id=plan_id,
@@ -754,23 +823,33 @@ class ResearchService:
                     objective_id=plan.objective_id,
                     session_id=session.session_id)
                 bound, created = self.stores.sessions.bind_campaign(binding)
-                if not created:
-                    # A concurrent caller already bound this triple. Reuse its id
-                    # and apply the SAME "record present => skip" rule.
-                    record = self.deps.campaign_store.load_campaign(
-                        bound.campaign_id)
-                    if record is not None:
-                        status = self.deps.runner_factory().get_status(
-                            bound.campaign_id)
-                        return {"ok": True, "already_submitted": True,
-                                "campaign_id": bound.campaign_id,
-                                "status": status.get("status"),
-                                "summary": status.get("summary")}
-                    campaign_id = bound.campaign_id
+                # A concurrent caller may have bound the same triple first;
+                # reuse its id either way (still ONE binding, ONE campaign).
+                campaign_id = bound.campaign_id
+            else:
+                campaign_id = existing.campaign_id
 
-            # Persisted intent reached (binding present, no completed record):
-            # launch EXACTLY once. The campaign id is stable, so the runner
-            # dedups by it and a recovered run cannot double-execute.
+            # (M4.3-00 / P0-03 #3/#4) classify the REAL persisted state.
+            record = self.deps.campaign_store.load_campaign(campaign_id)
+            state = classify_campaign_state(record)
+
+            if state == CAMPAIGN_STATE_TERMINAL:
+                # ONLY a terminal record is a true idempotent no-op.
+                status = self.deps.runner_factory().get_status(campaign_id)
+                return {"ok": True, "already_submitted": True,
+                        "campaign_id": campaign_id,
+                        "campaign_state": state,
+                        "status": status.get("status"),
+                        "summary": status.get("summary"),
+                        "note": ("duplicate submission ignored; campaign is "
+                                 "terminal and no new jobs were created")}
+
+            # (M4.3-00 / P0-03 #5/#6) In-flight states are RECOVERED, never
+            # freshly submitted. ``resume=True`` makes the existing runner
+            # re-verify config identity and reuse persisted, deterministic job
+            # ids via an existence probe -- so recovery cannot double-submit
+            # training tasks or silently consume extra budget.
+            resume = state in CAMPAIGN_RECOVERABLE_STATES
             approved_ids = [c.hypothesis_id for c in plan.candidates]
             run_spec = CampaignRunSpec(
                 campaign_id=campaign_id,
@@ -783,29 +862,39 @@ class ResearchService:
                 max_jobs=self.domain.max_jobs,
                 max_total_seconds=self.domain.max_total_seconds,
                 approved_hypothesis_ids=approved_ids,
+                resume=resume,
             )
             session.link("campaign_ids", [campaign_id])
             session.status = "running"
             self.stores.sessions.save(
-                session, event_type="campaign_submitted",
+                session,
+                event_type=("campaign_recovered" if resume
+                            else "campaign_submitted"),
                 payload={"campaign_id": campaign_id,
                          "plan_sha256": digest, "approval_id": approval_id,
-                         "approved_hypothesis_ids": approved_ids})
-            record = self.deps.runner_factory().run(plan, run_spec)
+                         "approved_hypothesis_ids": approved_ids,
+                         "campaign_state": state, "resume": resume,
+                         "execution_semantics": EXECUTION_SEMANTICS})
+            result = self.deps.runner_factory().run(plan, run_spec)
             self.stores.sessions.save(
                 session, event_type="campaign_finished",
                 payload={"campaign_id": campaign_id,
-                         "status": record.status})
+                         "status": result.status})
             return {
                 "ok": True, "campaign_id": campaign_id,
                 "plan_id": plan_id, "approval_id": approval_id,
-                "plan_sha256": digest, "status": record.status,
-                "total_trials": len(record.trials),
-                "succeeded_trials": record.completed_trials,
-                "dataset_version": record.dataset_version,
-                "evaluation_split": record.evaluation_split,
+                "plan_sha256": digest, "status": result.status,
+                "campaign_state": state,
+                "recovered": resume,
+                "already_submitted": False,
+                "total_trials": len(result.trials),
+                "succeeded_trials": result.completed_trials,
+                "dataset_version": result.dataset_version,
+                "evaluation_split": result.evaluation_split,
+                "execution_semantics": EXECUTION_SEMANTICS,
                 "note": ("campaign executed by the existing P1-04 CampaignRunner; "
-                         "no comparison, promotion or frozen-test evaluation here"),
+                         "recovery resumes from persisted state; no comparison, "
+                         "promotion or frozen-test evaluation here"),
             }
 
     def get_campaign_status(self, *, campaign_id: str) -> dict[str, Any]:
