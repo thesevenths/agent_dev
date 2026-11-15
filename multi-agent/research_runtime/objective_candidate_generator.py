@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .discovery_context_provider import DiscoverySnapshot
+from .schemas import RESERVED_FINAL_SPLITS
 
 # Raw verdict strings (kept verbatim by the read model) that signal a direction
 # worth re-investigating. We never recompute a verdict, only recognise a stored
@@ -83,6 +85,119 @@ def parse_failure_ref(ref: str) -> tuple[str, str, str | None] | None:
             and parts[1] and parts[3]):              # event ref
         return (scope, parts[1], parts[3])
     return None
+
+
+# ---------------------------------------------------------------------------
+# Comparable ID/OOD metric evidence contract (M4.3-00 / P0-02)
+# ---------------------------------------------------------------------------
+# The MERE PRESENCE of ``provenance.domains[d].ood_dataset_version`` is metadata
+# about a dataset, NOT evidence that an ID/OOD generalisation GAP exists. A
+# "close the gap" claim is only legitimate when the Evidence View carries a
+# REAL, COMPARABLE ID/OOD metric record, i.e. two measurements that are
+# comparable along ALL FOUR identity dimensions:
+#   * domain                 -- the same domain as the claim
+#   * dataset version       -- a real ID version AND a declared OOD version,
+#                              distinct, with the OOD version matching the
+#                              domain's declared version
+#   * metric identity       -- ID and OOD measured on the SAME metric
+#   * evaluation split      -- ID and OOD measured on the SAME split, and that
+#                              split must NOT be a frozen/final split
+# The record must also trace back to at least one REAL evidence entity. No
+# verdict is recomputed here: we only READ stored measurements. Framework-
+# agnostic by construction -- no domain name, metric name or split name is
+# hardcoded; reserved final splits may be extended by the Evidence View.
+ID_OOD_METRICS_KEY = "id_ood_comparable_metrics"
+ID_OOD_METRIC_REF_PREFIX = "id_ood_metric:"
+
+
+def _finite_number(value: Any) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)))
+
+
+def _reserved_final_splits(snapshot: DiscoverySnapshot) -> set[str]:
+    """Global reserved splits + any declared by this Evidence View (generic)."""
+    extra = (snapshot.evidence_view or {}).get("reserved_final_splits") or []
+    return {str(s).lower() for s in RESERVED_FINAL_SPLITS} | {
+        str(s).lower() for s in extra}
+
+
+def comparable_id_ood_records(snapshot: DiscoverySnapshot,
+                              domain: str) -> list[dict[str, Any]]:
+    """Return ONLY the real, comparable ID/OOD metric records for ``domain``.
+
+    A record survives iff it passes every identity/grounding check. Rejected
+    records (version mismatch, metric mismatch, split mismatch, frozen split,
+    non-finite/absent values, untraceable evidence) never produce a gap claim.
+    """
+    view = snapshot.evidence_view or {}
+    domains = (view.get("provenance") or {}).get("domains") or {}
+    declared_ood = str((domains.get(domain) or {}).get("ood_dataset_version") or "")
+    if not declared_ood:
+        return []
+    entity_ids = {str(e.get("evidence_id") or "")
+                  for e in (view.get("evidence") or [])}
+    entity_ids.discard("")
+    reserved = _reserved_final_splits(snapshot)
+
+    out: list[dict[str, Any]] = []
+    for rec in view.get(ID_OOD_METRICS_KEY) or []:
+        if not isinstance(rec, dict):
+            continue
+        # (1) domain identity
+        if str(rec.get("domain") or "") != domain:
+            continue
+        # (2) dataset version identity: distinct ID/OOD, OOD == declared
+        id_ver = str(rec.get("id_dataset_version") or "")
+        ood_ver = str(rec.get("ood_dataset_version") or "")
+        if not id_ver or not ood_ver or id_ver == ood_ver or ood_ver != declared_ood:
+            continue
+        # (3) metric identity: one and the SAME metric on both sides
+        id_metric = str(rec.get("id_metric") or "")
+        ood_metric = str(rec.get("ood_metric") or "")
+        if not id_metric or id_metric != ood_metric:
+            continue
+        # (4) evaluation split identity: same split, never a frozen/final split
+        id_split = str(rec.get("id_evaluation_split") or "")
+        ood_split = str(rec.get("ood_evaluation_split") or "")
+        if (not id_split or id_split != ood_split
+                or id_split.lower() in reserved):
+            continue
+        # Real numeric measurements, not fabricated placeholders.
+        if not (_finite_number(rec.get("id_value"))
+                and _finite_number(rec.get("ood_value"))):
+            continue
+        # Traceability to REAL evidence entities (no synthetic grounding).
+        refs = [str(x) for x in (rec.get("evidence_ids") or []) if str(x)]
+        if not refs or not all(r in entity_ids for r in refs):
+            continue
+        out.append(rec)
+    return out
+
+
+def make_id_ood_metric_ref(rec: dict[str, Any]) -> str:
+    """Canonical ref for ONE comparable record (domain:metric:split:versions)."""
+    return (f"{ID_OOD_METRIC_REF_PREFIX}"
+            f"{rec.get('domain')}:{rec.get('id_metric')}:"
+            f"{rec.get('id_evaluation_split')}:"
+            f"{rec.get('id_dataset_version')}:{rec.get('ood_dataset_version')}")
+
+
+def resolve_id_ood_metric_ref(ref: str, snapshot: DiscoverySnapshot) -> bool:
+    """A gap-metric ref resolves ONLY to a real, comparable record."""
+    if not ref.startswith(ID_OOD_METRIC_REF_PREFIX):
+        return False
+    parts = ref.split(":")
+    if len(parts) != 6 or not all(parts[1:]):       # prefix + 5 identity parts
+        return False
+    domain, metric, split, id_ver, ood_ver = parts[1:]
+    for rec in comparable_id_ood_records(snapshot, domain):
+        if (str(rec.get("id_metric")) == metric
+                and str(rec.get("id_evaluation_split")) == split
+                and str(rec.get("id_dataset_version")) == id_ver
+                and str(rec.get("ood_dataset_version")) == ood_ver):
+            return True
+    return False
 
 
 def _short_hash(text: str) -> str:
@@ -227,9 +342,18 @@ class ObjectiveCandidateGenerator:
             ))
         return out
 
-    # -- source 2: ID / OOD performance gap -----------------------------
+    # -- source 2: ID / OOD gap (M4.3-00 / P0-02) ------------------------
     def _from_ood_gaps(self, snapshot: DiscoverySnapshot
                        ) -> list[ObjectiveCandidate]:
+        """A "close the gap" claim requires REAL comparable ID/OOD metrics.
+
+        M4.3-00 / P0-02: a declared ``ood_dataset_version`` is metadata, NOT a
+        measured gap. Only a record that passes ALL FOUR identity checks
+        (domain / dataset version / metric identity / evaluation split, on a
+        NON-frozen split and traced to real evidence) may produce a gap claim.
+        When only the version exists, we emit an EXPLORATORY candidate that is
+        explicitly marked ``evidence_insufficient`` and never asserts a gap.
+        """
         out: list[ObjectiveCandidate] = []
         domains = (snapshot.evidence_view or {}).get("provenance", {}).get("domains", {})
         for dname in sorted(domains):
@@ -237,40 +361,108 @@ class ObjectiveCandidateGenerator:
             ood_version = d.get("ood_dataset_version")
             if not ood_version:
                 continue
-            cid = _candidate_id("ood_gap", dname)
-            ref = f"domain:{dname}:ood_dataset_version:{ood_version}"
-            out.append(ObjectiveCandidate(
-                candidate_id=cid,
-                domain=self.domain,
-                description=(
-                    f"Close the ID/OOD generalisation gap for domain '{dname}' "
-                    f"(OOD dataset {ood_version})."),
-                evidence_refs=[ref],
-                source_objective_ids=list(o.get("objective_id")
-                                          for o in snapshot.objectives),
-                hypothesis_hint=(
-                    "A degraded OOD metric implies the ID-trained model does not "
-                    "generalise; hypothesize a robustness/regularisation change "
-                    "and test it on the OOD split (held-out, never the frozen "
-                    "final split)."),
-                proposed_intervention={
-                    "axis": "generalisation_robustness",
-                    "rationale": f"improve OOD generalisation for {dname}",
-                },
-                success_criteria={
-                    "criterion": f"reduce OOD gap for {dname} on held-out split",
-                    "measurable": True,
-                    "basis_provenance": ref,
-                },
-                budget=dict(self.default_budget),
-                provenance={
-                    "generation_source": "id_ood_gap",
-                    "domain": dname,
-                    "ood_dataset_version": ood_version,
-                    "snapshot_run_id": snapshot.run_id,
-                },
-                generation_source="id_ood_gap",
-            ))
+            source_objectives = list(o.get("objective_id")
+                                     for o in snapshot.objectives)
+            records = comparable_id_ood_records(snapshot, dname)
+
+            if records:
+                # REAL comparable measurements exist -> a grounded gap claim.
+                # No verdict is recomputed: we cite the stored measurements.
+                for rec in records:
+                    ref = make_id_ood_metric_ref(rec)
+                    meta_ref = f"domain:{dname}:ood_dataset_version:{ood_version}"
+                    cid = _candidate_id("ood_gap", ref)
+                    out.append(ObjectiveCandidate(
+                        candidate_id=cid,
+                        domain=self.domain,
+                        description=(
+                            f"Investigate and reduce the measured ID/OOD "
+                            f"generalisation gap for domain '{dname}' "
+                            f"(metric {rec['id_metric']} on split "
+                            f"{rec['id_evaluation_split']}; OOD dataset "
+                            f"{ood_version})."),
+                        evidence_refs=[ref, meta_ref],
+                        source_objective_ids=source_objectives,
+                        hypothesis_hint=(
+                            "Comparable ID/OOD measurements are recorded on the "
+                            "same metric and the same non-frozen split; form a "
+                            "falsifiable hypothesis for a robustness/regularisation "
+                            "change and re-measure BOTH sides on that same split. "
+                            "Do not use the frozen final split for selection."),
+                        proposed_intervention={
+                            "axis": "generalisation_robustness",
+                            "rationale": (
+                                f"reduce measured ID/OOD gap for {dname} on "
+                                f"{rec['id_evaluation_split']}"),
+                        },
+                        success_criteria={
+                            "criterion": (
+                                f"reduce {rec['id_metric']} gap for {dname} "
+                                f"on {rec['id_evaluation_split']}"),
+                            "measurable": True,
+                            "basis_evidence": ref,
+                            "evidence_insufficient": False,
+                        },
+                        budget=dict(self.default_budget),
+                        provenance={
+                            "generation_source": "id_ood_gap",
+                            "domain": dname,
+                            "ood_dataset_version": ood_version,
+                            "id_dataset_version": rec["id_dataset_version"],
+                            "metric": rec["id_metric"],
+                            "evaluation_split": rec["id_evaluation_split"],
+                            "evidence_ids": list(rec.get("evidence_ids") or []),
+                            "evidence_insufficient": False,
+                            "snapshot_run_id": snapshot.run_id,
+                        },
+                        generation_source="id_ood_gap",
+                    ))
+            else:
+                # ONLY a version, no comparable metrics -> NO gap conclusion.
+                # An exploratory candidate is allowed, but MUST be marked as
+                # evidence_insufficient (persisted via success_criteria).
+                meta_ref = f"domain:{dname}:ood_dataset_version:{ood_version}"
+                cid = _candidate_id("ood_exploration", dname)
+                out.append(ObjectiveCandidate(
+                    candidate_id=cid,
+                    domain=self.domain,
+                    description=(
+                        f"Investigate OOD generalization for domain '{dname}' "
+                        f"(OOD dataset {ood_version} recorded; no comparable "
+                        f"ID/OOD metrics available yet)."),
+                    evidence_refs=[meta_ref],
+                    source_objective_ids=source_objectives,
+                    hypothesis_hint=(
+                        "Only an OOD dataset version is recorded; there is NO "
+                        "comparable ID/OOD metric evidence for a gap claim. "
+                        "First establish comparable ID and OOD measurements on "
+                        "the SAME metric and the SAME non-frozen split, then "
+                        "decide whether a gap-closing direction is warranted."),
+                    proposed_intervention={
+                        "axis": "establish_comparable_ood_measurement",
+                        "rationale": (
+                            "gap evidence is insufficient; collect comparable "
+                            "ID/OOD metrics before proposing a gap-closing change"),
+                    },
+                    success_criteria={
+                        "criterion": (
+                            f"establish comparable ID/OOD {dname} metrics on a "
+                            f"non-frozen split before any gap claim"),
+                        "measurable": True,
+                        "basis_provenance": meta_ref,
+                        "evidence_insufficient": True,
+                    },
+                    budget=dict(self.default_budget),
+                    provenance={
+                        "generation_source": "id_ood_exploration",
+                        "domain": dname,
+                        "ood_dataset_version": ood_version,
+                        "evidence_insufficient": True,
+                        "reason": "no_comparable_id_ood_metrics",
+                        "snapshot_run_id": snapshot.run_id,
+                    },
+                    generation_source="id_ood_exploration",
+                ))
         return out
 
     # -- source 3: historical failures / Experience signals -----------------

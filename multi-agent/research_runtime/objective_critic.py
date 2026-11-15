@@ -23,12 +23,13 @@ from typing import Any
 
 from .discovery_context_provider import DiscoverySnapshot
 from .objective_candidate_generator import (
-    FAILURE_ID_FIELD, ObjectiveCandidate, parse_failure_ref,
+    FAILURE_ID_FIELD, ID_OOD_METRIC_REF_PREFIX, ObjectiveCandidate,
+    parse_failure_ref, resolve_id_ood_metric_ref, _reserved_final_splits,
 )
 
 # Refs we accept as resolvable, keyed by their colon-delimited prefix.
 _RESOLVABLE_PREFIXES = ("sha256:", "domain:", "session:", "objective:",
-                        "experience:")
+                        "experience:", ID_OOD_METRIC_REF_PREFIX)
 
 
 def _resolve_entity_ref(ref: str, snapshot: DiscoverySnapshot) -> bool:
@@ -90,6 +91,10 @@ def _resolve_ref(ref: str, snapshot: DiscoverySnapshot) -> bool:
         ids = {e.get("evidence_id") for e in
                (snapshot.evidence_view or {}).get("evidence", [])}
         return ref in ids
+    if prefix == ID_OOD_METRIC_REF_PREFIX:
+        # M4.3-00 / P0-02: a gap-metric ref resolves ONLY to a REAL, comparable
+        # ID/OOD record (four identity checks, non-frozen split, real evidence).
+        return resolve_id_ood_metric_ref(ref, snapshot)
     if prefix == "domain:":
         # domain:<name>[:ood_dataset_version:<v>] -> provenance.domains must
         # contain <name> AND, when a version is specified, it must MATCH exactly.
@@ -147,6 +152,28 @@ class ObjectiveCritic:
                 not _resolve_ref(r, snapshot) for r in cands):
                 errors.append(
                     "all evidence_refs are unresolved; candidate cannot be grounded")
+
+        # M4.3-00 / P0-02: evidence-semantics guards.
+        # (a) A "close the gap" claim (generation_source=id_ood_gap) MUST cite a
+        #     REAL comparable ID/OOD metric record. A mere dataset-version ref
+        #     is metadata, not gap evidence -> reject the claim.
+        if candidate.generation_source == "id_ood_gap":
+            if not any(r.startswith(ID_OOD_METRIC_REF_PREFIX)
+                       and _resolve_ref(r, snapshot) for r in cands):
+                errors.append(
+                    "id_ood_gap claim cites no comparable ID/OOD metric record "
+                    "(a dataset version alone is not gap evidence)")
+        # (b) No candidate may use a frozen/final split as selection evidence.
+        #     Frozen splits are reserved for independent final confirmation.
+        reserved = _reserved_final_splits(snapshot)
+        for r in cands:
+            parts = r.split(":")
+            if (r.startswith(ID_OOD_METRIC_REF_PREFIX) and len(parts) == 6
+                    and parts[3].lower() in reserved):
+                errors.append(
+                    f"frozen final split {parts[3]!r} cannot be used as "
+                    f"objective-selection evidence")
+                break
 
         # verifiability
         sc = candidate.success_criteria or {}
