@@ -289,16 +289,28 @@ def test_completed_arm_must_pass_all_12_gate_steps(gate):
 
 # --------------------------------------------------------------------- frozen protocol / stage gates
 def test_confirmatory_refuses_unfrozen_protocol():
-    p = _protocol()
+    from research_runtime.m4_3 import CONFIRMATORY_REQUIRED_FIELDS
+    p = _protocol()   # Pilot shell: most confirmatory fields still empty
     with pytest.raises(ValueError) as exc:
         p.assert_confirmatory_ready()
     assert "frozen" in str(exc.value).lower()
+    missing = p.missing_confirmatory_fields()
+    assert "confirmatory" in missing
+    assert "domain_policy_version" in missing
+    assert "metric_contract_sha256" in missing
+    assert set(missing) <= set(CONFIRMATORY_REQUIRED_FIELDS)
     frozen = FrozenProtocol(
-        snapshot_ids=("snap_1", "snap_2"), sample_size=30, seed=7,
-        model_version="m1", prompt_version="p1", ranker_version="r1",
-        budget={"paired_seeds": [42, 43]},
-        exclusion_rules=("pre-registered",), statistical_method="paired-block",
-        stopping_rule="all blocks complete", confirmatory=True)
+        confirmatory=True, snapshot_ids=("snap_1", "snap_2"),
+        sample_size=30, seed=7, model_version="m1", prompt_version="p1",
+        ranker_version="r1", domain_policy_version="dp1",
+        analysis_plan_version="ap1", campaign_budget={"max_jobs": 30},
+        paired_seeds=(42, 43), primary_metrics=PRIMARY_METRICS,
+        metric_contract_sha256=frozen_metric_contract()["contract_sha256"],
+        exclusion_rules=("pre-registered",),
+        statistical_method="paired-block",
+        multiple_comparison_correction="holm-bonferroni",
+        stopping_rule="all blocks complete",
+        smallest_effect_of_interest=0.2, alpha=0.05, target_power=0.8)
     frozen.assert_confirmatory_ready()  # no exception
     assert len(frozen.freeze_sha256()) == 64
 

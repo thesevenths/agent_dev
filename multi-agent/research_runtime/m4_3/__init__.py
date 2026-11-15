@@ -26,6 +26,11 @@ from .research_service_gate import (
     GATE_STEP_COUNT, GATED_OUTCOMES, UNGATED_OUTCOMES, FORGED_GATE_KEYS,
     GateAdapter, GateEvidence, GateRunRef, ResearchServiceGateAdapter,
 )
+from .protocol_schema import (
+    CONFIRMATORY_REQUIRED_FIELDS, POSTHOC_LOCKED_FIELDS, EMPTY_VALUES,
+    ProtocolImmutable, ProtocolNotFrozen, ProtocolRegistry, ProtocolVersion,
+    assert_confirmatory_ready, missing_confirmatory_fields,
+)
 
 __all__ = [
     "EvaluationHarness", "ProtocolViolation", "ArmContext", "BlockSpec",
@@ -39,4 +44,8 @@ __all__ = [
     "FORBIDDEN_BLIND_FIELDS",
     "GATE_STEP_COUNT", "GATED_OUTCOMES", "UNGATED_OUTCOMES", "FORGED_GATE_KEYS",
     "GateAdapter", "GateEvidence", "GateRunRef", "ResearchServiceGateAdapter",
+    "CONFIRMATORY_REQUIRED_FIELDS", "POSTHOC_LOCKED_FIELDS", "EMPTY_VALUES",
+    "ProtocolImmutable", "ProtocolNotFrozen", "ProtocolRegistry",
+    "ProtocolVersion", "assert_confirmatory_ready",
+    "missing_confirmatory_fields",
 ]

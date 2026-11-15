@@ -424,7 +424,10 @@ class EvaluationHarness:
 
     def _paired_seeds(self, block_id: str) -> list[int]:
         # Rule #8: same paired seeds across arms (from frozen protocol budget).
-        seeds = self.protocol.budget.get("paired_seeds")
+        # P0-04: ``paired_seeds`` is now a first-class frozen field; ``budget``
+        # remains a backwards-compatible alias.
+        seeds = self.protocol.paired_seeds or \
+            self.protocol.budget.get("paired_seeds")
         return list(seeds) if seeds else []
 
     # ------------------------------------------------------------- metrics

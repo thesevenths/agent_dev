@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .metrics import ALL_METRICS, PRIMARY_METRICS, frozen_metric_contract
+from .metrics import ALL_METRICS, PRIMARY_METRICS
 
 ARMS: tuple[str, ...] = ("A", "B", "C")
 ARM_DESCRIPTIONS: dict[str, str] = {
@@ -48,56 +48,58 @@ def _hash(payload: dict[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class FrozenProtocol:
-    """Fields that must be frozen BEFORE the confirmatory run (M4.3-03).
+    """The COMPLETE confirmatory pre-registration (P0-04, 20 required fields).
 
-    Frozen here for the harness so any post-hoc change is detectable. Pilot
-    (M4.3-02) may leave ``confirmatory`` False and sample_size 0; the
-    confirmatory experiment MUST set every field.
+    Field names are the SINGLE schema shared with ``M4_3_runs/protocol.yaml``
+    (``confirmatory_required_fields``), enforced by a contract test. Pilot
+    (M4.3-02) may leave them empty; the confirmatory experiment (M4.3-03) MUST
+    set every one of them. ``budget`` is kept as a backwards-compatible alias
+    for ``campaign_budget`` used by the harness' paired-seed helper.
     """
+    # --- identity / design -------------------------------------------------
+    confirmatory: bool = False
     snapshot_ids: tuple[str, ...] = ()
-    primary_metrics: tuple[str, ...] = PRIMARY_METRICS
     sample_size: int = 0
-    seed: int = 0
+    seed: int | None = None
+    # --- frozen versions ---------------------------------------------------
     model_version: str = ""
     prompt_version: str = ""
     ranker_version: str = ""
-    budget: dict[str, Any] = field(default_factory=dict)
+    domain_policy_version: str = ""
+    analysis_plan_version: str = ""
+    # --- budget / pairing --------------------------------------------------
+    campaign_budget: dict[str, Any] = field(default_factory=dict)
+    paired_seeds: tuple[int, ...] = ()
+    budget: dict[str, Any] = field(default_factory=dict)  # legacy alias
+    # --- frozen measurement ------------------------------------------------
+    primary_metrics: tuple[str, ...] = PRIMARY_METRICS
+    metric_contract_sha256: str = ""
     exclusion_rules: tuple[str, ...] = ()
     statistical_method: str = ""
+    multiple_comparison_correction: str = ""
     stopping_rule: str = ""
-    confirmatory: bool = False
+    smallest_effect_of_interest: float = 0.0
+    alpha: float = 0.0
+    target_power: float = 0.0
 
     def frozen_dict(self) -> dict[str, Any]:
         d = asdict(self)
-        d["snapshot_ids"] = list(self.snapshot_ids)
-        d["primary_metrics"] = list(self.primary_metrics)
-        d["exclusion_rules"] = list(self.exclusion_rules)
-        d["metric_contract_sha256"] = frozen_metric_contract()[
-            "contract_sha256"]
+        for key in ("snapshot_ids", "primary_metrics", "exclusion_rules",
+                    "paired_seeds"):
+            d[key] = list(getattr(self, key))
         return d
 
     def freeze_sha256(self) -> str:
         return _hash(self.frozen_dict())
 
+    def missing_confirmatory_fields(self) -> tuple[str, ...]:
+        from .protocol_schema import missing_confirmatory_fields
+        return missing_confirmatory_fields(self)
+
     def assert_confirmatory_ready(self) -> None:
-        """M4.3-03 gate: refuse to start if the protocol was not frozen."""
-        missing = []
-        if not self.confirmatory:
-            missing.append("confirmatory flag")
-        if not self.snapshot_ids:
-            missing.append("snapshot set")
-        if self.sample_size <= 0:
-            missing.append("sample size")
-        if not self.statistical_method:
-            missing.append("statistical method")
-        if not self.stopping_rule:
-            missing.append("stopping condition")
-        if not self.exclusion_rules:
-            missing.append("exclusion rules")
-        if missing:
-            raise ValueError(
-                "confirmatory experiment requires a frozen protocol; missing: "
-                + ", ".join(missing))
+        """M4.3-03 gate: ALL 20 fields must be frozen. Fail-closed."""
+        from .protocol_schema import assert_confirmatory_ready
+        assert_confirmatory_ready(self)
 
 
 @dataclass
