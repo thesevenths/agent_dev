@@ -19,8 +19,10 @@ from .blind_review import (
     IndependentReviewer, QualityReview, ReviewPanel, blind,
 )
 from .metrics import (
-    ALL_METRICS, PRIMARY_METRICS, SAFETY_METRICS, SECONDARY_METRICS,
-    frozen_metric_contract,
+    ALL_METRICS, METRIC_CATEGORIES, METRIC_DEFINITIONS,
+    METRIC_FORMULA_VERSION, MetricDefinition, PRIMARY_METRICS,
+    SAFETY_METRICS, SECONDARY_METRICS, compute_metric_set,
+    frozen_metric_contract, metric_definitions,
 )
 from .research_service_gate import (
     GATE_STEP_COUNT, GATED_OUTCOMES, UNGATED_OUTCOMES, FORGED_GATE_KEYS,
@@ -39,6 +41,8 @@ __all__ = [
     "BlindedObjective", "BlindingEntry", "BlindingLedger", "BlindingViolation",
     "blind", "frozen_metric_contract",
     "PRIMARY_METRICS", "SECONDARY_METRICS", "SAFETY_METRICS", "ALL_METRICS",
+    "METRIC_CATEGORIES", "METRIC_DEFINITIONS", "METRIC_FORMULA_VERSION",
+    "MetricDefinition", "compute_metric_set", "metric_definitions",
     "REVIEW_RUBRIC_VERSION", "RUBRIC_DIMENSIONS", "RUBRIC_SCALE",
     "REVIEW_KINDS", "REVIEW_KIND_HUMAN_BLIND", "REVIEW_KIND_AUTOMATED",
     "FORBIDDEN_BLIND_FIELDS",

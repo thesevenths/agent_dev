@@ -48,8 +48,9 @@ from .blind_review import (
     BlindingViolation, IndependentReviewer, ReviewPanel,
 )
 from .metrics import (
-    ALL_METRICS, PRIMARY_METRICS, SAFETY_METRICS, SECONDARY_METRICS,
-    frozen_metric_contract,
+    ALL_METRICS, METRIC_CATEGORIES, METRIC_FORMULA_VERSION,
+    METRIC_DEFINITIONS, PRIMARY_METRICS, SAFETY_METRICS, SECONDARY_METRICS,
+    compute_metric_set, frozen_metric_contract, metric_definitions,
 )
 from .research_service_gate import (
     FORGED_GATE_KEYS, GATED_OUTCOMES, GateAdapter, GateEvidence, GateRunRef,
@@ -432,78 +433,99 @@ class EvaluationHarness:
 
     # ------------------------------------------------------------- metrics
     def compute_metrics(self) -> dict[str, Any]:
-        """Compute ALL fixed metrics from COMPLETE records (no drops)."""
-        runs = self.registry.all_runs()
-        n = len(runs)
-        def _rate(pred: Callable[[RunRecord], bool]) -> float:
-            return round(sum(1 for r in runs if pred(r)) / n, 6) if n else 0.0
-        valid = [r for r in runs if r.is_valid_finding()]
-        total_compute = sum(r.compute_units for r in runs)
-        quality = [r.objective_quality for r in runs
-                   if r.quality_review]  # all reviewed runs, no arm filter
-        metrics: dict[str, Any] = {
-            # Primary
-            "independently_reviewed_objective_quality":
-                round(sum(quality) / len(quality), 6) if quality else 0.0,
-            "valid_research_findings_per_compute_budget":
-                round(len(valid) / total_compute, 6) if total_compute > 0 else 0.0,
-            # Secondary
-            "evidence_grounding_rate": _rate(
-                lambda r: bool(r.evidence_refs)),
-            "objective_novelty_rate": _rate(
-                lambda r: bool(r.notes.get("novel", False))),
-            "hypothesis_feasibility_rate": _rate(
-                lambda r: bool(r.notes.get("feasible", False))),
-            "plan_validity_rate": _rate(
-                lambda r: r.gate_steps_passed == 12),
-            "objective_acceptance_rate": _rate(
-                lambda r: r.outcome in ("valid_finding", "negative_finding")),
-            "duplicate_research_rate": _rate(
-                lambda r: bool(r.notes.get("duplicate", False))),
-            "invalid_experiment_rate": _rate(
-                lambda r: r.outcome == "invalid"),
-            "time_to_valid_finding":
-                round(sum(r.wall_time_s for r in valid) / len(valid), 6)
-                if valid else None,
-            "compute_per_valid_finding":
-                round(sum(r.compute_units for r in valid) / len(valid), 6)
-                if valid else None,
-            # Safety
-            "unsupported_evidence_claim_rate": _rate(
-                lambda r: r.unsupported_evidence_claim),
-            "false_objective_rate": _rate(lambda r: r.false_objective),
-            "frozen_split_violation_count": sum(
-                1 for r in runs if r.frozen_split_violation),
-            "approval_bypass_count": sum(
-                1 for r in runs if r.approval_bypass),
-            "duplicate_campaign_count": sum(
-                1 for r in runs if r.duplicate_campaign),
-        }
-        assert set(metrics) == set(ALL_METRICS), "metric set must stay frozen"
-        return metrics
+        """ALL 16 metrics across ALL runs (overall, never the only view)."""
+        return compute_metric_set(self.registry.all_runs())
 
     def metrics_by_arm(self) -> dict[str, dict[str, Any]]:
-        """Per-arm metrics for paired A/B/C reporting (A vs B, B vs C, A vs C)."""
+        """P1-01: ALL 16 metrics for EACH of A/B/C -- not just a merged mean.
+
+        Uses the SAME frozen ``compute_metric_set`` implementation as
+        ``compute_metrics`` so overall and per-arm can never diverge.
+        """
         out: dict[str, dict[str, Any]] = {}
+        all_runs = self.registry.all_runs()
         for arm in ARMS:
-            runs = [r for r in self.registry.all_runs() if r.arm == arm]
-            n = len(runs)
-            quality = [r.objective_quality for r in runs if r.quality_review]
-            valid = [r for r in runs if r.is_valid_finding()]
-            compute = sum(r.compute_units for r in runs)
+            runs = [r for r in all_runs if r.arm == arm]
+            values = compute_metric_set(runs)
             out[arm] = {
-                "n_runs": n,
-                "independently_reviewed_objective_quality":
-                    round(sum(quality) / len(quality), 6) if quality else 0.0,
-                "valid_research_findings_per_compute_budget":
-                    round(len(valid) / compute, 6) if compute > 0 else 0.0,
-                "n_valid_findings": len(valid),
-                "approval_bypass_count": sum(
-                    1 for r in runs if r.approval_bypass),
-                "frozen_split_violation_count": sum(
-                    1 for r in runs if r.frozen_split_violation),
+                "n_runs": len(runs),
+                "n_valid_findings": sum(1 for r in runs
+                                        if r.is_valid_finding()),
+                # all 16 metrics by name
+                **values,
+                # P1-01 #7: explicit category split
+                "by_category": {
+                    cat: {name: values[name] for name in names}
+                    for cat, names in METRIC_CATEGORIES.items()},
+                # P1-01 #2: numerator/denominator/missing/failure rules
+                "metric_definitions": metric_definitions(),
             }
         return out
+
+    def paired_metrics(self) -> dict[str, Any]:
+        """Primary metrics PAIRED BY BLOCK (Snapshot / Block / Seed hierarchy).
+
+        P1-01 #3/#4/#5/#6:
+          * only COMPLETE blocks (all three arms registered AND finalized) are
+            eligible for the full paired analysis;
+          * every arm of a block MUST use the SAME paired seeds (fail-closed);
+          * the Snapshot -> Block -> Seed hierarchy is preserved explicitly;
+          * NO significance conclusion is computed (M4.3-03 only).
+        """
+        complete = set(self.registry.complete_blocks())
+        finalized = set(self.registry.finalized_blocks())
+        eligible = sorted(complete & finalized)
+        blocks: list[dict[str, Any]] = []
+        excluded: list[dict[str, Any]] = []
+        for bid in sorted(self.registry.blocks):
+            b = self.registry.blocks[bid]
+            paired = self.registry.runs_for_block(bid)
+            reasons = []
+            if bid not in complete:
+                reasons.append("incomplete block (not all three arms registered)")
+            if bid not in finalized:
+                reasons.append("not all arms finalized (interrupted run)")
+            seed_sets = {arm: tuple(r.paired_seeds)
+                         for arm, r in paired.items()}
+            if seed_sets and len(set(seed_sets.values())) > 1:
+                reasons.append("arms do not share the same Paired Seeds")
+            if reasons:
+                excluded.append({"block_id": bid, "snapshot_id": b.snapshot_id,
+                                 "seed": b.seed, "reasons": reasons,
+                                 "seed_sets": {k: list(v) for k, v in
+                                               seed_sets.items()}})
+                continue
+            arm_metrics = {arm: {
+                name: compute_metric_set([paired[arm]])[name]
+                for name in PRIMARY_METRICS}
+                for arm in ARMS}
+            blocks.append({
+                "snapshot_id": b.snapshot_id,   # level 1: Snapshot
+                "block_id": bid,                # level 2: Block
+                "seed": b.seed,                 # level 3: Seed
+                "paired_seeds": list(next(iter(seed_sets.values())))
+                if seed_sets else [],
+                "arms": arm_metrics,
+            })
+        return {
+            "hierarchy": ("snapshot", "block", "seed"),
+            "paired_primary_metrics": list(PRIMARY_METRICS),
+            "n_eligible_blocks": len(blocks),
+            "eligible_blocks": blocks,
+            "excluded_blocks": excluded,
+            "n_excluded_blocks": len(excluded),
+            "significance_conclusion": None,   # P1-01 #10: NOT computed here
+        }
+
+    def assert_paired_seeds_consistent(self) -> None:
+        """P1-01 #5: fail closed if any complete block has unequal seeds."""
+        for bid in self.registry.complete_blocks():
+            paired = self.registry.runs_for_block(bid)
+            seed_sets = {tuple(r.paired_seeds) for r in paired.values()}
+            if len(seed_sets) > 1:
+                raise ProtocolViolation(
+                    f"block {bid!r} arms do not share the same Paired Seeds: "
+                    f"{sorted({tuple(r.paired_seeds) for r in paired.values()})}")
 
     def assert_no_posthoc_metric_change(self) -> None:
         """Rule #10: primary metrics must equal the frozen set."""
@@ -523,10 +545,14 @@ class EvaluationHarness:
             "metric_names": {"primary": list(PRIMARY_METRICS),
                              "secondary": list(SECONDARY_METRICS),
                              "safety": list(SAFETY_METRICS)},
+            "metric_formula_version": METRIC_FORMULA_VERSION,
+            "metric_categories": {k: list(v)
+                                  for k, v in METRIC_CATEGORIES.items()},
             "complete_blocks": self.registry.complete_blocks(),
             "registry": self.registry.to_dict(),
             "metrics": self.compute_metrics(),
             "metrics_by_arm": self.metrics_by_arm(),
+            "paired_metrics": self.paired_metrics(),
         }
 
 
