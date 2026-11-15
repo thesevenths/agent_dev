@@ -22,6 +22,12 @@ Invariants enforced here (spec M4-E2E-01B)
   * Recovery only RE-ENTERS ``RECOVERING`` from an active or halted-recoverable
     state, then RESOLVES to a concrete active state -- it never grants approval,
     never re-runs a campaign, never bypasses a gate.
+  * M4.3-00 / P0-04: a verified, already-finished run may take ONE dedicated
+    legal recovery path ``RECOVERING --RECOVER_COMPLETE--> COMPLETED``. This is
+    the ONLY way recovery reaches COMPLETED; a generic FAIL event can never
+    write a terminal-success state. Eligibility (real Report + non-empty
+    experience_refs + real Experience rows) is checked by the reconciliation
+    layer BEFORE this event is requested.
   * The machine is side-effect free: it never touches the ResearchService, the
     stores, or the journal. That keeps it trivially testable and deterministic.
 """
@@ -82,6 +88,9 @@ E_INTERRUPT = "INTERRUPT"
 E_STOP = "STOP"
 E_ENTER_RECOVERY = "ENTER_RECOVERY"
 E_RESOLVE_RECOVERY = "RESOLVE_RECOVERY"
+# M4.3-00 / P0-04: the ONE legal recovery -> COMPLETED transition. It is only
+# legal from RECOVERING, so E_FAIL / generic halts can never produce COMPLETED.
+E_RECOVER_COMPLETE = "RECOVER_COMPLETE"
 
 # Generic halt events map to a single target regardless of the active source.
 _HALT_TARGET = {
@@ -116,6 +125,10 @@ _FORWARD = {
     (S_FAILED, E_ENTER_RECOVERY): S_RECOVERING,
     (S_INTERRUPTED, E_ENTER_RECOVERY): S_RECOVERING,
     (S_STOPPED, E_ENTER_RECOVERY): S_RECOVERING,
+    # Recovery-to-COMPLETED: legal ONLY from RECOVERING. Reconciliation must
+    # have already proven a real Report + non-empty experience_refs + real
+    # Experience Store rows; the machine only validates the transition itself.
+    (S_RECOVERING, E_RECOVER_COMPLETE): S_COMPLETED,
 }
 
 
@@ -162,7 +175,8 @@ class DirectorStateMachine:
         for ev in (E_SELECT_OBJECTIVE, E_PROPOSE_HYPOTHESES, E_CREATE_PLAN,
                    E_REQUEST_APPROVAL, E_EXECUTE, E_COMPARE,
                    E_RECORD_EXPERIENCE, E_FINALIZE, E_REJECT, E_FAIL,
-                   E_INTERRUPT, E_STOP, E_ENTER_RECOVERY, E_RESOLVE_RECOVERY):
+                   E_INTERRUPT, E_STOP, E_ENTER_RECOVERY, E_RESOLVE_RECOVERY,
+                   E_RECOVER_COMPLETE):
             t = self._raw_next(ev, from_state)
             if t is not None:
                 out.append(t)
@@ -226,7 +240,7 @@ def describe_states() -> dict[str, list[str]]:
             E_SELECT_OBJECTIVE, E_PROPOSE_HYPOTHESES, E_CREATE_PLAN,
             E_REQUEST_APPROVAL, E_EXECUTE, E_COMPARE, E_RECORD_EXPERIENCE,
             E_FINALIZE, E_REJECT, E_FAIL, E_INTERRUPT, E_STOP,
-            E_ENTER_RECOVERY, E_RESOLVE_RECOVERY,
+            E_ENTER_RECOVERY, E_RESOLVE_RECOVERY, E_RECOVER_COMPLETE,
         ],
     }
 
@@ -242,5 +256,5 @@ __all__ = [
     "E_SELECT_OBJECTIVE", "E_PROPOSE_HYPOTHESES", "E_CREATE_PLAN",
     "E_REQUEST_APPROVAL", "E_EXECUTE", "E_COMPARE", "E_RECORD_EXPERIENCE",
     "E_FINALIZE", "E_REJECT", "E_FAIL", "E_INTERRUPT", "E_STOP",
-    "E_ENTER_RECOVERY", "E_RESOLVE_RECOVERY",
+    "E_ENTER_RECOVERY", "E_RESOLVE_RECOVERY", "E_RECOVER_COMPLETE",
 ]

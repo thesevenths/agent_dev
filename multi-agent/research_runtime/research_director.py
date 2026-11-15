@@ -43,15 +43,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .director_recovery import reconcile_director_state
+from .director_recovery import (
+    reconcile_director_state, report_has_real_experience,
+)
 from .director_state_machine import (
     ACTIVE_STATES, E_COMPARE, E_CREATE_PLAN, E_ENTER_RECOVERY, E_EXECUTE,
     E_FAIL, E_FINALIZE, E_INTERRUPT, E_PROPOSE_HYPOTHESES, E_RECORD_EXPERIENCE,
-    E_REJECT, E_REQUEST_APPROVAL, E_RESOLVE_RECOVERY, E_SELECT_OBJECTIVE,
-    E_STOP, IllegalTransitionError, DirectorStateMachine,     S_AWAITING_APPROVAL,
-    S_COMPLETED, S_EXECUTING, S_FAILED, S_HYPOTHESIS_READY, S_IDLE,
-    S_OBJECTIVE_SELECTED, S_PLAN_READY, S_RECOVERING, S_RECORDING_EXPERIENCE,
-    S_REJECTED, S_EVALUATING,
+    E_RECOVER_COMPLETE, E_REJECT, E_REQUEST_APPROVAL, E_RESOLVE_RECOVERY,
+    E_SELECT_OBJECTIVE, E_STOP, IllegalTransitionError, DirectorStateMachine,
+    S_AWAITING_APPROVAL, S_COMPLETED, S_EXECUTING, S_FAILED,
+    S_HYPOTHESIS_READY, S_IDLE, S_OBJECTIVE_SELECTED, S_PLAN_READY,
+    S_RECOVERING, S_RECORDING_EXPERIENCE, S_REJECTED, S_EVALUATING,
 )
 
 
@@ -182,14 +184,27 @@ class ResearchDirector:
         with self._journal_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, sort_keys=True) + "\n")
 
-    def _record(self, event: str, to_state: str, detail: dict[str, Any]) -> None:
+    def _record(self, event: str, to_state: str, detail: dict[str, Any], *,
+                recovery_target: str | None = None) -> None:
+        """M4.3-00 / P0-04 #4: EVERY transition must pass the StateMachine.
+
+        No method may write ``context.state`` directly. ``sm.require`` raises
+        ``IllegalTransitionError`` when the (event, from_state) pair is illegal;
+        we additionally assert the validated target equals the requested one so
+        a caller cannot smuggle an inconsistent state into the persisted
+        context or the append-only journal.
+        """
         from_state = self.context.state
-        self.context.state = to_state
+        validated = self.sm.require(event, from_state,
+                                    recovery_target=recovery_target)
+        if validated != to_state:
+            raise IllegalTransitionError(event, from_state, to_state=to_state)
+        self.context.state = validated
         self.context.updated_at = _now()
         if "error" in detail and detail["error"]:
             self.context.error = str(detail["error"])
         self._write_ctx(self.context)
-        self._append_journal(event, from_state, to_state, detail)
+        self._append_journal(event, from_state, validated, detail)
 
     def history(self) -> list[dict[str, Any]]:
         """Return the append-only transition journal (audit trail)."""
@@ -442,9 +457,19 @@ class ResearchDirector:
                 raise DirectorError(
                     "ResearchReport has no experience_refs; Experience was not "
                     "written by the campaign/comparison step")
+            # M4.3-00 / P0-04: refs on a report are CLAIMS, not proof. Verify
+            # the Experience Store actually holds matching rows.
+            verified, xp = report_has_real_experience(
+                self.service, self.context.session_id, report)
+            if not verified:
+                raise DirectorError(
+                    "ResearchReport cites experience_refs but the Experience "
+                    f"Store has no matching records ({xp}); refusing to record "
+                    "an experience that was never persisted")
             self.context.report_id = report.get("report_id", "")
             detail = {"report_id": self.context.report_id,
                       "n_experience_refs": len(exp_refs),
+                      "experience_store_rows": xp.get("experience_store_rows", 0),
                       "outcome": report.get("outcome")}
             self._record(E_RECORD_EXPERIENCE, S_RECORDING_EXPERIENCE, detail)
             return detail
@@ -453,17 +478,30 @@ class ResearchDirector:
             raise
 
     def finalize(self) -> dict[str, Any]:
-        """RECORDING_EXPERIENCE -> COMPLETED."""
+        """RECORDING_EXPERIENCE -> COMPLETED (three independent proofs)."""
         self._guard_current(S_RECORDING_EXPERIENCE, E_FINALIZE)
         rep = self.service.get_research_report(
             session_id=self.context.session_id)
         if not rep.get("ok"):
             raise DirectorError(f"finalize report missing: {rep}")
         report = rep.get("report", {})
+        # M4.3-00 / P0-04 #2: COMPLETED requires a REAL Report + NON-EMPTY
+        # experience_refs + REAL Experience Store records. A report row alone
+        # (or a claim with no Experience) must never produce COMPLETED.
+        verified, xp = report_has_real_experience(
+            self.service, self.context.session_id, report)
+        if not verified:
+            raise DirectorError(
+                "cannot finalise to COMPLETED: a real ResearchReport, non-empty "
+                "experience_refs and matching Experience Store records are all "
+                f"required (verification={xp})")
         detail = {"report_id": self.context.report_id,
                   "outcome": report.get("outcome"),
                   "promotion": report.get("promotion"),
-                  "frozen_test_used": report.get("frozen_test_used")}
+                  "frozen_test_used": report.get("frozen_test_used"),
+                  "experience_refs_count": xp.get("experience_refs_count", 0),
+                  "experience_store_rows": xp.get("experience_store_rows", 0),
+                  "experience_verified": True}
         self._record(E_FINALIZE, S_COMPLETED, detail)
         return detail
 
@@ -490,8 +528,15 @@ class ResearchDirector:
         Returns the resolved state. Read-only: never grants, never re-runs.
         Raises ``IllegalTransitionError`` if the current state is terminal
         (a completed / rejected run cannot be recovered).
+
+        M4.3-00 / P0-04: every transition here goes through the StateMachine.
+        Reconciliation can now legitimately conclude at COMPLETED (only when a
+        real Report + experience_refs + real Experience rows were verified);
+        that takes the DEDICATED ``E_RECOVER_COMPLETE`` path. ``E_FAIL`` is
+        never used to write COMPLETED, and journal events always match the
+        persisted final state.
         """
-        # ENTER_RECOVERY is legal from any non-terminal state.
+        # ENTER_RECOVERY is legal from any non-terminal state (StateMachine).
         if not self.sm.can(E_ENTER_RECOVERY, self.context.state):
             raise IllegalTransitionError(
                 E_ENTER_RECOVERY, self.context.state,
@@ -502,19 +547,38 @@ class ResearchDirector:
             plan_id=self.context.plan_id,
             approval_id=self.context.approval_id,
             campaign_id=self.context.campaign_id)
-        # First mark we are recovering.
+        # First mark we are recovering (validated by _record -> StateMachine).
         self._record(E_ENTER_RECOVERY, S_RECOVERING, detail)
+
+        if target == S_COMPLETED:
+            # The ONLY legal Recovery-to-COMPLETED path (P0-04 #3/#5). E_FAIL
+            # must never write a terminal-success state.
+            resolved = self.sm.require(E_RECOVER_COMPLETE, S_RECOVERING)
+            self._record(E_RECOVER_COMPLETE, resolved, detail)
+            return resolved
+
         if target in ACTIVE_STATES:
             resolved = self.sm.require(
                 E_RESOLVE_RECOVERY, S_RECOVERING, recovery_target=target)
-            self._record(E_RESOLVE_RECOVERY, resolved, detail)
+            self._record(E_RESOLVE_RECOVERY, resolved, detail,
+                         recovery_target=target)
             return resolved
-        # Reconciliation concluded at a halted state (e.g. FAILED campaign).
+
+        # Reconciliation concluded at a halted-recoverable state (e.g. FAILED
+        # campaign). Choose the CORRECT halt event; a generic E_FAIL is not
+        # allowed to write anything other than S_FAILED.
         halt_event = {
             S_FAILED: E_FAIL,
-        }.get(target, E_FAIL)
-        self._record(halt_event, target, detail)
-        return target
+            S_INTERRUPTED: E_INTERRUPT,
+            S_STOPPED: E_STOP,
+            S_REJECTED: E_REJECT,
+        }.get(target)
+        if halt_event is None:
+            raise IllegalTransitionError(
+                "RECOVERY_HALT", S_RECOVERING, to_state=target)
+        resolved = self.sm.require(halt_event, S_RECOVERING)
+        self._record(halt_event, resolved, detail)
+        return resolved
 
     # ------------------------------------------------------------- convenience
     def run_to_awaiting_approval(self) -> dict[str, Any]:

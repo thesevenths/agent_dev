@@ -13,7 +13,13 @@ Hard constraints (spec M4-E2E-01B -- "No bypassing gates via recovery")
     historical report.
   * It may only RESOLVE the Director to a concrete *active* state that reflects
     what already happened. It cannot jump a run to COMPLETED unless a real
-    ResearchReport already exists.
+    ResearchReport exists.
+  * M4.3-00 / P0-04: a Report existing does NOT mean Experience exists.
+    COMPLETED requires THREE independent proofs: a real ResearchReport, a
+    NON-EMPTY ``experience_refs`` list on that report, AND real Experience rows
+    in the Experience Store whose ids match those refs. If any is missing, the
+    run is resolved back to ``RECORDING_EXPERIENCE`` (the honest in-progress
+    state) -- never to COMPLETED.
   * If the reconciliation finds a missing approval, a failed campaign, or an
     unapproved plan, it reports that honestly and lets the (human) operator
     decide how to proceed -- recovery does NOT invent approvals.
@@ -36,6 +42,37 @@ from .director_state_machine import (
 
 def _campaign_is_terminal(status: str | None) -> bool:
     return status in {"completed", "failed", "cancelled", "incomplete"}
+
+
+def report_has_real_experience(service: Any, session_id: str,
+                               report: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """M4.3-00 / P0-04 -- verify Experience is REAL, not just a report row.
+
+    Returns ``(verified, detail)``. Verified requires ALL THREE:
+      (1) a real ResearchReport (``report_id`` present),
+      (2) a NON-EMPTY ``experience_refs`` list on the report,
+      (3) real rows in the Experience Store whose ``experience_id`` values
+          intersect those refs (a report that merely *claims* a ref is not
+          sufficient -- the Experience Store is the authority).
+    """
+    detail: dict[str, Any] = {}
+    report_id = report.get("report_id")
+    refs = [str(r) for r in (report.get("experience_refs") or []) if str(r)]
+    detail["report_id_present"] = bool(report_id)
+    detail["experience_refs_count"] = len(refs)
+    detail["report_present"] = bool(report)
+    if not report_id or not refs:
+        return False, detail
+    try:
+        rows = service.stores.sessions.experience(session_id) or []
+    except Exception:  # store unreadable -> fail closed, never claim COMPLETED
+        detail["experience_store_error"] = True
+        return False, detail
+    stored_ids = {str(r.get("experience_id") or "") for r in rows}
+    matched = [r for r in refs if r in stored_ids]
+    detail["experience_store_rows"] = len(rows)
+    detail["experience_refs_matched"] = len(matched)
+    return (len(matched) > 0), detail
 
 
 def reconcile_director_state(service: Any, *,
@@ -65,14 +102,26 @@ def reconcile_director_state(service: Any, *,
             # Still executing on the engine; resume corresponds to EXECUTING.
             return S_EXECUTING, detail
         if cs in {"completed", "cancelled", "incomplete"}:
-            # Terminal campaign: a ResearchReport implies experience was written.
+            # M4.3-00 / P0-04: a Report existing is NOT proof that Experience
+            # was written. COMPLETED requires a real Report + non-empty
+            # experience_refs + REAL Experience Store records.
             try:
                 rep = service.get_research_report(session_id=session_id)
             except Exception:
                 rep = None
             if rep and rep.get("ok") and rep.get("report"):
-                detail["report_present"] = True
-                return S_COMPLETED, detail
+                verified, xp = report_has_real_experience(
+                    service, session_id, rep["report"])
+                detail.update(xp)
+                detail["experience_verified"] = verified
+                if verified:
+                    return S_COMPLETED, detail
+                # Report exists but Experience is missing / unmatched: resolve
+                # back to the honest in-progress state, NEVER to COMPLETED.
+                detail["reason"] = (
+                    "report exists but Experience is missing or unverified; "
+                    "COMPLETED is not legitimate")
+                return S_RECORDING_EXPERIENCE, detail
             # Campaign done but no report yet -> need comparison (EVALUATING).
             detail["report_present"] = False
             return S_EVALUATING, detail
@@ -161,4 +210,5 @@ def recovery_target_from_history(service: Any, *, director_context: dict[str, An
     )
 
 
-__all__ = ["reconcile_director_state", "recovery_target_from_history"]
+__all__ = ["reconcile_director_state", "recovery_target_from_history",
+           "report_has_real_experience"]
