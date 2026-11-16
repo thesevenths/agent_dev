@@ -44,16 +44,15 @@ from .autonomous_loop_recovery import (
     apply_recovery, reconcile, LoopRecoveryReport,
 )
 from .discovery_context_provider import DiscoveryContextProvider
+from .loop_budget_ledger import (
+    LoopBudgetExhausted, LoopBudgetLedger, config_sha256,
+)
 from .objective_critic import ObjectiveCritic
 from .objective_discovery import ObjectiveDiscovery
 from .objective_ranker import ObjectiveRanker
 from .objective_candidate_generator import ObjectiveCandidateGenerator
 from .research_director import ResearchDirector
 from .research_store import ResearchStoreConflict
-
-
-class LoopBudgetExhausted(RuntimeError):
-    pass
 
 
 class LoopPreflightError(RuntimeError):
@@ -131,6 +130,8 @@ class AutonomousResearchLoop:
         self.rounds_dir.mkdir(parents=True, exist_ok=True)
         self.approver = approver          # external human grant; NEVER defaulted
         self.store = LoopEventStore(db=service.stores.db)
+        self.budget = LoopBudgetLedger(db=service.stores.db)
+        self.config_sha = config_sha256(config)
         self.started_wall = time.time()
         self.campaigns_run = 0
         self._stop_requested = False
@@ -138,6 +139,15 @@ class AutonomousResearchLoop:
         # last COMPLETED round stored on LoopRecord (which lags by one).
         self._current_round = 0
         self.record = self.store.load(config.loop_id)
+        if self.record is not None:
+            if dict(self.record.config or {}) != dict(config.__dict__):
+                raise LoopPreflightError(
+                    f"loop {config.loop_id!r} config changed after creation; "
+                    "refusing silent budget/experiment reconfiguration")
+            if self.record.config_sha and self.record.config_sha != self.config_sha:
+                raise LoopPreflightError(
+                    f"loop {config.loop_id!r} config SHA mismatch: stored="
+                    f"{self.record.config_sha}, computed={self.config_sha}")
 
     # -------------------------------------------------------------- lifecycle
     def preflight(self) -> dict[str, Any]:
@@ -156,13 +166,24 @@ class AutonomousResearchLoop:
         except Exception as exc:  # noqa: BLE001 - fail closed, no engine
             detail["engine_error"] = f"{type(exc).__name__}: {exc}"
         ready = bool(detail.get("engine_python"))
+        ledger = self.budget.initialize(
+            self.config.loop_id, config_sha=self.config_sha,
+            max_campaigns=self.config.max_campaigns,
+            max_wall_time_s=self.config.max_wall_time_s,
+            started_epoch=self.started_wall)
+        detail["budget"] = ledger
         if self.record is None:
             self.record = LoopRecord(
                 loop_id=self.config.loop_id, domain=self.config.domain,
                 state=S_CREATED, max_rounds=self.config.max_rounds,
-                config=self.config.__dict__.copy())
+                config=self.config.__dict__.copy(), config_sha=self.config_sha)
             self.store.save(self.record)
-            self._emit("create", {"preflight": detail})
+            self._emit("create", {"preflight": detail,
+                                  "config_sha": self.config_sha})
+        elif not self.record.config_sha:
+            self.record.config_sha = self.config_sha
+            self.store.save(self.record)
+            self._emit("config_sha_bound", {"config_sha": self.config_sha})
         if not ready:
             raise LoopPreflightError(
                 f"real engine/data unavailable; refusing to run: {detail}")
@@ -179,16 +200,19 @@ class AutonomousResearchLoop:
     # --------------------------------------------------------------- budget
     def _check_budget(self) -> None:
         if self._stop_requested:
+            self.budget.stop(self.config.loop_id, "human stop")
             raise LoopBudgetExhausted("human stop requested")
+        budget = self.budget.snapshot(self.config.loop_id)
         if self.config.max_rounds and self.record.round_no >= self.config.max_rounds:
             raise LoopBudgetExhausted(
                 f"max_rounds={self.config.max_rounds} reached")
-        if self.config.max_campaigns and \
-                self.campaigns_run >= self.config.max_campaigns:
+        if budget["remaining"] is not None and budget["remaining"] <= 0:
             raise LoopBudgetExhausted(
-                f"max_campaigns={self.config.max_campaigns} reached")
+                f"max_campaigns={self.config.max_campaigns} exhausted "
+                f"(reserved={budget['reserved']}, consumed={budget['consumed']})")
         if self.config.max_wall_time_s and \
-                (time.time() - self.started_wall) >= self.config.max_wall_time_s:
+                budget["elapsed_s"] >= self.config.max_wall_time_s:
+            self.budget.stop(self.config.loop_id, "wall-clock exhausted")
             raise LoopBudgetExhausted(
                 f"max_wall_time_s={self.config.max_wall_time_s} reached")
 
@@ -357,14 +381,55 @@ class AutonomousResearchLoop:
         self._transition("approval_observed", S_AWAITING_APPROVAL,
                          {"approval_id": approval_id})
 
+        # Reserve budget BEFORE execution. The id is the SAME deterministic
+        # idempotency id ResearchService derives from (plan, approval, plan SHA);
+        # a mismatch after execution fails closed rather than silently charging
+        # a different campaign.
+        from .research_service import make_campaign_id
+        plan = self.service.stores.plans.get(director.context.plan_id)
+        if plan is None or not getattr(plan, "plan_sha256", ""):
+            raise LoopPreflightError(
+                f"round {round_no}: plan SHA missing; refusing to reserve budget")
+        planned_campaign_id = make_campaign_id(
+            director.context.plan_id, approval_id, plan.plan_sha256)
+        self.budget.reserve(self.config.loop_id, planned_campaign_id,
+                            config_sha=self.config_sha)
+        self._emit("budget_reserved", {
+            "campaign_id": planned_campaign_id,
+            "snapshot": self.budget.snapshot(self.config.loop_id)})
+
         # Execute the REAL campaign + 12-step gate + Experience write.
         self._transition("executing", S_EXECUTING,
                          {"campaign_id_before": director.context.campaign_id})
-        final = director.run_to_completion()
+        try:
+            final = director.run_to_completion()
+            ctx = director.context
+            if ctx.campaign_id != planned_campaign_id:
+                raise LoopPreflightError(
+                    f"campaign id drift: reserved={planned_campaign_id}, "
+                    f"executed={ctx.campaign_id}")
+            spent = self.budget.consume(
+                self.config.loop_id, planned_campaign_id,
+                outcome=str(final.get("state") or "unknown"),
+                config_sha=self.config_sha)
+            self._emit("budget_consumed", {
+                "campaign_id": planned_campaign_id,
+                "outcome": spent.get("outcome", ""),
+                "snapshot": self.budget.snapshot(self.config.loop_id)})
+        except Exception:
+            ctx = director.context
+            if ctx.campaign_id:
+                self.budget.consume(
+                    self.config.loop_id, planned_campaign_id,
+                    outcome="interrupted", config_sha=self.config_sha)
+            else:
+                self.budget.release(
+                    self.config.loop_id, planned_campaign_id,
+                    reason="campaign_not_created", config_sha=self.config_sha)
+            raise
         self.campaigns_run += 1
         self._transition("evaluating", S_EVALUATING,
                          {"director_state": final.get("state", "")})
-        ctx = director.context
         round_rec = {
             "round_no": round_no,
             "objective_id": objective_id,

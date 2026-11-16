@@ -135,12 +135,14 @@ class LoopRecord:
     round_no: int = 0
     max_rounds: int = 2
     config: dict[str, Any] = field(default_factory=dict)
+    config_sha: str = ""
     rounds: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {"loop_id": self.loop_id, "domain": self.domain,
                 "state": self.state, "round_no": self.round_no,
                 "max_rounds": self.max_rounds, "config": dict(self.config),
+                "config_sha": self.config_sha,
                 "rounds": list(self.rounds)}
 
 
@@ -178,7 +180,9 @@ class LoopEventStore:
             loop_id=d.get("loop_id", loop_id), domain=d.get("domain", "scinet"),
             state=d.get("state", S_CREATED), round_no=int(d.get("round_no", 0)),
             max_rounds=int(d.get("max_rounds", 2)),
-            config=d.get("config") or {}, rounds=d.get("rounds") or [])
+            config=d.get("config") or {},
+            config_sha=str(d.get("config_sha") or ""),
+            rounds=d.get("rounds") or [])
 
     def append(self, *, loop_id: str, round_no: int, event: str,
                payload: dict[str, Any]) -> str:
