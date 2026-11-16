@@ -328,15 +328,76 @@ class EvaluationHarness:
         self._contexts[spec.block_id] = contexts
         return contexts
 
+    def ensure_block(self, spec: BlockSpec, *, candidate_budget: int,
+                     human_time_budget_s: float) -> dict[str, ArmContext]:
+        """Add a block, or RE-ATTACH to one that already exists (restart).
+
+        After a restart the registry (and therefore the persisted block) still
+        exists, but the in-memory arm contexts do not. Re-creating the block
+        would be a duplicate; refusing would make a run unresumable. This
+        rebuilds the contexts and re-validates the SAME boundaries WITHOUT
+        writing anything new.
+        """
+        if spec.block_id in self._contexts:
+            return self._contexts[spec.block_id]
+        if spec.block_id not in self.registry.blocks:
+            return self.add_block(spec, candidate_budget=candidate_budget,
+                                  human_time_budget_s=human_time_budget_s)
+        partition = validate_evidence_partition(
+            snapshot_id=spec.snapshot_id,
+            current_evidence=spec.current_evidence,
+            historical_experience=spec.historical_experience,
+            historical_evidence=spec.historical_evidence,
+            historical_failure=spec.historical_failure,
+            explicit_current_ids=(tuple(spec.current_evidence_ids)
+                                  if spec.current_evidence_ids else None),
+            explicit_historical_ids=(tuple(spec.historical_ids)
+                                     if spec.historical_ids else None))
+        budget = validate_block_budget(
+            candidate_budget=candidate_budget,
+            human_time_budget_s=human_time_budget_s,
+            campaign_budget=(spec.campaign_budget
+                             or self.protocol.campaign_budget
+                             or self.protocol.budget),
+            protocol_campaign_budget=(self.protocol.campaign_budget or None))
+        contexts: dict[str, ArmContext] = {}
+        for arm in ARMS:
+            allow_history = ARM_CONTEXT_RULES[arm]["read_historical_experience"]
+            contexts[arm] = build_arm_context(
+                arm=arm, snapshot_id=spec.snapshot_id, seed=spec.seed,
+                current_evidence=spec.current_evidence,
+                historical_experience=(list(spec.historical_experience)
+                                       if allow_history else []),
+                historical_evidence=(list(spec.historical_evidence)
+                                     if allow_history else []),
+                historical_failure=(list(spec.historical_failure)
+                                    if allow_history else []),
+                candidate_budget=candidate_budget,
+                human_time_budget_s=human_time_budget_s)
+        self._partitions[spec.block_id] = partition
+        self._budgets[spec.block_id] = budget
+        self._contexts[spec.block_id] = contexts
+        return contexts
+
     # ------------------------------------------------------------- selection
     def select_objective(self, block_id: str, arm: str,
-                         objective: dict[str, Any] | None = None) -> dict[str, Any]:
+                         objective: dict[str, Any] | None = None, *,
+                         defer_review: bool = False,
+                         notes: dict[str, Any] | None = None) -> dict[str, Any]:
         """Record the selected objective for one arm.
 
         For A/B an operator supplies the human-selected objective. For C, if
         none is supplied, ``objective_selector`` is invoked with the SAME
         ArmContext (wired to the real Discovery by the operator). The Ranker
         NEVER participates in quality scoring here.
+
+        ``defer_review=True`` records the selection WITHOUT fabricating a
+        review: the objective is sealed into the blinding ledger (append-only
+        mapping) but no score exists yet. Real human submissions arrive through
+        ``ReviewQueue`` and are attached later -- the objective-quality metric
+        then stays MISSING until they do. This exists so a Pilot can execute
+        while the human review phase is still pending; it is never a way to
+        claim a review happened.
         """
         ctx = self._contexts[block_id][arm]
         if objective is None:
@@ -363,7 +424,13 @@ class EvaluationHarness:
             evidence_refs=list(objective.get("evidence_refs") or []),
             review_id=blinded.review_id,
             notes={"selection_context": ctx.to_dict(),
-                   "review_id": blinded.review_id})
+                   "review_id": blinded.review_id,
+                   "review_status": ("pending_human" if defer_review else ""),
+                   **dict(notes or {})})
+        if defer_review:
+            # NO review object is created. The metric stays missing until two
+            # real human reviewers submit through the queue.
+            return objective
         # Independent, blind, fixed-rubric review by the WHOLE panel.
         reviews = self.review_panel.review(blinded)
         human = [r for r in reviews if r.is_human_blind]

@@ -336,10 +336,11 @@ class ExperimentController:
     def mark_evaluating(self, block_id: str, *, campaign_id: str = "",
                         seconds: float = 0.0,
                         detail: dict[str, Any] | None = None) -> str:
+        """EXECUTING -> EVALUATING. ``detail.arm`` (optional) tags a campaign."""
         block = self.blocks[block_id]
-        if campaign_id:
-            block.campaign_ids[str(detail.get("arm") if detail else "")] = \
-                campaign_id
+        arm = str((detail or {}).get("arm") or "")
+        if campaign_id and arm:
+            block.campaign_ids[arm] = campaign_id
         block.seconds += max(0.0, seconds)
         self.budget.charge_seconds(seconds)
         return self._transition(E_EVALUATING, {

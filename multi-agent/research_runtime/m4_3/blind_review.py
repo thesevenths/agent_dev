@@ -107,6 +107,15 @@ def _scrub_text(value: str) -> str:
     return value
 
 
+def is_group_leaking(text: str) -> bool:
+    """True if ``text`` carries an arm / block / Ranker signal (fail-closed).
+
+    Public so a caller can decide NOT to hand such a string to the blinding
+    layer at all (e.g. an evidence reference that literally encodes the arm).
+    """
+    return any(p.search(str(text)) for p in _ARM_LEAK_PATTERNS)
+
+
 def _scrub_obj(value: Any) -> Any:
     """Recursively validate every string (keys AND values) in a payload."""
     if isinstance(value, str):
@@ -403,7 +412,8 @@ class BlindingLedger:
 __all__ = [
     "REVIEW_RUBRIC_VERSION", "RUBRIC_DIMENSIONS", "RUBRIC_SCALE",
     "REVIEW_KIND_HUMAN_BLIND", "REVIEW_KIND_AUTOMATED", "REVIEW_KINDS",
-    "FORBIDDEN_BLIND_FIELDS", "BlindingViolation", "BlindedObjective",
+    "FORBIDDEN_BLIND_FIELDS", "BlindingViolation", "is_group_leaking",
+    "BlindedObjective",
     "QualityReview", "blind", "IndependentReviewer", "ReviewPanel",
     "BlindingEntry", "BlindingLedger",
 ]

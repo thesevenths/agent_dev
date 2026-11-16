@@ -307,6 +307,24 @@ def _conclusion(*, stage: str, primary: dict[str, Any],
                 "reason": (f"{n_pairs} paired block(s) and/or an integrity "
                            "problem cannot support a value conclusion"),
                 "evidence": []}
+    if cb.get("p_value") is None or ca.get("p_value") is None:
+        # Missing primary data (e.g. pending human review) is NOT evidence of
+        # "no value": it is evidence that we cannot decide yet.
+        return {"outcome": VALUE_OUTCOMES[3], "significance_claimed": False,
+                "reason": ("the primary contrast has no computable statistic "
+                           f"(C-B n={cb.get('n')}, C-A n={ca.get('n')}); the "
+                           "human blind review and/or the remaining blocks must "
+                           "be completed first"),
+                "evidence": []}
+    if cb.get("p_value") is None or ca.get("p_value") is None:
+        # Missing primary data (e.g. pending human review) is NOT evidence of
+        # "no value": it is evidence that we cannot decide yet.
+        return {"outcome": VALUE_OUTCOMES[3], "significance_claimed": False,
+                "reason": ("the primary contrast has no computable statistic "
+                           f"(C-B n={cb.get('n')}, C-A n={ca.get('n')}); the "
+                           "human blind review and/or the remaining blocks must "
+                           "be completed first"),
+                "evidence": []}
     if cb.get("significant") and ca.get("significant"):
         return {"outcome": VALUE_OUTCOMES[0], "significance_claimed": True,
                 "reason": ("primary contrast C-B and secondary C-A are both "

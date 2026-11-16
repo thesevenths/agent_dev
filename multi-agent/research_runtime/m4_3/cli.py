@@ -77,8 +77,10 @@ def _config(args, *, stage: str, experiment_id: str | None = None):
         paired_seeds=tuple(args.seeds),
         candidate_budget=args.candidate_budget,
         human_time_budget_s=args.human_time_seconds,
+        # The domain policy caps a plan at 2 candidates; the recorded budget
+        # must describe what actually runs (no optimistic under-reporting).
         campaign_budget={"max_jobs": args.max_jobs, "max_seeds": len(args.seeds),
-                         "max_candidates": 1},
+                         "max_candidates": 2},
         approver_id=args.approver,
         max_campaigns=args.max_campaigns,
         max_wall_time_s=args.max_seconds,
@@ -114,17 +116,39 @@ def cmd_run(args) -> int:
 
     if stage == "confirmatory":
         from .confirmatory_protocol_builder import (
-            ProtocolBlocked, ProtocolNotApproved,
+            ProtocolBlocked, ProtocolNotApproved, load_frozen_protocol,
         )
         from .confirmatory_runner import ConfirmatoryRunner
         protocol_dir = _root(args) / "confirmatory" / "protocol"
-        controller = ExperimentController.load(cfg.experiment_id,
-                                               db=service.stores.db)
+        # ONE lifecycle record (pilot db) carries the human gates; the
+        # confirmatory REGISTRY (and its per-block bookkeeping) is separate.
+        from .confirmatory_protocol_builder import load_approval
+        lifecycle = ExperimentController.load(cfg.experiment_id,
+                                              db=_db(args, "pilot"))
+        protocol = load_frozen_protocol(protocol_dir)
+        approval = load_approval(protocol_sha256=protocol.freeze_sha256(),
+                                 out_dir=protocol_dir)
+        if lifecycle.state == "CONFIRMATORY_AWAITING_APPROVAL":
+            lifecycle.start_confirmatory(
+                approval_reference=(f"{approval['approved_by']}@"
+                                    f"{approval['approved_at']}"),
+                detail={"protocol_sha256": protocol.freeze_sha256()})
+        controller_id = f"{cfg.experiment_id}::confirmatory"
+        controller = ExperimentController.load(controller_id, db=_db(args, stage)) \
+            if _experiment_exists(_db(args, stage), controller_id) else None
+        if controller is None:
+            controller = ExperimentController.create(
+                experiment_id=controller_id, db=_db(args, stage),
+                config=cfg.to_dict(),
+                budget=BudgetGuard(max_campaigns=cfg.max_campaigns,
+                                   max_wall_time_s=cfg.max_wall_time_s))
+            controller.preflight(detail={"stage": stage})
+            controller.freeze_snapshots(list(protocol.snapshot_ids))
         try:
             runner = ConfirmatoryRunner.from_frozen(
                 service=service, config=cfg, out_dir=paths["base"],
                 controller=controller, protocol_dir=protocol_dir,
-                review_queue=queue)
+                review_queue=queue, lifecycle=lifecycle)
         except (ProtocolBlocked, ProtocolNotApproved) as exc:
             _print({"ok": False, "refused": type(exc).__name__, "error": str(exc)})
             return 3
@@ -164,10 +188,23 @@ def cmd_run(args) -> int:
 
 
 def _experiment_exists(db: Any, experiment_id: str) -> bool:
-    row = db.rows(
-        "SELECT 1 FROM m4_3_experiments WHERE experiment_id=?",
-        (experiment_id,))
-    return bool(row)
+    """Does this experiment already exist? (creates the additive schema)."""
+    from .experiment_state import ExperimentEventStore
+    store = ExperimentEventStore(db=db)      # idempotent CREATE TABLE IF NOT EXISTS
+    return store.load(experiment_id) is not None
+
+
+def _advance_to_pilot_completed(controller: Any, pilot: dict[str, Any]) -> None:
+    """Move the lifecycle to PILOT_COMPLETED exactly once (idempotent)."""
+    state = controller.state
+    if state == "BLOCK_COMPLETED":
+        controller.analyze_pilot(detail={
+            "n_blocks": pilot.get("n_blocks"),
+            "conclusion": (pilot.get("conclusion") or {}).get("verdict")})
+        state = controller.state
+    if state == "PILOT_ANALYZING":
+        controller.pilot_completed(detail={
+            "sample_size_status": (pilot.get("sample_size") or {}).get("status")})
 
 
 def _snapshot_ids(service, cfg) -> list[str]:
@@ -211,14 +248,14 @@ def cmd_prepare_confirmatory(args) -> int:
 
     pilot = json.loads((_root(args) / "pilot" / "pilot_analysis.json")
                        .read_text(encoding="utf-8"))
-    db = _db(args, "confirmatory")
-    controller = ExperimentController.load(args.experiment_id, db=db) \
-        if _experiment_exists(db, args.experiment_id) else None
-    if controller is None:
+    pilot_db = _db(args, "pilot")
+    if not _experiment_exists(pilot_db, args.experiment_id):
         _print({"ok": False,
                 "error": ("no pilot experiment record for "
                           f"{args.experiment_id!r}; run the pilot first")})
         return 3
+    controller = ExperimentController.load(args.experiment_id, db=pilot_db)
+    _advance_to_pilot_completed(controller, pilot)
     try:
         protocol = build_confirmatory_protocol(
             pilot_analysis=pilot,
@@ -272,7 +309,7 @@ def cmd_freeze_confirmatory(args) -> int:
         return 3
     pilot = json.loads(pilot_path.read_text(encoding="utf-8"))
     controller = ExperimentController.load(args.experiment_id,
-                                           db=_db(args, "confirmatory"))
+                                           db=_db(args, "pilot"))
     try:
         protocol = build_confirmatory_protocol(
             pilot_analysis=pilot,
@@ -321,7 +358,7 @@ def cmd_approve_confirmatory(args) -> int:
         _print({"ok": False, "error": str(exc)})
         return 3
     controller = ExperimentController.load(args.experiment_id,
-                                           db=_db(args, "confirmatory"))
+                                           db=_db(args, "pilot"))
     _print({"ok": True, "approval": approval,
             "controller_state": controller.state})
     return 0

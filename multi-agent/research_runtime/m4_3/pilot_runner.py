@@ -53,7 +53,7 @@ from ..research_director import ResearchDirector
 from ..research_store import from_research_objective
 from ..schemas import ResearchObjective
 from ..settings import DEFAULT_SCINET_DIR, resolve_engine
-from .blind_review import BlindingLedger
+from .blind_review import BlindingLedger, is_group_leaking
 from .evaluation_harness import EvaluationHarness, ProtocolViolation
 from .experiment_controller import BudgetExhausted, ExperimentController
 from .experiment_registry import ARMS, FrozenProtocol, RunRecord
@@ -381,10 +381,15 @@ class PilotRunner:
             reviewer_id="pilot_pending_review_placeholder",
             scorer=lambda _b: (_ for _ in ()).throw(RuntimeError(
                 "pilot does not fabricate reviews")))
+        # RECOVER the registry from the SAME database: a resumed run must see
+        # the blocks/runs it already produced (never re-create them).
+        from .experiment_registry import ExperimentRegistry
+        registry = ExperimentRegistry.recover(protocol=self.protocol,
+                                              db=self.service.stores.db)
         return EvaluationHarness(
             protocol=self.protocol, reviewer=placeholder,
             blinding=BlindingLedger(),
-            gate_adapter=self.gate_adapter, db=self.service.stores.db)
+            gate_adapter=self.gate_adapter, registry=registry)
 
     def _snapshot_id(self, block_number: int) -> str:
         return f"{self.config.run_id}::block_{block_number}"
@@ -428,17 +433,28 @@ class PilotRunner:
                        evidence_view=new_view)
 
     def _historical_snapshot(self, block_number: int,
-                             history_ids: list[str] | None = None
+                             history_ids: list[str] | None = None,
+                             current_snap: DiscoverySnapshot | None = None
                              ) -> DiscoverySnapshot:
-        """History view: the SAME real run, plus prior objectives/sessions.
+        """History view: the SAME research opportunity + prior research.
 
-        B and C receive exactly this object, so their historical context is
-        identical by construction. Arm A never sees it.
+        B and C read the SAME current evidence subset as A (so all three arms
+        study one opportunity) PLUS the persisted history (earlier objectives,
+        sessions, Experience, failures). Arm A never sees the history.
+
+        Scoping the EVIDENCE to the block subset matters scientifically: the
+        Critic refuses to re-propose a direction that is already an objective,
+        so a block must bring its own evidence; only the CONTEXT is shared.
         """
+        from dataclasses import replace
         provider = DiscoveryContextProvider(stores=self.service.stores)
         ids = (history_ids if history_ids is not None
                else self._historical_objective_ids())
-        return provider.build_snapshot(self.config.run_id, objective_ids=ids)
+        full = provider.build_snapshot(self.config.run_id, objective_ids=ids)
+        if current_snap is None:
+            return full
+        return replace(full, run_id=self._snapshot_id(block_number),
+                       evidence_view=current_snap.evidence_view)
 
     # ------------------------------------------------------- selection core
     def _subject_objective(self, candidate: ObjectiveCandidate, *,
@@ -502,136 +518,209 @@ class PilotRunner:
         snap_id = self._snapshot_id(block_number)
         seed = self.config.block_seed + block_number - 1
         started = time.time()
-        self.controller.begin_block(bid, detail={"snapshot_id": snap_id,
-                                                 "seed": seed})
+        prior_progress = self.controller.blocks.get(bid)
+        if prior_progress is not None and \
+                prior_progress.state == "BLOCK_COMPLETED":
+            # Already finished in a previous process: never re-run it.
+            recorded = self._block_record_from_registry(bid, snap_id, seed)
+            if recorded is not None:
+                self.blocks.append(recorded)
+                return recorded
+        if prior_progress is None:
+            self.controller.begin_block(bid, detail={"snapshot_id": snap_id,
+                                                     "seed": seed})
+        elif self.controller.state in ("CREATED", "PREFLIGHTING"):
+            self.controller.begin_block(bid, detail={"snapshot_id": snap_id,
+                                                     "seed": seed})
 
         # History is frozen BEFORE this block selects anything: A/B/C must see
         # the context as it was at the start of the block.
         history_ids = self._historical_objective_ids()
         current_snap = self._block_snapshot(full, block_number, evidence_ids)
-        history_snap = self._historical_snapshot(block_number, history_ids)
+        history_snap = self._historical_snapshot(block_number, history_ids,
+                                                 current_snap)
         current_ids = [str(e.get("evidence_id")) for e in
                        (current_snap.evidence_view.get("evidence") or [])]
         visible_a = set(current_ids)
+        # B/C may additionally read earlier evidence entities as HISTORY.
         visible_bc = set(current_ids) | {
             str(e.get("evidence_id")) for e in
-            (history_snap.evidence_view.get("evidence") or [])}
+            (full.evidence_view.get("evidence") or [])}
 
         # ---- build the shared block (A/B/C contexts from the SAME snapshot)
-        self.harness.add_block(
+        self.harness.ensure_block(
             self._block_spec(bid, snap_id, seed, current_ids, block_number,
                              history_ids),
             candidate_budget=self.config.candidate_budget,
             human_time_budget_s=self.config.human_time_budget_s)
 
-        # ---- arm A: current evidence only
+        # ---- per-arm selection (RESUMABLE: never re-select a registered arm)
         critic = ObjectiveCritic()
-        pool_a = self._candidate_pool(current_snap, critic)
-        cand_a, why_a = self._selector(pool_a, visible_ids=visible_a)
-        sel_a = SelectionRecord(
-            block_id=bid, arm="A", selector_id=self.config.selector_id,
-            protocol=self.config.selection_protocol, selected_at=_now(),
-            order_index=1, duration_s=0.0,
-            visible_evidence_ids=sorted(visible_a),
-            context_sha256=_hash({"arm": "A", "ids": sorted(visible_a)}),
-            candidate_ids=[c.candidate_id for c in pool_a],
-            selected_candidate_id=cand_a.candidate_id,
-            selected_objective_id=f"obj_sel_{bid}_A", rationale=why_a,
-            generation_source=cand_a.generation_source,
-            ranker_version=self.protocol.ranker_version,
-            rank_score=cand_a.rank_score)
-        self._write_selection(sel_a)
-        obj_a = self._subject_objective(
-            cand_a, objective_id=sel_a.selected_objective_id, arm="A",
-            selection=sel_a)
+        objectives: dict[str, dict[str, Any]] = {}
+        review_ids: dict[str, str] = {}
+        discovery_info: dict[str, Any] = {}
+
+        def _resume_arm(arm: str) -> bool:
+            existing = self.harness.registry.runs.get(f"{bid}_{arm}")
+            if existing is None:
+                return False
+            stored = self.service.stores.objectives.get(existing.objective_id)
+            review_ids[arm] = existing.review_id
+            objectives[arm] = {
+                "objective_id": existing.objective_id,
+                "description": getattr(stored, "description", "") or "",
+                "evidence_refs": list(existing.evidence_refs),
+                "success_criteria": dict(
+                    getattr(stored, "success_criteria", {}) or {})}
+            return True
+
+        # Pools are built BEFORE any arm persists an objective: once A's
+        # objective exists, the Critic would flag it as a duplicate and B would
+        # lose that candidate from its (identical) opportunity.
+        pool_a: list[ObjectiveCandidate] = []
+        pool_b: list[ObjectiveCandidate] = []
+        if self.harness.registry.runs.get(f"{bid}_A") is None:
+            pool_a = self._candidate_pool(current_snap, critic)
+        if self.harness.registry.runs.get(f"{bid}_B") is None:
+            pool_b = self._candidate_pool(history_snap, critic)
+
+        # ---- arm A: current evidence only
+        if not _resume_arm("A"):
+            cand_a, why_a = self._selector(pool_a, visible_ids=visible_a)
+            sel_a = SelectionRecord(
+                block_id=bid, arm="A", selector_id=self.config.selector_id,
+                protocol=self.config.selection_protocol, selected_at=_now(),
+                order_index=1, duration_s=0.0,
+                visible_evidence_ids=sorted(visible_a),
+                context_sha256=_hash({"arm": "A", "ids": sorted(visible_a)}),
+                candidate_ids=[c.candidate_id for c in pool_a],
+                selected_candidate_id=cand_a.candidate_id,
+                selected_objective_id=f"obj_sel_{bid}_A", rationale=why_a,
+                generation_source=cand_a.generation_source,
+                ranker_version=self.protocol.ranker_version,
+                rank_score=cand_a.rank_score)
+            self._write_selection(sel_a)
+            objectives["A"] = self._subject_objective(
+                cand_a, objective_id=sel_a.selected_objective_id, arm="A",
+                selection=sel_a)
 
         # ---- arm B: SAME historical context as C, human-protocol selection
-        pool_b = self._candidate_pool(history_snap, critic)
-        cand_b, why_b = self._selector(pool_b, visible_ids=visible_bc)
-        sel_b = SelectionRecord(
-            block_id=bid, arm="B", selector_id=self.config.selector_id,
-            protocol=self.config.selection_protocol, selected_at=_now(),
-            order_index=2, duration_s=0.0,
-            visible_evidence_ids=sorted(visible_bc),
-            context_sha256=_hash({"arm": "B", "ids": sorted(visible_bc)}),
-            candidate_ids=[c.candidate_id for c in pool_b],
-            selected_candidate_id=cand_b.candidate_id,
-            selected_objective_id=f"obj_sel_{bid}_B", rationale=why_b,
-            generation_source=cand_b.generation_source,
-            ranker_version=self.protocol.ranker_version,
-            rank_score=cand_b.rank_score)
-        self._write_selection(sel_b)
-        obj_b = self._subject_objective(
-            cand_b, objective_id=sel_b.selected_objective_id, arm="B",
-            selection=sel_b)
+        if not _resume_arm("B"):
+            cand_b, why_b = self._selector(pool_b, visible_ids=visible_bc)
+            sel_b = SelectionRecord(
+                block_id=bid, arm="B", selector_id=self.config.selector_id,
+                protocol=self.config.selection_protocol, selected_at=_now(),
+                order_index=2, duration_s=0.0,
+                visible_evidence_ids=sorted(visible_bc),
+                context_sha256=_hash({"arm": "B", "ids": sorted(visible_bc)}),
+                candidate_ids=[c.candidate_id for c in pool_b],
+                selected_candidate_id=cand_b.candidate_id,
+                selected_objective_id=f"obj_sel_{bid}_B", rationale=why_b,
+                generation_source=cand_b.generation_source,
+                ranker_version=self.protocol.ranker_version,
+                rank_score=cand_b.rank_score)
+            self._write_selection(sel_b)
+            objectives["B"] = self._subject_objective(
+                cand_b, objective_id=sel_b.selected_objective_id, arm="B",
+                selection=sel_b)
 
         # ---- arm C: REAL Discovery (generator + critic + ranker)
-        discovery = ObjectiveDiscovery(
-            generator=ObjectiveCandidateGenerator(domain=self.config.domain),
-            critic=critic, ranker=ObjectiveRanker(), domain=self.config.domain)
-        result_c = discovery.discover(history_snap,
-                                      objective_store=self.service.stores.objectives,
-                                      domain=self.config.domain)
-        if not result_c.proposed_objective_ids:
-            raise SelectionError(
-                "real ObjectiveDiscovery approved no objective for arm C")
-        c_id = result_c.proposed_objective_ids[0]
-        c_ranked = next((r for r in result_c.ranked
-                         if r.get("objective_id") == c_id), {})
-        sel_c = SelectionRecord(
-            block_id=bid, arm="C", selector_id="objective_discovery",
-            protocol="real_discovery_generator_critic_ranker",
-            selected_at=_now(), order_index=3, duration_s=0.0,
-            visible_evidence_ids=sorted(visible_bc),
-            context_sha256=_hash({"arm": "C", "ids": sorted(visible_bc)}),
-            candidate_ids=[c["candidate_id"] for c in result_c.ranked],
-            selected_candidate_id=str(c_ranked.get("candidate_id", "")),
-            selected_objective_id=c_id,
-            rationale=(f"ranked #1 of {len(result_c.ranked)} approved "
-                       f"candidates (critic rejected {len(result_c.rejected)})"),
-            generation_source=str(c_ranked.get("generation_source", "")),
-            ranker_version=result_c.ranker_version,
-            rank_score=c_ranked.get("rank_score"))
-        self._write_selection(sel_c)
-        stored_c = self.service.stores.objectives.get(c_id)
-        obj_c = {"objective_id": c_id,
-                 "description": getattr(stored_c, "description", "") or "",
-                 "evidence_refs": list(c_ranked.get("evidence_refs") or []),
-                 "success_criteria": dict(getattr(stored_c, "success_criteria",
-                                                  {}) or {}),
-                 "generation_source": sel_c.generation_source,
-                 "rank_score": sel_c.rank_score}
+        if not _resume_arm("C"):
+            discovery = ObjectiveDiscovery(
+                generator=ObjectiveCandidateGenerator(
+                    domain=self.config.domain),
+                critic=critic, ranker=ObjectiveRanker(),
+                domain=self.config.domain)
+            result_c = discovery.discover(
+                history_snap, objective_store=self.service.stores.objectives,
+                domain=self.config.domain)
+            if not result_c.proposed_objective_ids:
+                raise SelectionError(
+                    "real ObjectiveDiscovery approved no objective for arm C")
+            c_id = result_c.proposed_objective_ids[0]
+            c_ranked = next((r for r in result_c.ranked
+                             if r.get("objective_id") == c_id), {})
+            sel_c = SelectionRecord(
+                block_id=bid, arm="C", selector_id="objective_discovery",
+                protocol="real_discovery_generator_critic_ranker",
+                selected_at=_now(), order_index=3, duration_s=0.0,
+                visible_evidence_ids=sorted(visible_bc),
+                context_sha256=_hash({"arm": "C", "ids": sorted(visible_bc)}),
+                candidate_ids=[c["candidate_id"] for c in result_c.ranked],
+                selected_candidate_id=str(c_ranked.get("candidate_id", "")),
+                selected_objective_id=c_id,
+                rationale=(f"ranked #1 of {len(result_c.ranked)} approved "
+                           f"candidates (critic rejected "
+                           f"{len(result_c.rejected)})"),
+                generation_source=str(c_ranked.get("generation_source", "")),
+                ranker_version=result_c.ranker_version,
+                rank_score=c_ranked.get("rank_score"))
+            self._write_selection(sel_c)
+            stored_c = self.service.stores.objectives.get(c_id)
+            objectives["C"] = {
+                "objective_id": c_id,
+                "description": getattr(stored_c, "description", "") or "",
+                "evidence_refs": list(c_ranked.get("evidence_refs") or []),
+                "success_criteria": dict(
+                    getattr(stored_c, "success_criteria", {}) or {}),
+                "generation_source": sel_c.generation_source,
+                "rank_score": sel_c.rank_score}
+            discovery_info = result_c.to_dict()
 
-        # ---- record selections + queue the human blind review (pending)
-        objectives = {"A": obj_a, "B": obj_b, "C": obj_c}
-        review_ids: dict[str, str] = {}
+        # ---- register + queue the human blind review (only for NEW arms)
+        newly_registered = 0
         for arm in ARMS:
+            if arm in review_ids:            # resumed: already registered
+                continue
+            safe_refs, withheld = self._reviewer_safe_refs(
+                objectives[arm].get("evidence_refs") or [])
+            review_objective = {**objectives[arm], "evidence_refs": safe_refs}
             self.harness.select_objective(
-                bid, arm, objective=objectives[arm], defer_review=True,
-                notes={"selection_arm": arm, "block": bid})
+                bid, arm, objective=review_objective, defer_review=True,
+                notes={"selection_arm": arm, "block": bid,
+                       "withheld_evidence_refs": withheld})
             run = self.harness.registry.runs_for_block(bid)[arm]
             review_ids[arm] = run.review_id
+            newly_registered += 1
             if self.review_queue is not None:
                 self.review_queue.enqueue(
                     experiment_id=self.config.experiment_id,
-                    objective=objectives[arm], arm=arm, block_id=bid,
+                    objective=review_objective, arm=arm, block_id=bid,
                     snapshot_id=snap_id, review_id=run.review_id)
-        self.controller.request_review(bid, detail={"review_ids": review_ids})
-        if self.config.require_review_complete:
-            status = self.review_status(review_ids)
-            if not status["complete"]:
-                raise ReviewIncomplete(
-                    "this stage requires COMPLETED independent human blind "
-                    f"review; pending: {status['pending']}")
-            self.controller.complete_review(
-                bid, reviewers=status["reviewers"],
-                review_ids=sorted(review_ids.values()),
-                detail={"review_status": status})
-        else:
-            self.controller.defer_review(
-                bid, reason=("human blind review pending: objectives queued "
-                             "for >=2 independent reviewers; no review is "
-                             "fabricated by the pilot"))
+
+        if self.controller.state == "SELECTING_OBJECTIVES":
+            self.controller.request_review(bid, detail={
+                "review_ids": review_ids,
+                "newly_registered": newly_registered})
+            if self.config.require_review_complete:
+                status = self.review_status(review_ids)
+                if not status["complete"]:
+                    raise ReviewIncomplete(
+                        "this stage requires COMPLETED independent human blind "
+                        f"review; pending: {status['pending']}")
+                self.controller.complete_review(
+                    bid, reviewers=status["reviewers"],
+                    review_ids=sorted(review_ids.values()),
+                    detail={"review_status": status})
+            else:
+                self.controller.defer_review(
+                    bid, reason=("human blind review pending: objectives "
+                                 "queued for >=2 independent reviewers; no "
+                                 "review is fabricated by the pilot"))
+        elif self.controller.state == "AWAITING_REVIEW":
+            if self.config.require_review_complete:
+                status = self.review_status(review_ids)
+                if not status["complete"]:
+                    raise ReviewIncomplete(
+                        "this stage requires COMPLETED independent human blind "
+                        f"review; pending: {status['pending']}")
+                self.controller.complete_review(
+                    bid, reviewers=status["reviewers"],
+                    review_ids=sorted(review_ids.values()),
+                    detail={"review_status": status})
+            else:
+                self.controller.defer_review(
+                    bid, reason="human blind review pending (resumed)")
 
         # ---- execute the three real chains (prepare -> approve ALL -> run)
         outcomes: dict[str, str] = {}
@@ -683,13 +772,26 @@ class PilotRunner:
                  "outcomes": outcomes,
                  "seconds": round(time.time() - started, 2),
                  "exec_seconds": round(exec_seconds, 2),
-                 "discovery": {"n_candidates": result_c.n_candidates,
-                               "n_approved": result_c.n_approved,
-                               "n_rejected": len(result_c.rejected),
-                               "ranker_version": result_c.ranker_version}}
+                 # Full, real Discovery provenance (generator/critic/ranker).
+                 "discovery": discovery_info}
         self.blocks.append(block)
         self._save_records()
         return block
+
+    @staticmethod
+    def _reviewer_safe_refs(refs: list[Any]) -> tuple[list[Any], list[Any]]:
+        """Split refs into reviewer-visible and withheld (group-leaking).
+
+        An evidence reference that literally encodes an arm (e.g. a historical
+        objective id) may never reach a reviewer. It is withheld from the BLIND
+        payload, still recorded on the run, and the withheld list is surfaced in
+        the run notes -- nothing is silently dropped.
+        """
+        safe: list[Any] = []
+        withheld: list[Any] = []
+        for ref in refs:
+            (withheld if is_group_leaking(str(ref)) else safe).append(ref)
+        return safe, withheld
 
     def review_status(self, review_ids: dict[str, str]) -> dict[str, Any]:
         """Is the human blind review COMPLETE for every queued objective?"""
@@ -705,6 +807,36 @@ class PilotRunner:
             reviewers.update(c.get("reviewers") or [])
         return {"complete": not pending, "pending": sorted(pending),
                 "reviewers": sorted(reviewers)}
+
+    def _block_record_from_registry(self, bid: str, snap_id: str,
+                                    seed: int) -> dict[str, Any] | None:
+        """Reconstruct the record of an ALREADY completed block (no re-run)."""
+        arms = self.harness.registry.runs_for_block(bid)
+        if len(arms) != len(ARMS) or not all(r.finalized for r in arms.values()):
+            return None
+        return {"block_id": bid, "snapshot_id": snap_id, "seed": seed,
+                "resumed": True,
+                "objective_ids": {a: arms[a].objective_id for a in ARMS},
+                "gate_refs": {a: self._ref_from_record(arms[a]).to_dict()
+                              for a in ARMS},
+                "outcomes": {a: arms[a].outcome for a in ARMS},
+                "review_ids": {a: arms[a].review_id for a in ARMS},
+                "seconds": 0.0, "exec_seconds": 0.0}
+
+    def _block_record_from_registry(self, bid: str, snap_id: str,
+                                    seed: int) -> dict[str, Any] | None:
+        """Reconstruct the record of an ALREADY completed block (no re-run)."""
+        arms = self.harness.registry.runs_for_block(bid)
+        if len(arms) != len(ARMS) or not all(r.finalized for r in arms.values()):
+            return None
+        return {"block_id": bid, "snapshot_id": snap_id, "seed": seed,
+                "resumed": True,
+                "objective_ids": {a: arms[a].objective_id for a in ARMS},
+                "gate_refs": {a: self._ref_from_record(arms[a]).to_dict()
+                              for a in ARMS},
+                "outcomes": {a: arms[a].outcome for a in ARMS},
+                "review_ids": {a: arms[a].review_id for a in ARMS},
+                "seconds": 0.0, "exec_seconds": 0.0}
 
     def _block_spec(self, bid: str, snap_id: str, seed: int,
                     current_ids: list[str], block_number: int,
@@ -731,6 +863,16 @@ class PilotRunner:
         except Exception:  # noqa: BLE001 - absent history is legitimate
             pass
         marker = f"block_snapshot_{block_number}:{_hash(sorted(current_ids))[:16]}"
+        # REAL historical evidence entities: everything outside this block's
+        # opportunity. Explicit, disjoint ids -- never synthesised.
+        try:
+            full_ids = [str(e.get("evidence_id")) for e in
+                        (self._full_snapshot().evidence_view.get("evidence")
+                         or [])]
+        except Exception:  # noqa: BLE001
+            full_ids = []
+        historical_evidence = [{"evidence_id": eid} for eid in full_ids
+                               if eid and eid not in set(current_ids)]
         return BlockSpec(
             block_id=bid, snapshot_id=snap_id, seed=seed,
             current_evidence={"evidence_id": marker,
@@ -738,8 +880,7 @@ class PilotRunner:
                               "snapshot_sha256": _hash(sorted(current_ids))},
             current_evidence_ids=(marker,),
             historical_experience=experience,
-            historical_evidence=[{"evidence_id": f"hist:{i}"}
-                                 for i in range(len(experience))],
+            historical_evidence=historical_evidence,
             historical_failure=failures,
             campaign_budget=dict(self.config.campaign_budget))
 

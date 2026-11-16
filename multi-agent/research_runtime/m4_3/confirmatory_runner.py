@@ -37,7 +37,8 @@ class ConfirmatoryRunner(PilotRunner):
     def __init__(self, *, service: Any, config: PilotConfig,
                  out_dir: str | Path, controller: ExperimentController,
                  protocol: FrozenProtocol, approval: dict[str, Any],
-                 review_queue: ReviewQueue | None = None):
+                 review_queue: ReviewQueue | None = None,
+                 lifecycle: ExperimentController | None = None):
         if not protocol.confirmatory:
             raise ProtocolBlocked("the confirmatory runner needs a frozen "
                                   "confirmatory protocol")
@@ -58,6 +59,11 @@ class ConfirmatoryRunner(PilotRunner):
             raise ProtocolBlocked(
                 "the confirmatory stage requires COMPLETED human blind review "
                 "for every queued objective")
+        # ``lifecycle`` is the ONE experiment record (pilot db) that carries the
+        # human gates; ``controller`` book-keeps the confirmatory blocks in the
+        # confirmatory registry. Keeping them separate means the confirmatory
+        # registry never mixes pilot runs into the final analysis.
+        self.lifecycle = lifecycle
         super().__init__(service=service, config=config, out_dir=out_dir,
                          controller=controller, review_queue=review_queue,
                          protocol=protocol)
@@ -67,14 +73,20 @@ class ConfirmatoryRunner(PilotRunner):
     def from_frozen(cls, *, service: Any, config: PilotConfig,
                     out_dir: str | Path, controller: ExperimentController,
                     protocol_dir: str | Path,
-                    review_queue: ReviewQueue | None = None
+                    review_queue: ReviewQueue | None = None,
+                    lifecycle: ExperimentController | None = None
                     ) -> "ConfirmatoryRunner":
         protocol = load_frozen_protocol(protocol_dir)
         approval = load_approval(protocol_sha256=protocol.freeze_sha256(),
                                  out_dir=protocol_dir)
         return cls(service=service, config=config, out_dir=out_dir,
                    controller=controller, protocol=protocol,
-                   approval=approval, review_queue=review_queue)
+                   approval=approval, review_queue=review_queue,
+                   lifecycle=lifecycle)
+
+    def _block_id(self, block_number: int) -> str:
+        """Confirmatory blocks never share an id with a pilot block."""
+        return f"confirm_block_{block_number}"
 
     def _snapshot_id(self, block_number: int) -> str:
         ids = list(self.protocol.snapshot_ids)
@@ -86,18 +98,25 @@ class ConfirmatoryRunner(PilotRunner):
     # ----------------------------------------------------------------- run
     def run(self) -> dict[str, Any]:
         """Execute the frozen design. Refuses without every precondition."""
-        if self.controller.state not in ("CONFIRMATORY_AWAITING_APPROVAL",):
+        gate = self.lifecycle or self.controller
+        allowed = ("CONFIRMATORY_AWAITING_APPROVAL", "CONFIRMATORY_EXECUTING")
+        if gate.state not in allowed:
             raise ProtocolNotApproved(
-                "the experiment controller is not awaiting confirmatory "
-                f"approval (state={self.controller.state!r}); confirmatory "
-                "runs never start automatically")
-        if not self.controller.record.config.get("confirmatory_protocol_sha256"):
+                "the experiment lifecycle is not awaiting confirmatory "
+                f"approval (state={gate.state!r}); confirmatory runs never "
+                "start automatically")
+        if not gate.record.config.get("confirmatory_protocol_sha256"):
             raise ProtocolNotApproved(
-                "the controller has no frozen protocol SHA; freeze first")
-        if self.controller.record.config["confirmatory_protocol_sha256"] != \
+                "the lifecycle has no frozen protocol SHA; freeze first")
+        if gate.record.config["confirmatory_protocol_sha256"] != \
                 self.protocol.freeze_sha256():
             raise ProtocolNotApproved(
-                "the controller is bound to a DIFFERENT protocol SHA")
+                "the lifecycle is bound to a DIFFERENT protocol SHA")
+        if self.lifecycle is not None and \
+                self.lifecycle.state == "CONFIRMATORY_AWAITING_APPROVAL":
+            raise ProtocolNotApproved(
+                "call start_confirmatory with the human approval reference "
+                "before executing the confirmatory blocks")
         rep = preflight(self.config, service=self.service)
         if not rep.ready:
             raise PreflightError(
