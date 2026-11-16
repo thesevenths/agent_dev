@@ -153,6 +153,8 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
                           correction: str = "holm",
                           protocol: dict[str, Any] | None = None,
                           pilot_analysis: dict[str, Any] | None = None,
+                          human_quality_overlay: dict[str, dict[str, Any]]
+                          | None = None,
                           write: bool = True) -> dict[str, Any]:
     """Build the value report for ``stage`` ('pilot' or 'final')."""
     if stage not in ("pilot", "final"):
@@ -160,6 +162,10 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     runs = load_runs(db)
+    # P1-04: overlay closed human reviews (non-invasive; no run rewrite).
+    if human_quality_overlay:
+        from .review_bridge import apply_overlay
+        runs = apply_overlay(runs, human_quality_overlay)
     blocks = RegistryStore(db=db).load_blocks()
     by_arm = _runs_by_arm(runs)
     integrity = RegistryStore(db=db).verify_integrity()

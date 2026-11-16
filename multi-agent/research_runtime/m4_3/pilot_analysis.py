@@ -116,6 +116,8 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
                   seoi_valid_findings: float = 0.01,
                   bootstrap_resamples: int = BOOTSTRAP_RESAMPLES,
                   protocol: dict[str, Any] | None = None,
+                  human_quality_overlay: dict[str, dict[str, Any]] | None = None,
+                  review_closure: dict[str, Any] | None = None,
                   write: bool = True) -> dict[str, Any]:
     """Recompute the full pilot analysis from the persisted registry."""
     out = Path(out_dir)
@@ -126,6 +128,13 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
     integrity = store.verify_integrity()
     human = _human_reviews(db)
     automated = _automated_scores(db)
+
+    # P1-04: if a REAL human blind-review closure was resolved (unblinded +
+    # >=2 distinct human reviewers), overlay its quality onto the in-memory
+    # runs. Finalized records on disk are NEVER touched.
+    if human_quality_overlay:
+        from .review_bridge import apply_overlay
+        runs = apply_overlay(runs, human_quality_overlay)
 
     by_arm: dict[str, list[RunRecord]] = {a: [r for r in runs if r.arm == a]
                                           for a in ARMS}
@@ -241,8 +250,10 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
     quality["n_human_blind_reviews"] = len(human)
     quality["n_automated_scores"] = len(automated)
     quality["review_status"] = (
-        "complete" if human and all(q[arm]["n_with_review"] == len(by_arm[arm])
-                                    for arm in ARMS) else "pending_or_partial")
+        "complete" if human and all(
+            quality[arm]["n_with_review"] == len(by_arm[arm])
+            and len(by_arm[arm]) > 0 for arm in ARMS)
+        else "pending_or_partial")
     quality["note"] = (
         "objective quality is a HUMAN-BLIND metric; automated scores are stored "
         "separately and never enter it")
@@ -346,6 +357,10 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
         "objective_quality": quality,
         "blocks": block_rows,
         "paired_contrasts": contrasts,
+        "review_closure": dict(review_closure or {
+            "status": "not_applied",
+            "note": ("no human blind-review closure was supplied; objective "
+                     "quality stays missing until two real humans submit")}),
         "hierarchy": ["snapshot", "block", "seed"],
         "economics": economics,
         "data_integrity": data_integrity,

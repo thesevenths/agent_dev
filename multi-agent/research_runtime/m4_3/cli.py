@@ -211,6 +211,22 @@ def _snapshot_ids(service, cfg) -> list[str]:
     return [f"{cfg.run_id}::block_{i}" for i in range(1, cfg.n_blocks + 1)]
 
 
+def _resolve_review_closure(db: Any, experiment_id: str) -> dict[str, Any]:
+    """Read the REAL human blind-review queue; resolve only if fully closed.
+
+    Returns a dict with ``overlay`` and audit info. Never fabricates a review:
+    with pending/missing submissions the overlay is empty.
+    """
+    from .review_bridge import resolve_human_quality_overlay
+    from .review_queue import ReviewQueue
+    queue = ReviewQueue(db=db)
+    resolved = resolve_human_quality_overlay(
+        queue=queue, experiment_id=experiment_id)
+    resolved["closure_applied"] = bool(resolved["overlay"]) and \
+        resolved["unblinded"]
+    return resolved
+
+
 def cmd_analyze_pilot(args) -> int:
     from .pilot_analysis import analyze_pilot
     from .value_report import generate_value_report
@@ -228,16 +244,33 @@ def cmd_analyze_pilot(args) -> int:
         rebuilt = protocol_from_config(payload.get("config") or {})
         if rebuilt.freeze_sha256() == payload.get("protocol_sha256"):
             protocol = rebuilt.frozen_dict()
-    analysis = analyze_pilot(db=db, out_dir=_root(args) / "pilot",
-                             experiment_id=args.experiment_id,
-                             alpha=args.alpha,
-                             seoi_quality=args.seoi,
-                             seoi_valid_findings=getattr(
-                                 args, "seoi_valid", 0.01),
-                             protocol=protocol, write=True)
-    generate_value_report(db=db, out_dir=_root(args) / "pilot",
+
+    # P1-04: resolve REAL human blind-review closure. Versioned output keeps
+    # the original pilot report untouched; a fixed run writes to a sibling dir.
+    closure = _resolve_review_closure(db, args.experiment_id)
+    closure["status"] = ("closed" if closure["closure_applied"]
+                         else "pending_human_reviews")
+    out_dir = _root(args) / "pilot"
+    version = getattr(args, "analysis_version", "") or ""
+    if version:
+        out_dir = out_dir / version
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    analysis = analyze_pilot(
+        db=db, out_dir=out_dir,
+        experiment_id=args.experiment_id,
+        alpha=args.alpha,
+        seoi_quality=args.seoi,
+        seoi_valid_findings=getattr(args, "seoi_valid", 0.01),
+        protocol=protocol,
+        human_quality_overlay=closure["overlay"],
+        review_closure={k: v for k, v in closure.items()
+                        if k not in ("overlay",)},
+        write=True)
+    generate_value_report(db=db, out_dir=out_dir,
                           experiment_id=args.experiment_id, stage="pilot",
                           pilot_analysis=analysis, protocol=protocol,
+                          human_quality_overlay=closure["overlay"],
                           write=True)
     _print({"ok": True,
             "n_blocks": analysis["n_blocks"],
@@ -246,6 +279,9 @@ def cmd_analyze_pilot(args) -> int:
             "sample_size_status": analysis["sample_size"]["status"],
             "n_blocks_recommended":
                 analysis["sample_size"]["n_blocks_recommended"],
+            "review_closure_applied": closure["closure_applied"],
+            "n_runs_resolved_from_human_reviews":
+                closure["n_runs_resolved"],
             "outputs": ["pilot_analysis.json", "pilot_report.md",
                         "sample_size_recommendation.json",
                         "pilot_value_report.json",
@@ -523,6 +559,17 @@ def cmd_review(args) -> int:
             _print(queue.queue_status(args.experiment_id))
         elif args.review_cmd == "unblind":
             _print(queue.unblind(args.experiment_id))
+        elif args.review_cmd == "resolve-quality":
+            from .review_bridge import resolve_human_quality_overlay
+            resolved = resolve_human_quality_overlay(
+                queue=queue, experiment_id=args.experiment_id)
+            _print({"ok": resolved["closure_applied"]
+                    if "closure_applied" in resolved else
+                    bool(resolved["overlay"]) and resolved["unblinded"],
+                    "n_runs_resolved": resolved["n_runs_resolved"],
+                    "unblinded": resolved["unblinded"],
+                    "audit": resolved["audit"],
+                    "skipped": resolved["skipped"]})
         else:  # pragma: no cover - argparse enforces the choices
             raise SystemExit(2)
     except ReviewQueueViolation as exc:
@@ -572,6 +619,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="pre-registered SEOI for objective quality")
     sp.add_argument("--seoi-valid", type=float, default=0.01,
                     help="pre-registered SEOI for valid findings per compute")
+    sp.add_argument("--analysis-version", default="",
+                    help="write analysis to pilot/<version>/ (keeps original)")
     sp.set_defaults(func=cmd_analyze_pilot)
 
     for name, func in (("prepare-confirmatory", cmd_prepare_confirmatory),
@@ -643,6 +692,9 @@ def build_parser() -> argparse.ArgumentParser:
     rst.set_defaults(func=cmd_review)
     ru = rsub.add_parser("unblind", help="release the sealed arm mapping")
     ru.set_defaults(func=cmd_review)
+    rq = rsub.add_parser("resolve-quality",
+                         help="resolve completed human reviews into quality")
+    rq.set_defaults(func=cmd_review)
     return p
 
 
