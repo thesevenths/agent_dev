@@ -45,7 +45,9 @@ class RRSICoordinator:
             layer: str | None = None,
             domain: str | None = None,
             domain_candidate_available: bool = True,
-            require_structured_holdout: bool = False) -> dict[str, Any]:
+            require_structured_holdout: bool = False,
+            holdout_artifact_reader: Any = None,
+            holdout_manifest_path: str = "") -> dict[str, Any]:
         chosen = layer or self.select_layer(
             dominant_failure=dominant_failure, domain=domain,
             domain_candidate_available=domain_candidate_available)
@@ -81,7 +83,9 @@ class RRSICoordinator:
                     decision, holdout_confirmed=holdout_ok,
                     frozen_test_used=frozen, training_only=training_only,
                     holdout_evidence=result.get("holdout_evidence"),
-                    expected_candidate_sha=sha, expected_parent_sha=parent_sha)
+                    expected_candidate_sha=sha, expected_parent_sha=parent_sha,
+                    artifact_reader=holdout_artifact_reader,
+                    manifest_path=holdout_manifest_path)
             else:
                 gate = gate_allows_promotion(
                     decision, holdout_confirmed=holdout_ok,

@@ -13,6 +13,7 @@ explicit reason. Nothing here writes state or grants anything.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 _SHA64 = re.compile(r"^[0-9a-f]{64}$")
@@ -49,6 +50,8 @@ def verify_holdout_evidence(
     expected_parent_sha: str = "",
     min_holdout_tasks: int = 1,
     min_holdout_seeds: int = 2,
+    artifact_reader: Any = None,
+    manifest_path: str = "",
 ) -> dict[str, Any]:
     """Verify a structured holdout evidence object. Returns a verdict dict.
 
@@ -131,6 +134,28 @@ def verify_holdout_evidence(
     if n_tasks < min_holdout_tasks:
         problems.append("too_few_holdout_tasks")
 
+    # P0-E: structural validity != evidence truth. When a real artifact reader
+    # is provided, RE-READ the physical files and confirm the SHAs actually
+    # match what is on disk. A self-consistent but fabricated evidence object
+    # cannot pass this second, independent check.
+    if artifact_reader is not None:
+        try:
+            check = artifact_reader(evidence)
+            if not check.get("ok"):
+                problems.extend(check.get("reasons", ["artifact_reread_failed"]))
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            problems.append(f"artifact_reader_error:{type(exc).__name__}: {exc}")
+    if manifest_path:
+        p = Path(manifest_path)
+        if not p.is_file():
+            problems.append("manifest_path_missing")
+        else:
+            import hashlib as _h
+            with p.open("rb") as fh:
+                real_manifest_sha = _h.sha256(fh.read()).hexdigest()
+            if str(manifest).strip().lower() != real_manifest_sha:
+                problems.append("manifest_sha_mismatch_on_disk")
+
     return {"verified": not problems, "reasons": problems,
             "n_holdout_tasks": len(eval_ids) if isinstance(eval_ids, (list, tuple)) else 0}
 
@@ -144,6 +169,8 @@ def gate_allows_promotion_verified(
     holdout_evidence: Any = None,
     expected_candidate_sha: str = "",
     expected_parent_sha: str = "",
+    artifact_reader: Any = None,
+    manifest_path: str = "",
 ) -> tuple[bool, list[str]]:
     """Strict promotion gate: boolean + structured evidence must BOTH pass."""
     from .evolution_experiment import gate_allows_promotion  # local: avoid cycle
@@ -157,7 +184,8 @@ def gate_allows_promotion_verified(
     verdict = verify_holdout_evidence(
         holdout_evidence,
         expected_candidate_sha=expected_candidate_sha,
-        expected_parent_sha=expected_parent_sha)
+        expected_parent_sha=expected_parent_sha,
+        artifact_reader=artifact_reader, manifest_path=manifest_path)
     if not verdict["verified"]:
         reasons.extend(verdict["reasons"])
     return (not reasons, reasons)
@@ -176,6 +204,7 @@ def build_holdout_evidence(
     n_holdout_seeds: int | None = None,
     direction_fraction: float | None = None,
     result_shas: list[str] | None = None,
+    result_files: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build structured holdout evidence from REAL evaluation artifacts.
 
@@ -183,8 +212,11 @@ def build_holdout_evidence(
     split ids and the real seeds used for decision vs holdout. Task ids are
     derived as ``seed@split`` so a holdout on a DIFFERENT split or DIFFERENT
     seeds can never overlap selection. Dataset manifest SHA is read from disk.
-    No value here is fabricated; a missing manifest yields an empty SHA that
-    the verifier rejects.
+
+    P0-E: result SHAs are NEVER self-derived. They must either be supplied as
+    the caller's real result-file SHAs, or be computed HERE from ``result_files``
+    that exist on disk. Missing/unreadable files yield an empty sha and the
+    verifier then rejects promotion (fail-closed).
     """
     import hashlib
     from pathlib import Path
@@ -199,11 +231,19 @@ def build_holdout_evidence(
 
     eval_ids = [f"{s}@{split_id}" for s in holdout_seeds]
     sel_ids = [f"{s}@{selection_split_id}" for s in selection_seeds]
+    # P0-E: compute result SHAs ONLY from real files on disk. No self-derived
+    # hash may masquerade as an independent result artifact.
     if result_shas is None:
-        # Bind each holdout task to its seed/split identity deterministically.
-        result_shas = [hashlib.sha256(
-            f"{tid}|{manifest_sha}|{candidate_sha}".encode("utf-8")
-        ).hexdigest() for tid in eval_ids]
+        result_shas = []
+        for fp in (result_files or []):
+            fh = hashlib.sha256()
+            f = Path(fp)
+            if not f.is_file():
+                continue
+            with f.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(65536), b""):
+                    fh.update(chunk)
+            result_shas.append(fh.hexdigest())
 
     stats: dict[str, Any] = {
         "n_holdout_seeds": (int(n_holdout_seeds) if n_holdout_seeds is not None

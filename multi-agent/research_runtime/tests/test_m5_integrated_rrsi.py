@@ -1,6 +1,8 @@
 """M5-INTEGRATED -- RRSI facade serialization + holdout evidence builder (ENGINE-FREE)."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -28,21 +30,38 @@ def test_build_holdout_evidence_from_real_manifest(tmp_path):
     )
     manifest = tmp_path / "manifest.json"
     manifest.write_text('{"dataset_version":"v1"}', encoding="utf-8")
+    # P0-E: two REAL result files on disk; their SHAs must be bound verbatim.
+    result_files = []
+    for seed in (60, 61):
+        rp = tmp_path / f"result_{seed}.json"
+        rp.write_text(f'{{"seed":{seed},"Q":0.001}}', encoding="utf-8")
+        result_files.append(str(rp))
     ev = build_holdout_evidence(
         manifest_path=str(manifest), split_id="test",
         selection_split_id="validation",
         holdout_seeds=[60, 61], selection_seeds=[42, 43],
         candidate_sha="a" * 64, parent_sha="b" * 64,
+        result_files=result_files,
         holdout_metrics={"holdout_improvement": 0.001},
         direction_fraction=1.0)
     sha = "a" * 64
     import hashlib
     msha = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    real_shas = [hashlib.sha256(Path(f).read_bytes()).hexdigest()
+                 for f in result_files]
     assert ev["dataset_manifest_sha"] == msha
+    assert ev["result_shas"] == real_shas        # real artifacts, not derived
     assert ev["independent"] is True
     v = verify_holdout_evidence(ev, expected_candidate_sha=sha,
-                                expected_parent_sha="b" * 64)
+                                expected_parent_sha="b" * 64,
+                                manifest_path=str(manifest))
     assert v["verified"], v["reasons"]
+    # A fabricated evidence object with no real result files must FAIL.
+    bad = dict(ev, result_shas=[hashlib.sha256(b"fabricated").hexdigest()] * 2)
+    v2 = verify_holdout_evidence(
+        bad, expected_candidate_sha=sha, expected_parent_sha="b" * 64,
+        artifact_reader=lambda e: {"ok": False, "reasons": ["result_sha_not_on_disk"]})
+    assert not v2["verified"]
 
 
 def test_coordinator_outcome_carries_candidate_identity(tmp_path):

@@ -231,3 +231,51 @@ def test_classify_uses_real_store_not_round_flag(tmp_path):
     assert any("missing" in str(r).lower() or "unresolved" in str(r).lower()
                for r in report.get("reasons", [])) or \
            report["classification"] == C_RECOVERY
+
+
+# ------------------------------------------------------------------------ #
+# P0-E: Holdout truth is re-checked against real artifacts                 #
+# ------------------------------------------------------------------------ #
+def test_holdout_rejects_self_derived_result_sha(tmp_path):
+    """A well-formed evidence object with fake result SHAs must NOT promote."""
+    from research_runtime.rrsi.holdout_evidence import (
+        build_holdout_evidence, gate_allows_promotion_verified,
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"v": 1}', encoding="utf-8")
+    ev = build_holdout_evidence(
+        manifest_path=str(manifest), split_id="test",
+        selection_split_id="validation", holdout_seeds=[60, 61],
+        selection_seeds=[42, 43], candidate_sha="a" * 64,
+        # NO real result files -> result_shas empty -> builder cannot fabricate.
+        holdout_metrics={"Q": 1.0}, direction_fraction=1.0)
+    assert ev["result_shas"] == [], "builder must never self-derive result SHAs"
+    ok, reasons = gate_allows_promotion_verified(
+        "ACCEPTED", holdout_confirmed=True, holdout_evidence=ev,
+        expected_candidate_sha="a" * 64)
+    assert not ok and any("result_sha" in r for r in reasons), reasons
+
+    ok2, reasons2 = gate_allows_promotion_verified(
+        "ACCEPTED", holdout_confirmed=True, holdout_evidence=ev,
+        expected_candidate_sha="a" * 64, manifest_path=str(manifest))
+    assert not ok2
+
+
+def test_holdout_candidate_identity_uses_coordinator_sha(tmp_path):
+    """Harness artifact SHA != candidate-dict SHA; promotion binds the latter."""
+    from research_runtime.research_store.db import ResearchDatabase
+    from research_runtime.rrsi import (
+        RRSICoordinator, EvolutionRegistry, RESEARCH_HARNESS_LAYER,
+    )
+    coord = RRSICoordinator(
+        EvolutionRegistry(db=ResearchDatabase(tmp_path / "e.sqlite")))
+    cand = {"candidate_id": "harness::x", "target": "planner.strategy",
+            "artifact_sha256": "f" * 64}
+    dict_sha = coord._candidate_sha(cand)
+    assert dict_sha != cand["artifact_sha256"]
+    # A promotion gate given the artifact SHA as candidate_sha must reject.
+    from research_runtime.rrsi.holdout_evidence import gate_allows_promotion_verified
+    ok, reasons = gate_allows_promotion_verified(
+        "ACCEPTED", holdout_confirmed=True, holdout_evidence=None,
+        expected_candidate_sha=cand["artifact_sha256"])
+    assert not ok

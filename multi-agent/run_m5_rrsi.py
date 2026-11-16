@@ -128,12 +128,33 @@ def phase_domain_model(out: Path) -> dict[str, Any]:
                     else "INCONCLUSIVE")
         holdout_ok = bool(n_valid >= 2 and ho_frac is not None
                           and ho_frac >= 0.6 and all(x >= 0 for x in ho_imp))
+        # P0-E: persist REAL per-holdout-task results to disk and bind their
+        # SHAs -- never self-derive a "result sha" from seed/split strings.
+        # Each file is the actual measured base/candidate Q for one holdout
+        # seed, extracted from the real evaluate_domain_candidate record.
+        hb = rec.get("holdout_base_Q") or []
+        hc = rec.get("holdout_cand_Q") or []
+        result_paths: list[str] = []
+        for i, seed in enumerate(HOLDOUT_SEEDS):
+            per = {"seed": seed, "split": "holdout_seed",
+                   "candidate_sha": cand_sha,
+                   "base_Q": hb[i] if i < len(hb) else None,
+                   "cand_Q": hc[i] if i < len(hc) else None,
+                   "primary_metric": rec.get("primary_metric"),
+                   "metric_direction": rec.get("metric_direction")}
+            rp = out / f"domain_holdout_{cid}_{seed}.json"
+            rp.write_text(json.dumps(per, indent=2, sort_keys=True,
+                                     ensure_ascii=False, default=str),
+                          encoding="utf-8")
+            result_paths.append(str(rp))
+        parent_sha = coord.registry.parent_for(DOMAIN_MODEL_LAYER)
         he = build_holdout_evidence(
             manifest_path=str(MANIFEST_EMB), split_id="holdout_seed",
             selection_split_id="decision_seed",
             holdout_seeds=list(HOLDOUT_SEEDS),
             selection_seeds=list(DECISION_SEEDS),
-            candidate_sha=cand_sha,
+            candidate_sha=cand_sha, parent_sha=parent_sha,
+            result_files=result_paths,
             holdout_metrics={"holdout_improvement": rec.get("holdout_improvement"),
                              "holdout_direction_fraction": ho_frac,
                              "mean_improvement": mean_imp},
@@ -158,7 +179,8 @@ def phase_domain_model(out: Path) -> dict[str, Any]:
                   "source_domains": ["embodied"]},
         generator=generator, evaluator=evaluator,
         layer=DOMAIN_MODEL_LAYER, domain="embodied",
-        require_structured_holdout=True)
+        require_structured_holdout=True,
+        holdout_manifest_path=str(MANIFEST_EMB))
     for o in out["outcomes"]:
         _log(f"domain layer: {o['decision']} gate={o['gate_passed']} "
              f"status={o['status']} ({o.get('candidate_id', '?')})")
@@ -279,8 +301,12 @@ def phase_harness(out: Path) -> dict[str, Any]:
         cand = {"candidate_id": f"harness::{artifact_sha[:12] or 'live'}",
                 "target": real_ev.get("key", "train.lr"),
                 "old": real_ev.get("old"), "new": real_ev.get("new"),
-                "candidate_sha": artifact_sha}
-        cand_sha = artifact_sha or coord._candidate_sha(cand)
+                "artifact_sha256": artifact_sha}
+        # P0-E: the identity used for promotion MUST be the same SHA the
+        # coordinator computes over this exact candidate dict -- not the
+        # artifact sha (a different value that caused an identity mismatch).
+        cand_sha = coord._candidate_sha(cand)
+        result_files = [str(harness_dir / "ingest_result.json")]
         ho_delta = real_ev.get("holdout_deltas") or live.get("task_deltas") or []
         ho_frac = real_ev.get("holdout_direction_agreement")
         holdout_ok = live.get("holdout_consistent") is True
@@ -298,8 +324,13 @@ def phase_harness(out: Path) -> dict[str, Any]:
             return {"layer": RESEARCH_HARNESS_LAYER, **rp}
         cand = {"candidate_id": f"harness::replay::{rp['candidate_sha'][:12]}",
                 "target": "RESEARCH_HARNESS", "old": None, "new": None,
-                "base_harness_sha256": rp["base_harness_sha256"]}
-        cand_sha = rp["candidate_sha"]
+                "base_harness_sha256": rp["base_harness_sha256"],
+                "source_artifact_sha256": rp["candidate_sha"]}
+        cand_sha = coord._candidate_sha(cand)  # P0-E: single identity source
+        # Real result files on disk (from the persisted harness artifact).
+        result_files = [p for p in (
+            rp["holdout"].get("base_result_path"),
+            rp["holdout"].get("cand_result_path")) if p and Path(p).is_file()]
         ho_delta = [rp["holdout"].get("holdout_delta")]
         ho_frac = None
         holdout_ok = bool(rp["holdout"].get("base_Q") is not None
@@ -312,13 +343,16 @@ def phase_harness(out: Path) -> dict[str, Any]:
 
     from research_runtime.settings import DEFAULT_SCINET_DIR
     manifest = Path(DEFAULT_SCINET_DIR) / "datasets" / "pendulum_smoke_v1" / "manifest.json"
-    n_ho = max(2, len([x for x in ho_delta if x is not None]))
+    n_ho = max(2, len(result_files) if result_files else
+               len([x for x in ho_delta if x is not None]))
+    parent_sha = coord.registry.parent_for(RESEARCH_HARNESS_LAYER)
     he = build_holdout_evidence(
         manifest_path=str(manifest), split_id="test",
         selection_split_id="validation",
         holdout_seeds=list(range(60, 60 + n_ho)),
         selection_seeds=list(DECISION_SEEDS),
-        candidate_sha=cand_sha,
+        candidate_sha=cand_sha, parent_sha=parent_sha,
+        result_files=result_files,
         holdout_metrics={"mean_delta": mean_delta,
                          "holdout_direction_agreement": ho_frac,
                          "holdout_deltas": ho_delta},
@@ -341,7 +375,8 @@ def phase_harness(out: Path) -> dict[str, Any]:
         evidence={"changed_layers": [RESEARCH_HARNESS_LAYER],
                   "source_domains": ["scinet"]},
         generator=generator, evaluator=evaluator,
-        layer=RESEARCH_HARNESS_LAYER, require_structured_holdout=True)
+        layer=RESEARCH_HARNESS_LAYER, require_structured_holdout=True,
+        holdout_manifest_path=str(manifest))
     oc = out_r["outcomes"][0]
     _log(f"harness layer: decision={oc['decision']} gate={oc['gate_passed']} "
          f"status={oc['status']} source={source}")
