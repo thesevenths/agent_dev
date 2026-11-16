@@ -243,6 +243,9 @@ def _build_runtime(out_dir: Path, *, approver, specs):
 # --------------------------------------------------------------------------- #
 # Phase RESEARCH: Round1 + Round2 cross-domain Experience reflow              #
 # --------------------------------------------------------------------------- #
+_LAST_RT: list[Any] = []  # single-process driver: active runtime handle
+
+
 def phase_research(out_dir: Path) -> dict[str, Any]:
     _log("\n=== PHASE research: three-domain Round1 + Round2 reflow ===")
     specs = _domain_specs()
@@ -251,6 +254,8 @@ def phase_research(out_dir: Path) -> dict[str, Any]:
     approver_fn = _external_human_approver(services_tmp, db_paths_tmp)
     rt, scheduler, services, specs = _build_runtime(
         out_dir, approver=approver_fn, specs=specs)
+    _LAST_RT.clear()
+    _LAST_RT.append(rt)  # shared with in-process RRSI phase under --phase all
     rt.start()
     recover = rt.recover_or_raise()
     _log("startup recovery:", recover["classification"])
@@ -268,15 +273,63 @@ def phase_research(out_dir: Path) -> dict[str, Any]:
 
     # Research-quality signal: did Experience reflow produce experience-based
     # objectives (generation_source) rather than only raw evidence bootstrap?
-    gen_sources = [r.get("generation_source") for r in
-                   (cd["discovery"].to_dict().get("ranked") or [])]
+    ranked = cd["discovery"].to_dict().get("ranked") or []
+    gen_sources = [r.get("generation_source") for r in ranked]
+
+    # P0-D / P1-A: Round2 must actually EXECUTE the new, experience-driven
+    # objectives -- proposing them is not a research round. Each candidate
+    # now carries target_domain; build per-domain specs from the REAL objective
+    # constraints persisted by Discovery and run a second real campaign.
+    round2_specs: dict[str, dict[str, Any]] = {}
+    for entry in ranked:
+        if "experience" not in str(entry.get("generation_source", "")):
+            continue  # only true experience-driven objectives enter Round2
+        oid = entry["objective_id"]
+        target = entry.get("target_domain") or entry.get("persist_domain") or ""
+        if target not in services or target in round2_specs:
+            continue
+        service = services[target]
+        stored = service.stores.objectives.get(oid)
+        if stored is None:
+            _log(f"  [round2] objective {oid} NOT in {target} store; skip")
+            continue
+        constraints = stored.constraints or {}
+        round2_specs[target] = {
+            "objective_id": oid,
+            "capabilities": list(constraints.get("required_capabilities") or
+                                 specs[target]["capabilities"]),
+            "source_experiment": specs[target]["source_experiment"],
+            "description": stored.description,
+            "generation_source": entry.get("generation_source"),
+        }
+        _log(f"  [round2] routed {oid} -> {target} "
+             f"(cross_domain={entry.get('cross_domain')})")
+
+    r2 = {"round_no": 2, "results": [], "skipped": True}
+    if round2_specs:
+        src2 = {d: s["source_experiment"] for d, s in round2_specs.items()}
+        r2 = rt.run_round(2, objective_specs=round2_specs,
+                          source_experiment_ids=src2)
+        r2["skipped"] = False
+        _log("Round2 EXECUTED:", [(x["domain"], x.get("ok"),
+                                   x.get("campaign_id"))
+                                  for x in r2["results"]])
+    else:
+        _log("Round2 SKIPPED: no experience-driven objective routed to a domain")
+
     payload = RuntimeReport().write(
         coordinator=rt.coordinator, out_dir=out_dir / "evidence",
         filename="phase_research_evidence.json",
         extra={"round1": r1, "cross_domain": cd["summary"],
-               "experience": exp_rows, "generation_sources": gen_sources})
+               "experience": exp_rows, "generation_sources": gen_sources,
+               "round2": r2,
+               "round2_routed": [{"objective_id": e["objective_id"],
+                                  "target_domain": e.get("target_domain")}
+                                 for e in ranked if "experience" in str(
+                                     e.get("generation_source", ""))]})
     return {"phase": "research", "round1": r1, "cross_domain": cd["summary"],
             "n_experience": len(exp_rows), "generation_sources": gen_sources,
+            "round2": r2,
             "evidence_sha": payload["package_sha256"],
             "state": rt.status()["run"]["state"]}
 
@@ -309,7 +362,34 @@ def main() -> int:
         if args.phase in ("research", "all"):
             result["phases"]["research"] = phase_research(out_dir)
         if args.phase in ("rrsi", "all"):
-            result["phases"]["rrsi"] = _subdriver("run_m5_rrsi.py")
+            if args.phase == "all" and _LAST_RT:
+                # P0-D: RRSI runs INSIDE the same persistent runtime, writing
+                # its layer events to the same RuntimeState journal (not a
+                # detached process with a disconnected state).
+                import run_m5_rrsi as rrsi_driver
+                rt = _LAST_RT[0]
+                dom = rrsi_driver.phase_domain_model(
+                    out_dir / "rrsi", runtime_state=rt.state, runtime_round=3)
+                har = rrsi_driver.phase_harness(
+                    out_dir / "rrsi", runtime_state=rt.state, runtime_round=3)
+                result["phases"]["rrsi"] = {
+                    "domain_model": dom["outcome"]["status"],
+                    "harness": har["status"],
+                    "candidate_sha": dom.get("candidate_sha", ""),
+                    "in_process": True}
+            else:
+                result["phases"]["rrsi"] = _subdriver("run_m5_rrsi.py")
+        if args.phase in ("research", "all") and _LAST_RT:
+            # P0-C: COMPLETED only after every round is verified by real stores.
+            rt = _LAST_RT[0]
+            fin = rt.finalize(
+                round_no=3 if args.phase == "all" and
+                "rrsi" in result["phases"] else 2,
+                rrsi_summary=result["phases"].get("rrsi", {}),
+                cross_summary=(result["phases"].get("research") or {}).get(
+                    "cross_domain", {}))
+            result["finalize"] = {"state": fin["state"],
+                                  "checkpoint_sha": fin["checkpoint"]["state_sha"]}
         if args.phase in ("validate", "all"):
             result["phases"]["validate"] = _subdriver("run_m5_validation.py")
     except Exception as exc:

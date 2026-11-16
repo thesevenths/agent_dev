@@ -267,7 +267,18 @@ class ObjectiveCandidateGenerator:
             "note": "single-domain MVP default; bounded by the ResearchService gate",
         })
 
-    # -- public ----------------------------------------------------------
+    def _domain_for(self, snapshot: DiscoverySnapshot, *clues: Any) -> str:
+        """Resolve the REAL owning domain from cross-domain snapshot clues.
+
+        P1-A: a candidate derived from domain X's evidence/session must be
+        owned by X, never silently reassigned to the generator's default domain.
+        Falls back to ``self.domain`` only when no source is identifiable.
+        """
+        for clue in clues:
+            if isinstance(clue, str) and clue.strip():
+                return clue.strip()
+        return self.domain
+
     def generate(self, snapshot: DiscoverySnapshot) -> list[ObjectiveCandidate]:
         """Generate candidates from all four required sources, deterministically.
 
@@ -309,7 +320,8 @@ class ObjectiveCandidateGenerator:
             cid = _candidate_id("neg_verdict", eid)
             out.append(ObjectiveCandidate(
                 candidate_id=cid,
-                domain=self.domain,
+                domain=self._domain_for(snapshot, ent.get("source_domain"),
+                                        ent.get("domain")),
                 description=(
                     f"Investigate negative evidence {eid} "
                     f"(verdicts={sorted(verdicts)}) and propose a direction that "
@@ -379,7 +391,7 @@ class ObjectiveCandidateGenerator:
                     cid = _candidate_id("ood_gap", ref)
                     out.append(ObjectiveCandidate(
                         candidate_id=cid,
-                        domain=self.domain,
+                        domain=self._domain_for(snapshot, dname),
                         description=(
                             f"Investigate and reduce the measured ID/OOD "
                             f"generalisation gap for domain '{dname}' "
@@ -430,7 +442,7 @@ class ObjectiveCandidateGenerator:
                 cid = _candidate_id("ood_exploration", dname)
                 out.append(ObjectiveCandidate(
                     candidate_id=cid,
-                    domain=self.domain,
+                    domain=self._domain_for(snapshot, dname),
                     description=(
                         f"Investigate OOD generalization for domain '{dname}' "
                         f"(OOD dataset {ood_version} recorded; no comparable "
@@ -486,9 +498,14 @@ class ObjectiveCandidateGenerator:
             # the Critic resolves against, so the id scope + event type always
             # match a real stored failure signal.
             ref = make_failure_ref(sig)
+            fail_domain = sig.get("source_domain") or next(
+                (o.get("source_domain") or o.get("domain")
+                 for o in snapshot.objectives
+                 if o.get("objective_id") == oid), "")
             out.append(ObjectiveCandidate(
                 candidate_id=cid,
-                domain=self.domain,
+                domain=self._domain_for(snapshot, fail_domain,
+                                        sig.get("domain")),
                 description=(
                     f"Address research failure signal '{etype}' on objective "
                     f"'{oid}' (session {sid})."),
@@ -548,9 +565,13 @@ class ObjectiveCandidateGenerator:
             ref = (f"experience:{sid}" if sid
                    else f"experience:{oid}")
             cid = _candidate_id("experience", key)
+            exp_domain = s.get("source_domain") or next(
+                (o.get("source_domain") or o.get("domain")
+                 for o in snapshot.objectives
+                 if o.get("objective_id") == oid), "")
             out.append(ObjectiveCandidate(
                 candidate_id=cid,
-                domain=self.domain,
+                domain=self._domain_for(snapshot, exp_domain),
                 description=(
                     f"Refine the next intervention for objective '{oid}' using "
                     f"recorded Experience from session '{sid}'; do NOT repeat the "

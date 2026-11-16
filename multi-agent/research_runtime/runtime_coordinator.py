@@ -374,11 +374,30 @@ class RuntimeCoordinator:
                              payload={"objective_ids": objective_ids})
         snapshot = self.scheduler.build_cross_domain_snapshot(
             self.config.run_id, objective_ids=objective_ids)
-        result = self.discovery.discover(
-            snapshot,
-            objective_store=self.scheduler.services[list(
-                self.scheduler.services)[0]].stores.objectives,
-            domain=list(self.scheduler.services)[0])
+        first_domain = list(self.scheduler.services)[0]
+
+        def _store_for(domain_id: str):
+            svc = self.scheduler.services.get(str(domain_id))
+            return svc.stores.objectives if svc is not None else None
+
+        discover_kwargs = {
+            "objective_store": (self.scheduler.services[first_domain]
+                                .stores.objectives if first_domain else None),
+            "domain": first_domain,
+        }
+        # P1-A: the REAL ObjectiveDiscovery routes each candidate to its own
+        # domain store. An injected discovery double without that capability
+        # is tolerated but explicitly marked as legacy (no silent misroute in
+        # production -- only test doubles use the fallback).
+        import inspect
+        try:
+            sig = inspect.signature(self.discovery.discover)
+            supports_routing = "objective_store_for_domain" in sig.parameters
+        except (TypeError, ValueError):
+            supports_routing = True
+        if supports_routing:
+            discover_kwargs["objective_store_for_domain"] = _store_for
+        result = self.discovery.discover(snapshot, **discover_kwargs)
         payload = {
             "round_no": round_no,
             "n_objectives": len(snapshot.objectives),
@@ -386,8 +405,13 @@ class RuntimeCoordinator:
             "experience_available": snapshot.experience_available,
             "source_domains": snapshot.provenance.get("source_domains", []),
             "artifact_shas": snapshot.provenance.get("artifact_shas", {}),
+            "domain_routed_discovery": bool(supports_routing),
             "unresolved_gaps": snapshot.unresolved_gaps,
             "proposed_objective_ids": result.proposed_objective_ids,
+            "routed": [{"objective_id": r["objective_id"],
+                        "target_domain": r.get("target_domain", ""),
+                        "cross_domain": r.get("cross_domain", False)}
+                       for r in (getattr(result, "ranked", None) or [])],
         }
         self.state.append(self.config.run_id, round_no,
                           "cross_domain_discovery", payload)

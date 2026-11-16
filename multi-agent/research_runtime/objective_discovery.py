@@ -75,7 +75,15 @@ class ObjectiveDiscovery:
     # -- main -------------------------------------------------------------
     def discover(self, snapshot: DiscoverySnapshot, *,
                  objective_store: ObjectiveStore,
-                 domain: str | None = None) -> DiscoveryResult:
+                 domain: str | None = None,
+                 objective_store_for_domain: Any = None) -> DiscoveryResult:
+        """Persist approved candidates as Proposed Objectives.
+
+        P1-A: when ``objective_store_for_domain`` is supplied, each candidate
+        is persisted into the store of its OWN ``candidate.domain`` (and marked
+        cross_domain). Without the callback, the single injected store is used
+        as before (backward compatible).
+        """
         domain = domain or self.generator.domain
         candidates = self.generator.generate(snapshot)
         critiques: dict[str, tuple[bool, list[str]]] = {
@@ -109,11 +117,19 @@ class ObjectiveDiscovery:
         result.n_approved = len(ranked)
 
         # Persist each approved candidate as a Proposed Objective (idempotent).
+        # P1-A: candidates carry their own domain; never funnel every objective
+        # into the caller's default domain/store.
         for c in ranked:
             oid = _objective_id_for(c)
+            target_domain = str(getattr(c, "domain", "") or domain)
+            store = objective_store
+            if objective_store_for_domain is not None:
+                store = objective_store_for_domain(target_domain) or objective_store
+            is_cross = bool(
+                objective_store_for_domain is not None and target_domain != domain)
             obj = ResearchObjective(
                 objective_id=oid,
-                domain=domain,
+                domain=target_domain,
                 description=c.description,
                 success_criteria=dict(c.success_criteria),
                 constraints={
@@ -123,10 +139,12 @@ class ObjectiveDiscovery:
                     "proposed_intervention": dict(c.proposed_intervention),
                     "budget": dict(c.budget),
                     "generation_source": c.generation_source,
+                    "target_domain": target_domain,
+                    "cross_domain": is_cross,
                 },
                 created_at=snapshot.generated_at or "",
             )
-            record = objective_store.save(
+            record = store.save(
                 from_research_objective(
                     obj, status="proposed",
                     provenance={
@@ -135,6 +153,8 @@ class ObjectiveDiscovery:
                         "rank_score": c.rank_score,
                         "ranker_version": self.ranker.version,
                         "discovery_run_id": snapshot.run_id,
+                        "target_domain": target_domain,
+                        "cross_domain": is_cross,
                     }))
             result.proposed_objective_ids.append(oid)
             result.ranked.append({
@@ -145,6 +165,9 @@ class ObjectiveDiscovery:
                 "rank_breakdown": c.rank_breakdown,
                 "description": c.description,
                 "evidence_refs": list(c.evidence_refs),
+                "target_domain": target_domain,
+                "persist_domain": target_domain,
+                "cross_domain": is_cross,
                 "persist_status": record.get("status"),
             })
         return result

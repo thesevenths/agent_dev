@@ -61,7 +61,11 @@ def _grow_registry(out: Path) -> tuple[RRSICoordinator, EvolutionRegistry]:
     return RRSICoordinator(reg), reg
 
 
-def phase_domain_model(out: Path) -> dict[str, Any]:
+RRSI_RUNTIME_RUN_ID = "m5_integrated_v1"
+
+
+def phase_domain_model(out: Path, runtime_state: Any = None,
+                       runtime_round: int = 3) -> dict[str, Any]:
     """Real embodied domain-model candidate evaluation + structured holdout.
 
     Two REAL candidates are evaluated:
@@ -184,6 +188,12 @@ def phase_domain_model(out: Path) -> dict[str, Any]:
     for o in out["outcomes"]:
         _log(f"domain layer: {o['decision']} gate={o['gate_passed']} "
              f"status={o['status']} ({o.get('candidate_id', '?')})")
+    if runtime_state is not None:
+        runtime_state.append(
+            RRSI_RUNTIME_RUN_ID, runtime_round, "rrsi_layer_evaluated",
+            {"layer": DOMAIN_MODEL_LAYER, "experiment_id": exp_id,
+             "statuses": [o["status"] for o in out["outcomes"]],
+             "gate_passed": [o["gate_passed"] for o in out["outcomes"]]})
     promoted = next((o for o in out["outcomes"]
                      if o["status"] == "PROMOTED"), None)
     best = promoted or out["outcomes"][-1]
@@ -262,7 +272,8 @@ def _replay_real_harness_artifact(out: Path) -> dict[str, Any]:
     }
 
 
-def phase_harness(out: Path) -> dict[str, Any]:
+def phase_harness(out: Path, runtime_state: Any = None,
+                  runtime_round: int = 3) -> dict[str, Any]:
     """Real harness candidate evaluation with hard timeout + honest fallback."""
     _log("\n--- RRSI Layer 2: real Harness candidate (SciNet++ ingest) ---")
     coord, reg = _grow_registry(out)
@@ -380,6 +391,13 @@ def phase_harness(out: Path) -> dict[str, Any]:
     oc = out_r["outcomes"][0]
     _log(f"harness layer: decision={oc['decision']} gate={oc['gate_passed']} "
          f"status={oc['status']} source={source}")
+    if runtime_state is not None:
+        runtime_state.append(
+            RRSI_RUNTIME_RUN_ID, runtime_round, "rrsi_layer_evaluated",
+            {"layer": RESEARCH_HARNESS_LAYER,
+             "statuses": [o["status"] for o in out_r["outcomes"]],
+             "gate_passed": [o["gate_passed"] for o in out_r["outcomes"]],
+             "source": source})
     return {"layer": RESEARCH_HARNESS_LAYER, "status": oc["status"],
             "evaluation_source": source, "candidate": cand,
             "candidate_sha": cand_sha, "outcome": oc,
