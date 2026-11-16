@@ -50,6 +50,14 @@ VALUE_OUTCOMES: tuple[str, ...] = (
 #: Which contrasts are PRIMARY vs secondary (fixed BEFORE results are seen).
 PRIMARY_CONTRAST_LABELS: tuple[str, ...] = ("C-B",)
 SECONDARY_CONTRAST_LABELS: tuple[str, ...] = ("B-A", "C-A")
+#: The COMPLETE pre-registered correction family. It is FIXED and passed to the
+#: statistician so a missing contrast can never shrink the correction (P1-02).
+TEST_FAMILY_LABELS: tuple[str, ...] = (
+    PRIMARY_CONTRAST_LABELS + SECONDARY_CONTRAST_LABELS)
+#: The pre-registered PRIMARY metric that gates a value conclusion. The other
+#: primary metric is reported but a secondary metric/contrast can NEVER make
+#: ``significance_claimed`` true (P1-02).
+DECISION_PRIMARY_METRIC: str = PRIMARY_METRICS[0]   # independently-reviewed quality
 
 
 def _runs_by_arm(runs: list[RunRecord]) -> dict[str, list[RunRecord]]:
@@ -150,6 +158,21 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
             "multiple_comparison_correction", correction),
         "primary_contrasts": list(PRIMARY_CONTRAST_LABELS),
         "secondary_contrasts": list(SECONDARY_CONTRAST_LABELS),
+        # P1-02: the fixed, pre-registered family and the Primary/Secondary
+        # hierarchy are declared in the design BEFORE any result is inspected.
+        "test_family": list(TEST_FAMILY_LABELS),
+        "correction_family_size": len(TEST_FAMILY_LABELS),
+        "testing_hierarchy": {
+            "primary_metrics": list(PRIMARY_METRICS),
+            "secondary_metrics": list(SECONDARY_METRICS),
+            "primary_contrasts": list(PRIMARY_CONTRAST_LABELS),
+            "secondary_contrasts": list(SECONDARY_CONTRAST_LABELS),
+            "decision_primary_metric": DECISION_PRIMARY_METRIC,
+            "decision_primary_contrast": PRIMARY_CONTRAST_LABELS[0],
+            "rule": ("only a PRIMARY contrast on a PRIMARY metric may drive "
+                     "significance_claimed or a value conclusion; missing "
+                     "contrasts stay in the correction family"),
+        },
         "arms": {a: {"n_runs": len(v)} for a, v in by_arm.items()},
         "metric_contract_sha256": frozen_metric_contract()["contract_sha256"],
     }
@@ -201,20 +224,37 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
         diffs = _contrast_differences(
             runs, metric, blocks=blocks,
             expected_protocol_sha256=expected_protocol_sha256)
-        analysed = analyse_primary_contrasts(differences=diffs, alpha=alpha,
-                                             correction=correction)
+        # Pass the FIXED pre-registered family: a missing contrast can never
+        # shrink the correction (P1-02).
+        analysed = analyse_primary_contrasts(
+            differences=diffs, alpha=alpha, correction=correction,
+            family=TEST_FAMILY_LABELS)
         contrast_runs[metric] = analysed
+
+    # P1-02: significance is claimed ONLY from a PRIMARY contrast (C-B) on a
+    # PRIMARY metric. A secondary metric or a secondary contrast, however
+    # significant, can NEVER set this flag.
+    decision_sig = any(
+        bool(contrast_runs.get(metric, {}).get("contrasts", {})
+             .get(label, {}).get("significant"))
+        for metric in PRIMARY_METRICS
+        for label in PRIMARY_CONTRAST_LABELS)
     primary = {
         "metrics": list(PRIMARY_METRICS),
         "by_arm": {a: {m: compute_metric_set(v)[m] for m in PRIMARY_METRICS}
                    for a, v in by_arm.items()},
         "contrasts": contrast_runs,
         "primary_contrast": PRIMARY_CONTRAST_LABELS[0],
-        "significance_claimed": bool(
-            stage == "final" and any(
-                c.get("significant")
-                for payload in contrast_runs.values()
-                for c in payload["contrasts"].values())),
+        "decision_primary_metric": DECISION_PRIMARY_METRIC,
+        "significance_claimed": bool(stage == "final" and decision_sig),
+        "significance_basis": {
+            "allowed_metrics": list(PRIMARY_METRICS),
+            "allowed_contrasts": list(PRIMARY_CONTRAST_LABELS),
+            "excluded_contrasts": list(SECONDARY_CONTRAST_LABELS),
+            "excluded_metrics": list(SECONDARY_METRICS),
+            "rule": ("significant only if a PRIMARY contrast on a PRIMARY "
+                     "metric survives the fixed-family correction"),
+        },
     }
 
     # ------------------------------------------------------ D secondary
@@ -266,6 +306,9 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
                              runs=runs, economics=economics)
     conclusion["outcome_key"] = OUTCOME_KEYS.get(conclusion["outcome"],
                                                  "unknown")
+    # One source of truth: the conclusion's claim is the report's claim. The
+    # primary section can never advertise significance the conclusion refuses.
+    primary["significance_claimed"] = bool(conclusion["significance_claimed"])
 
     chains = [_evidence_chain(r) for r in runs]
     key_links = {
@@ -305,15 +348,33 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
 def _conclusion(*, stage: str, primary: dict[str, Any],
                 integrity_section: dict[str, Any], runs: list[RunRecord],
                 economics: dict[str, Any]) -> dict[str, Any]:
-    """Choose ONE of the four allowed outcomes -- never a forced C win."""
+    """Choose ONE of the four allowed outcomes -- never a forced C win.
+
+    P1-02: the value conclusion is driven ONLY by the PRE-REGISTERED primary
+    contrast (C-B) on the PRE-REGISTERED primary metrics. A secondary contrast
+    (B-A / C-A) or a secondary metric is context, never a decision driver.
+    """
     if not runs:
         return {"outcome": VALUE_OUTCOMES[3], "significance_claimed": False,
                 "reason": "no persisted runs: nothing to report",
-                "evidence": []}
-    cb = primary["contrasts"][PRIMARY_METRICS[0]]["contrasts"].get("C-B", {})
-    ca = primary["contrasts"][PRIMARY_METRICS[0]]["contrasts"].get("C-A", {})
-    ba = primary["contrasts"][PRIMARY_METRICS[0]]["contrasts"].get("B-A", {})
+                "evidence": [], "decision_contrast": PRIMARY_CONTRAST_LABELS[0]}
+    primary_contrast = PRIMARY_CONTRAST_LABELS[0]
+    # Snapshot across metrics for the PRIMARY contrast only.
+    cb_by_metric = {
+        m: primary["contrasts"][m]["contrasts"].get(primary_contrast, {})
+        for m in PRIMARY_METRICS}
+    cb = cb_by_metric[DECISION_PRIMARY_METRIC]
     n_pairs = cb.get("n") or 0
+    sig_by_metric = {
+        m: bool(v.get("significant")) for m, v in cb_by_metric.items()}
+    decision_sig = primary.get("significance_claimed", False)
+    decision_basis = {
+        "decision_contrast": primary_contrast,
+        "decision_primary_metric": DECISION_PRIMARY_METRIC,
+        "primary_metrics": list(PRIMARY_METRICS),
+        "primary_contrast_significant_by_metric": sig_by_metric,
+        "secondary_contrasts_excluded": list(SECONDARY_CONTRAST_LABELS),
+    }
     if stage != "final":
         return {
             "outcome": VALUE_OUTCOMES[3],
@@ -321,50 +382,52 @@ def _conclusion(*, stage: str, primary: dict[str, Any],
             "reason": ("PILOT: this report is a pilot artefact. The pilot never "
                        "declares a winner; the four-way value conclusion is "
                        "reserved for the frozen confirmatory analysis."),
-            "pilot_contrast_snapshot": {"C-B": cb, "C-A": ca, "B-A": ba,
-                                        "n_pairs": n_pairs},
+            "pilot_contrast_snapshot": {
+                "primary_contrast": primary_contrast,
+                "by_primary_metric": cb_by_metric, "n_pairs": n_pairs},
+            "decision_basis": decision_basis,
             "evidence": [],
         }
     if n_pairs < 3 or integrity_section["duplicate_campaign_ids"]:
         return {"outcome": VALUE_OUTCOMES[3], "significance_claimed": False,
-                "reason": (f"{n_pairs} paired block(s) and/or an integrity "
-                           "problem cannot support a value conclusion"),
-                "evidence": []}
-    if cb.get("p_value") is None or ca.get("p_value") is None:
+                "reason": (f"{n_pairs} paired block(s) on the primary contrast "
+                           "and/or an integrity problem cannot support a value "
+                           "conclusion"),
+                "decision_basis": decision_basis, "evidence": []}
+    if any(v.get("p_value") is None for v in cb_by_metric.values()):
         # Missing primary data (e.g. pending human review) is NOT evidence of
         # "no value": it is evidence that we cannot decide yet.
         return {"outcome": VALUE_OUTCOMES[3], "significance_claimed": False,
-                "reason": ("the primary contrast has no computable statistic "
-                           f"(C-B n={cb.get('n')}, C-A n={ca.get('n')}); the "
-                           "human blind review and/or the remaining blocks must "
-                           "be completed first"),
-                "evidence": []}
-    if cb.get("p_value") is None or ca.get("p_value") is None:
-        # Missing primary data (e.g. pending human review) is NOT evidence of
-        # "no value": it is evidence that we cannot decide yet.
-        return {"outcome": VALUE_OUTCOMES[3], "significance_claimed": False,
-                "reason": ("the primary contrast has no computable statistic "
-                           f"(C-B n={cb.get('n')}, C-A n={ca.get('n')}); the "
-                           "human blind review and/or the remaining blocks must "
-                           "be completed first"),
-                "evidence": []}
-    if cb.get("significant") and ca.get("significant"):
-        return {"outcome": VALUE_OUTCOMES[0], "significance_claimed": True,
-                "reason": ("primary contrast C-B and secondary C-A are both "
-                           "significant after correction"),
-                "evidence": ["C-B", "C-A"]}
-    if cb.get("significant") and not ca.get("significant"):
-        return {"outcome": VALUE_OUTCOMES[1], "significance_claimed": True,
-                "reason": ("C beats B but not the manual baseline: automation "
-                           "adds efficiency, not discovery power"),
-                "evidence": ["C-B"]}
-    if not cb.get("significant") and not ca.get("significant"):
+                "reason": ("the pre-registered primary contrast has no "
+                           "computable statistic on a primary metric "
+                           f"({ {m: v.get('n') for m, v in cb_by_metric.items()} }); "
+                           "the human blind review and/or more blocks are "
+                           "needed first"),
+                "decision_basis": decision_basis, "evidence": []}
+    if not decision_sig:
+        # No primary-contrast/primary-metric result survived the correction.
+        # Secondary metrics/contrasts never change this into a positive claim.
         return {"outcome": VALUE_OUTCOMES[2], "significance_claimed": False,
-                "reason": "no contrast survives the correction",
-                "evidence": ["C-B", "C-A"]}
-    return {"outcome": VALUE_OUTCOMES[3], "significance_claimed": False,
-            "reason": "the pattern does not support any of the three positive "
-                      "outcomes", "evidence": []}
+                "reason": ("the pre-registered primary contrast (C-B) on the "
+                           "primary metrics does not survive the fixed-family "
+                           "correction; secondary contrasts are not decision "
+                           "drivers"),
+                "decision_basis": decision_basis,
+                "evidence": [primary_contrast]}
+    # significance_claimed is True: C-B survived on >=1 primary metric.
+    if sig_by_metric.get(DECISION_PRIMARY_METRIC):
+        return {"outcome": VALUE_OUTCOMES[0], "significance_claimed": True,
+                "reason": ("the pre-registered primary contrast (C-B) is "
+                           "significant on the decision primary metric after "
+                           "the fixed-family correction"),
+                "decision_basis": decision_basis,
+                "evidence": [primary_contrast, DECISION_PRIMARY_METRIC]}
+    return {"outcome": VALUE_OUTCOMES[1], "significance_claimed": True,
+            "reason": ("C-B is significant on a primary metric other than the "
+                       "decision metric: efficiency improved without a "
+                       "scientific-discovery improvement"),
+            "decision_basis": decision_basis,
+            "evidence": [primary_contrast]}
 
 
 # ------------------------------------------------------------------ render
