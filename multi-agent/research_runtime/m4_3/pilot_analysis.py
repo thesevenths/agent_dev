@@ -111,6 +111,7 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
                   seoi_quality: float = 0.5,
                   seoi_valid_findings: float = 0.01,
                   bootstrap_resamples: int = BOOTSTRAP_RESAMPLES,
+                  protocol: dict[str, Any] | None = None,
                   write: bool = True) -> dict[str, Any]:
     """Recompute the full pilot analysis from the persisted registry."""
     out = Path(out_dir)
@@ -308,6 +309,7 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
         "stage": "pilot",
         "experiment_id": experiment_id,
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "protocol": dict(protocol or {}),
         "metric_contract": frozen_metric_contract(),
         "metric_definitions": {k: asdict(v)
                                for k, v in METRIC_DEFINITIONS.items()},

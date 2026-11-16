@@ -217,15 +217,26 @@ def cmd_analyze_pilot(args) -> int:
 
     paths = _paths(args, "pilot")
     from ..research_store.db import ResearchDatabase
+    from .pilot_runner import protocol_from_config
     db = ResearchDatabase(paths["db"])
+    # Restate the EXACT frozen pilot protocol (versions / seeds / budget) by
+    # rebuilding it from the recorded config and verifying its SHA.
+    protocol: dict[str, Any] = {}
+    run_path = _root(args) / "pilot" / "pilot_run.json"
+    if run_path.is_file():
+        payload = json.loads(run_path.read_text(encoding="utf-8"))
+        rebuilt = protocol_from_config(payload.get("config") or {})
+        if rebuilt.freeze_sha256() == payload.get("protocol_sha256"):
+            protocol = rebuilt.frozen_dict()
     analysis = analyze_pilot(db=db, out_dir=_root(args) / "pilot",
                              experiment_id=args.experiment_id,
                              alpha=args.alpha,
                              seoi_quality=args.seoi,
-                             write=True)
+                             protocol=protocol, write=True)
     generate_value_report(db=db, out_dir=_root(args) / "pilot",
                           experiment_id=args.experiment_id, stage="pilot",
-                          pilot_analysis=analysis, write=True)
+                          pilot_analysis=analysis, protocol=protocol,
+                          write=True)
     _print({"ok": True,
             "n_blocks": analysis["n_blocks"],
             "n_runs": analysis["n_runs"],

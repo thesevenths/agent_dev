@@ -1,6 +1,6 @@
 # M4.3-04 PILOT Value Report -- m4_3_pilot
 
-Generated: 2026-11-16T12:17:44  
+Generated: 2026-11-16T12:23:42  
 Stage: **pilot**  
 Protocol SHA-256: `2b206e999d6abab5bb5449c5ee18fcaff2ceded64f060f543fbf5a191f8075b6`
 
@@ -10,10 +10,10 @@ Protocol SHA-256: `2b206e999d6abab5bb5449c5ee18fcaff2ceded64f060f543fbf5a191f807
 
 - blocks: 4; snapshots: 4
 - arms: A manual / B memory-assisted / C autonomous discovery
-- model / prompt / ranker / policy: `` / `` / `` / ``
-- paired seeds: []; budget: {}
-- exclusion rules: []
-- statistical method:  (correction: holm)
+- model / prompt / ranker / policy: `scinet-pendulum-smoke-v1` / `objective-candidates-v1` / `m4-e2e-01a-deterministic-v1` / `scinet-domain-v1`
+- paired seeds: [42, 43]; budget: {'max_candidates': 2, 'max_jobs': 8, 'max_seeds': 2}
+- exclusion rules: ['pilot: no exclusion; every outcome retained']
+- statistical method: paired-block descriptive (pilot: no inference) (correction: holm (confirmatory only))
 - primary contrast: ['C-B']; secondary: ['B-A', 'C-A']
 
 ## B. Data integrity

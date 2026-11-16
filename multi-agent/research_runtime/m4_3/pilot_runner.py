@@ -1080,6 +1080,7 @@ class PilotRunner:
             "experiment_id": self.config.experiment_id,
             "config": self.config.to_dict(),
             "protocol_sha256": self.protocol.freeze_sha256(),
+            "protocol": self.protocol.frozen_dict(),
             "metric_contract_sha256":
                 frozen_metric_contract()["contract_sha256"],
             "engine": "REAL SciNet++ (no FakeRunner, no synthetic snapshot)",
@@ -1136,8 +1137,26 @@ class PilotRunner:
         return chunks[:n]
 
 
+def protocol_from_config(config: dict[str, Any]) -> FrozenProtocol:
+    """Rebuild the (pure) pilot protocol from a recorded config.
+
+    The protocol is a deterministic function of the config + the frozen domain
+    wiring, so a report can restate the exact versions/seeds/budget without
+    trusting a cached copy. The caller should verify the resulting SHA against
+    the recorded one.
+    """
+    known = {k: v for k, v in config.items()
+             if k in PilotConfig.__dataclass_fields__}
+    cfg = PilotConfig(**known)
+    cfg.paired_seeds = tuple(cfg.paired_seeds)
+    runner = PilotRunner.__new__(PilotRunner)
+    runner.config = cfg
+    return runner._pilot_protocol()
+
+
 __all__ = [
     "PilotConfig", "PreflightReport", "PreflightError", "SelectionError",
+    "protocol_from_config",
     "ReviewIncomplete",
     "SelectionRecord", "delegated_select", "preflight", "PilotRunner",
 ]
