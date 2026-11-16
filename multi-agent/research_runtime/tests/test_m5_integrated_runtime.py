@@ -1,6 +1,7 @@
 """M5-INTEGRATED -- top-level runtime state/coordinator contracts (ENGINE-FREE)."""
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,20 +24,44 @@ def _state(tmp_path):
     return RuntimeState(db=ResearchDatabase(tmp_path / "runtime.sqlite"))
 
 
-def _fake_scheduler(fail_domain=None):
+def _fake_scheduler(fail_domain=None, tmp_path=None):
+    """Scheduler double whose domains use REAL stores for P0-C reality checks."""
+    from research_runtime.research_store import (
+        ResearchStores, from_research_objective, ResearchReport, CampaignBinding,
+    )
+    from research_runtime.schemas import ResearchObjective
+    base = tmp_path or Path(".pytest_fake_sched")
+
+    def _svc(domain):
+        stores = ResearchStores(base / f"{domain}.sqlite")
+        obj = ResearchObjective(objective_id=f"fixed_{domain}",
+                                domain=domain, description="d")
+        stores.objectives.save(from_research_objective(obj, status="proposed"))
+        return SimpleNamespace(stores=stores)
+
     class S:
-        services = {
-            "scinet": SimpleNamespace(stores=SimpleNamespace(
-                objectives=SimpleNamespace(all=lambda: []))),
-            "embodied": SimpleNamespace(stores=SimpleNamespace(
-                objectives=SimpleNamespace(all=lambda: []))),
-        }
+        def __init__(self):
+            self.services = {"scinet": _svc("scinet"), "embodied": _svc("embodied")}
 
         def run_objective(self, oid, source_experiment_id=""):
             domain = "scinet" if "sci" in oid else "embodied"
             if domain == fail_domain:
                 raise RuntimeError("injected domain failure")
-            return {"campaign_id": f"camp_{oid}", "report_id": f"rep_{oid}",
+            stores = self.services[domain].stores
+            cid, sid, rid = f"camp_{oid}", f"sess_{oid}", f"rep_{oid}"
+            obj = ResearchObjective(objective_id=oid, domain=domain, description=oid)
+            stores.objectives.save(from_research_objective(obj, status="proposed"))
+            stores.sessions.create_session(obj, session_id=sid)
+            stores.sessions.bind_campaign(CampaignBinding(
+                campaign_id=cid, plan_id=f"plan_{oid}", approval_id=f"apr_{oid}",
+                plan_sha256="a" * 64, objective_id=oid, session_id=sid))
+            stores.sessions.record_experience(
+                session_id=sid, objective_id=oid, kind="research_outcome",
+                payload={"outcome": "inconclusive"})
+            stores.sessions.save_report(ResearchReport(
+                report_id=rid, session_id=sid, objective_id=oid,
+                outcome="inconclusive", experience_refs=[f"exp_{oid}"]))
+            return {"campaign_id": cid, "report_id": rid,
                     "director_state": "COMPLETED", "domain_id": domain,
                     "budget": {}, "result": {}}
 
@@ -65,7 +90,7 @@ def _coordinator(tmp_path, *, approver=lambda a, p: None, fail_domain=None,
                         domain_order=("scinet", "embodied"))
     return RuntimeCoordinator(
         config=cfg, state=_state(tmp_path),
-        scheduler=_fake_scheduler(fail_domain),
+        scheduler=_fake_scheduler(fail_domain, tmp_path=tmp_path),
         discovery=_fake_discovery(), rrsi=None,
         dataset_shas={"scinet": "a" * 64}, approver=approver,
         out_dir=tmp_path / "out")
@@ -165,5 +190,8 @@ def test_human_stop_exhaustion_and_recovery_classification(tmp_path):
     c2 = _coordinator(tmp_path / "rec")
     c2.start()
     c2.state.put_round("R1", 1, "scinet", "DISPATCHED", objective_id="obj_s")
-    with pytest.raises(RuntimeRecoveryRequired):
-        c2.recover_or_raise()
+    # P0-C/P0-B: an in-flight campaign is RESUMABLE, not a fail-closed error;
+    # but it is definitely NOT classified complete. Resume-in-place, no re-run.
+    from research_runtime.runtime_state import C_INFLIGHT
+    report = c2.state.classify("R1")
+    assert report["classification"] == C_INFLIGHT

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,24 +86,97 @@ class RuntimeCoordinator:
         self._stop_requested = True
         self.state.append(self.config.run_id, 0, "human_stop_requested",
                           {"reason": reason})
-        self.state.set_state(self.config.run_id, S_STOPPED,
-                             event="stop", payload={"reason": reason})
+        self.state.mark_terminal(self.config.run_id, S_STOPPED, reason)
 
     # ------------------------------------------------------------- lifecycle
     def start(self) -> dict[str, Any]:
         """Initialize global state; refuse config/manifest drift."""
+        # P0-B: initialize() only creates/validates the run. It must NOT blindly
+        # reset state -- a COMPLETED/STOPPED run can never restart, and a RUNNING
+        # run must go through recovery classification first.
         run = self.state.initialize(
             self.config.run_id, config=self.config,
             dataset_shas=self.dataset_shas,
             max_rounds=self.config.max_rounds,
             global_budget=self.config.global_budget)
-        self.state.set_state(self.config.run_id, S_INIT,
-                             event="runtime_created")
-        return run
+        prior_state = str(run.get("state") or "")
+        if prior_state in self.state.TERMINAL_STATES:
+            raise RuntimeRecoveryRequired(
+                f"run {self.config.run_id!r} is {prior_state} "
+                f"({run.get('terminal_reason', '')}); refusing to restart")
+        if prior_state in (S_RUNNING, S_ROUND2, S_RRSI, S_RECOVERING):
+            # A crashed mid-run restart: budget/consumption are untouched by
+            # initialize(). Require explicit recover_or_raise before executing.
+            self.state.append(self.config.run_id, 0, "restart_needs_recovery",
+                              {"previous_state": prior_state})
+            return run
+        # Fresh INIT (or a run explicitly parked at INIT): claim the SOLE
+        # executor right atomically. A second process with another id loses.
+        executor_id = f"{os.getpid()}@{time.time_ns()}"
+        claimed = self.state.claim_executor(self.config.run_id, executor_id)
+        if not claimed:
+            raise RuntimeRecoveryRequired(
+                f"run {self.config.run_id!r} already has an active executor; "
+                "concurrent start refused")
+        self._executor_id = executor_id
+        if prior_state != S_INIT:
+            self.state.set_state(self.config.run_id, S_INIT,
+                                 event="runtime_created")
+        return self.state.run(self.config.run_id)
+
+    def _verify_round_reality(self, round_rec: dict[str, Any]) -> dict[str, Any]:
+        """P0-C: resolve a round's ids against the REAL domain stores.
+
+        Verifies the full chain: campaign binding -> session -> report -> real
+        Experience record. A non-empty round field is NEVER accepted as proof.
+        """
+        domain = round_rec.get("domain_id", "")
+        service = self.scheduler.services.get(domain) if hasattr(
+            self.scheduler, "services") else None
+        if service is None:
+            return {"ok": False, "reasons": [f"no_service_for_{domain}"]}
+        reasons: list[str] = []
+        sessions = service.stores.sessions
+        cid = round_rec.get("campaign_id", "")
+        binding = None
+        try:
+            binding = sessions.binding_for_campaign(cid) if cid else None
+        except Exception as exc:  # noqa: BLE001
+            reasons.append(f"campaign_lookup_error:{type(exc).__name__}")
+        if binding is None:
+            reasons.append("campaign_binding_unresolved")
+        session_id = getattr(binding, "session_id", "") if binding else ""
+        rid = round_rec.get("report_id", "")
+        report_rec = None
+        try:
+            report_rec = sessions.get_report(rid) if rid else None
+        except Exception as exc:  # noqa: BLE001
+            reasons.append(f"report_lookup_error:{type(exc).__name__}")
+        if report_rec is None:
+            reasons.append("report_unresolved")
+        elif session_id and str(getattr(report_rec, "session_id", "")) != session_id:
+            reasons.append("report_session_mismatch")
+        exps: list[dict[str, Any]] = []
+        try:
+            exps = sessions.experience(session_id) if session_id else []
+        except Exception as exc:  # noqa: BLE001
+            reasons.append(f"experience_lookup_error:{type(exc).__name__}")
+        if not exps:
+            reasons.append("experience_unresolved")
+        eid = round_rec.get("experience_id", "")
+        if eid and not any(str(x.get("experience_id")) == eid for x in exps):
+            reasons.append("experience_id_mismatch")
+        return {"ok": not reasons, "reasons": reasons,
+                "session_id": session_id,
+                "n_experience": len(exps)}
+
+    def _classify_runtime(self) -> dict[str, Any]:
+        return self.state.classify(
+            self.config.run_id, reality_verifier=self._verify_round_reality)
 
     def recover_or_raise(self) -> dict[str, Any]:
         """Startup reconciliation against REAL persisted state; fail-closed."""
-        report = self.state.classify(self.config.run_id)
+        report = self._classify_runtime()
         cls = report["classification"]
         if cls == C_CORRUPT:
             self.state.set_state(self.config.run_id, S_RECOVERING,
@@ -126,8 +200,9 @@ class RuntimeCoordinator:
         snap = self.state.global_budget_snapshot(self.config.run_id)
         if snap["limit"] > 0 and snap["remaining"] <= 0:
             self._budget_exhausted = True
-            self.state.set_state(self.config.run_id, S_EXHAUSTED,
-                                 event="budget_exhausted", payload=snap)
+            self.state.append(self.config.run_id, 0, "budget_exhausted", snap)
+            self.state.mark_terminal(self.config.run_id, S_EXHAUSTED,
+                                     "global_budget_exhausted")
             raise RuntimeBudgetExhausted(f"global budget exhausted: {snap}")
 
     @staticmethod
@@ -154,49 +229,137 @@ class RuntimeCoordinator:
             if spec is None:
                 continue
             oid = spec["objective_id"]
-            self.state.put_round(self.config.run_id, round_no, domain,
-                                 "DISPATCHED", objective_id=oid)
+            # P0-A: reserve BEFORE any campaign is launched. The reservation
+            # identity is deterministic and independent of the engine's campaign
+            # id (which does not exist yet). With budget=1 the second domain
+            # fails here -- it never reaches run_objective.
+            res_id = self.state.reservation_id(
+                self.config.run_id, round_no, domain, oid)
             try:
-                # Budget reservation must happen BEFORE the campaign executes.
-                # The scheduler reserves per-domain budget after approval; we
-                # mirror a global reservation keyed by the deterministic id.
-                cid_hint = f"r{round_no}_{domain}_{oid}"
+                self.state.reserve_execution(
+                    self.config.run_id, res_id,
+                    config_sha=config_sha(self.config),
+                    domain_id=domain, round_no=round_no)
+            except RuntimeBudgetExhausted:
+                self.state.put_round(
+                    self.config.run_id, round_no, domain, "BUDGET_BLOCKED",
+                    objective_id=oid, payload={"reservation_id": res_id})
+                results.append({"domain": domain, "ok": False,
+                                "error": "global_budget_exhausted_before_execution",
+                                "reservation_id": res_id})
+                continue
+            self.state.put_round(self.config.run_id, round_no, domain,
+                                 "RESERVED", objective_id=oid,
+                                 payload={"reservation_id": res_id})
+            try:
                 self.state.append(self.config.run_id, round_no, "dispatching",
                                   {"domain": domain, "objective_id": oid,
-                                   "campaign_hint": cid_hint})
+                                   "reservation_id": res_id})
                 outcome = self.scheduler.run_objective(
                     oid, source_experiment_id=source_experiment_ids.get(domain, ""))
                 campaign_id = outcome.get("campaign_id", "")
                 if not campaign_id:
                     raise RuntimeError(
                         f"{domain}: no campaign id from real scheduler")
-                # Global reserve + consume (idempotent by campaign_id).
-                self.state.reserve_global(
-                    self.config.run_id, campaign_id,
-                    config_sha=config_sha(self.config))
-                self.state.consume_global(
-                    self.config.run_id, campaign_id,
+                # Bind the pre-existing reservation to the real campaign, then
+                # settle it. Both are idempotent across restarts.
+                self.state.bind_reservation(
+                    self.config.run_id, res_id, campaign_id=campaign_id)
+                self.state.consume_reservation(
+                    self.config.run_id, res_id,
                     outcome=str(outcome.get("director_state") or "unknown"))
+                report_id = outcome.get("report_id", "")
+                # P0-C: never mark a domain ROUND_COMPLETED without the real
+                # Report id. Experience is confirmed by the reconciler from the
+                # real ExperienceStore, not by trusting a caller-supplied id.
+                round_state = ("REPORT_PENDING" if not report_id
+                               else "CAMPAIGN_COMPLETED")
                 self.state.put_round(
-                    self.config.run_id, round_no, domain, "COMPLETED",
+                    self.config.run_id, round_no, domain, round_state,
                     objective_id=oid, campaign_id=campaign_id,
-                    report_id=outcome.get("report_id", ""),
-                    experience_id="",  # filled from real report below
-                    payload={"director_state": outcome.get("director_state", ""),
+                    report_id=report_id,
+                    payload={"reservation_id": res_id,
+                             "director_state": outcome.get("director_state", ""),
                              "budget": outcome.get("budget", {}),
                              "result": outcome.get("result", {})})
-                results.append({"domain": domain, "ok": True,
+                # P0-C: promote to ROUND_COMPLETED ONLY after the REAL stores
+                # confirm campaign binding + report + experience. Otherwise the
+                # round stays CAMPAIGN_COMPLETED/REPORT_PENDING and recovery
+                # will refuse to call the run complete.
+                final_state = round_state
+                exp_id = ""
+                if report_id:
+                    check = self._verify_round_reality({
+                        "domain_id": domain, "campaign_id": campaign_id,
+                        "report_id": report_id, "experience_id": ""})
+                    if check.get("ok"):
+                        exps = self.scheduler.services[domain].stores.sessions \
+                            .experience(check.get("session_id", ""))
+                        if exps:
+                            exp_id = str(exps[0].get("experience_id", ""))
+                    if exp_id:
+                        self.state.put_round(
+                            self.config.run_id, round_no, domain,
+                            self.state.S_ROUND_DONE,
+                            objective_id=oid, campaign_id=campaign_id,
+                            report_id=report_id, experience_id=exp_id,
+                            payload={"reservation_id": res_id,
+                                     "reality_ok": True})
+                        final_state = self.state.S_ROUND_DONE
+                results.append({"domain": domain,
+                                "ok": final_state == self.state.S_ROUND_DONE,
                                 "campaign_id": campaign_id,
-                                "report_id": outcome.get("report_id", ""),
+                                "report_id": report_id,
+                                "experience_id": exp_id,
+                                "reservation_id": res_id,
+                                "round_state": final_state,
                                 "director_state": outcome.get(
                                     "director_state", "")})
             except RuntimeBudgetExhausted:
                 raise
             except Exception as exc:  # noqa: BLE001 - isolate a failed domain
+                # Did the real engine create a campaign before the failure? Ask
+                # the REAL store, never the exception message. If the store
+                # cannot be read, assume a campaign may have started (spend the
+                # budget; at-most-once is more important than refunding).
+                camp = ""
+                store_ok = True
+                try:
+                    camps = self.scheduler.services[domain].stores.sessions \
+                        .campaigns_for_objective(oid)
+                    if camps:
+                        last = camps[-1]
+                        camp = (last.get("campaign_id")
+                                if isinstance(last, dict)
+                                else getattr(last, "campaign_id", ""))
+                except Exception:  # noqa: BLE001
+                    store_ok = False
+                if camp:
+                    self.state.bind_reservation(
+                        self.config.run_id, res_id, campaign_id=camp)
+                    self.state.consume_reservation(
+                        self.config.run_id, res_id, outcome="interrupted")
+                elif not store_ok:
+                    # Cannot prove no campaign started -> spend the budget.
+                    try:
+                        self.state.consume_reservation(
+                            self.config.run_id, res_id, outcome="unknown_interrupted")
+                    except RuntimeStateError:
+                        pass
+                else:
+                    # The real store proves no campaign was created: release.
+                    try:
+                        self.state.release_reservation(
+                            self.config.run_id, res_id,
+                            reason=f"{type(exc).__name__}: {exc}")
+                    except RuntimeStateError:
+                        pass  # already bound/consumed -> keep the spend
                 self.state.put_round(self.config.run_id, round_no, domain,
                                      "FAILED", objective_id=oid,
-                                     payload={"error": f"{type(exc).__name__}: {exc}"})
+                                     payload={"reservation_id": res_id,
+                                              "error": f"{type(exc).__name__}: {exc}"})
                 results.append({"domain": domain, "ok": False,
+                                "reservation_id": res_id,
                                 "error": f"{type(exc).__name__}: {exc}"})
         self.state.append(self.config.run_id, round_no, "round_finished",
                           {"results": results})
@@ -266,13 +429,18 @@ class RuntimeCoordinator:
         integ = self.state.verify_journal(self.config.run_id)
         if not integ["ok"]:
             raise RuntimeRecoveryRequired("journal integrity failed at finalize")
-        report = self.state.classify(self.config.run_id)
+        report = self._classify_runtime()
         if report["classification"] == C_CORRUPT:
             raise RuntimeRecoveryRequired("corrupt state at finalize")
-        self.state.set_state(self.config.run_id, S_COMPLETED, round_no=round_no,
-                             event="runtime_completed",
-                             payload={"round_no": round_no,
-                                      "checkpoint_sha": checkpoint["state_sha"]})
+        if report["classification"] != C_COMPLETE:
+            raise RuntimeRecoveryRequired(
+                f"refusing to mark run COMPLETED: recovery classification="
+                f"{report['classification']} (incomplete/unverified rounds)")
+        self.state.append(self.config.run_id, round_no, "runtime_completed",
+                          {"round_no": round_no,
+                           "checkpoint_sha": checkpoint["state_sha"]})
+        self.state.mark_terminal(self.config.run_id, S_COMPLETED,
+                                 "all_rounds_verified")
         return {"run_id": self.config.run_id, "state": S_COMPLETED,
                 "round_no": round_no, "checkpoint": checkpoint,
                 "journal": integ,
@@ -284,7 +452,7 @@ class RuntimeCoordinator:
                 "rounds": self.state.rounds(self.config.run_id),
                 "budget": self.state.global_budget_snapshot(self.config.run_id),
                 "journal": self.state.verify_journal(self.config.run_id),
-                "recovery": self.state.classify(self.config.run_id)}
+                "recovery": self._classify_runtime()}
 
 
 __all__ = [
