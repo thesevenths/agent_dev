@@ -307,6 +307,9 @@ def phase_research(out_dir: Path) -> dict[str, Any]:
 
     r2 = {"round_no": 2, "results": [], "skipped": True}
     if round2_specs:
+        # P0-D: a new round gets a fresh PER-ROUND domain budget; the global
+        # budget (RuntimeState) still governs the whole run.
+        scheduler.budget_epoch = 2
         src2 = {d: s["source_experiment"] for d, s in round2_specs.items()}
         r2 = rt.run_round(2, objective_specs=round2_specs,
                           source_experiment_ids=src2)

@@ -116,6 +116,10 @@ class ObjectiveDiscovery:
             resolvable_fn=lambda r: _resolve_ref(r, snapshot))
         result.n_approved = len(ranked)
 
+        # P1-B: deterministic Scientific Judgment (novelty/value) is advisory
+        # metadata only; it never emits an ACCEPT/REJECT verdict.
+        from .scientific_judgment import scientific_judgment as _judgment
+
         # Persist each approved candidate as a Proposed Objective (idempotent).
         # P1-A: candidates carry their own domain; never funnel every objective
         # into the caller's default domain/store.
@@ -141,6 +145,7 @@ class ObjectiveDiscovery:
                     "generation_source": c.generation_source,
                     "target_domain": target_domain,
                     "cross_domain": is_cross,
+                    "scientific_judgment": _judgment(c, snapshot),
                 },
                 created_at=snapshot.generated_at or "",
             )
@@ -155,6 +160,7 @@ class ObjectiveDiscovery:
                         "discovery_run_id": snapshot.run_id,
                         "target_domain": target_domain,
                         "cross_domain": is_cross,
+                        "scientific_judgment": _judgment(c, snapshot),
                     }))
             result.proposed_objective_ids.append(oid)
             result.ranked.append({
@@ -168,6 +174,7 @@ class ObjectiveDiscovery:
                 "target_domain": target_domain,
                 "persist_domain": target_domain,
                 "cross_domain": is_cross,
+                "scientific_judgment": _judgment(c, snapshot),
                 "persist_status": record.get("status"),
             })
         return result

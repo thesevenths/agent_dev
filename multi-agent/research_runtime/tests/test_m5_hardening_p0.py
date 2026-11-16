@@ -279,3 +279,113 @@ def test_holdout_candidate_identity_uses_coordinator_sha(tmp_path):
         "ACCEPTED", holdout_confirmed=True, holdout_evidence=None,
         expected_candidate_sha=cand["artifact_sha256"])
     assert not ok
+
+
+# ------------------------------------------------------------------------ #
+# P1-B: code-version binding + honest scientific judgment                   #
+# ------------------------------------------------------------------------ #
+def test_scientific_judgment_never_claims_global_novelty():
+    from research_runtime.scientific_judgment import scientific_judgment
+    from types import SimpleNamespace
+    cand = SimpleNamespace(
+        description="Investigate negative evidence exp_1 and refine train.lr",
+        evidence_refs=["sha256:" + "a" * 64],
+        success_criteria={"criterion": "reduce MSE", "measurable": True},
+        proposed_intervention={"train.lr": 0.001},
+        budget={"max_campaign_rounds": 1})
+    # A snapshot with one nearly-identical objective must flag a duplicate.
+    snap = SimpleNamespace(objectives=[{
+        "objective_id": "obj_old",
+        "description": "Investigate negative evidence exp_1 and refine train.lr"}])
+    j = scientific_judgment(cand, snap)
+    assert j["novelty"]["literature_check"] == "not_performed"
+    assert j["novelty"]["novelty_status"] == "possible_duplicate"
+    assert j["novelty"]["claim"].startswith("cannot_assert")
+    assert j["verdict_emitted"] is False
+    assert j["research_value"]["score"] >= 3
+
+
+def test_evidence_package_binds_code_versions(tmp_path):
+    from research_runtime.runtime_report import RuntimeReport
+    c = _coord(tmp_path)
+    c.start()
+    pkg = RuntimeReport().write(coordinator=c, out_dir=tmp_path / "ev")
+    cv = pkg["code_versions"]
+    assert "agent_dev" in cv and "scinet" in cv
+    assert cv["agent_dev"].get("head")  # real HEAD recorded
+    assert isinstance(cv["agent_dev"].get("dirty"), bool)
+
+
+# ------------------------------------------------------------------------ #
+# P1-A: cross-domain objectives route to their own stores                   #
+# ------------------------------------------------------------------------ #
+def test_experience_candidate_uses_source_domain(tmp_path):
+    """A candidate derived from domain X's Experience is owned by X."""
+    from research_runtime.objective_candidate_generator import (
+        ObjectiveCandidateGenerator,
+    )
+    from research_runtime.discovery_context_provider import DiscoverySnapshot
+    gen = ObjectiveCandidateGenerator(domain="scinet")
+    snap = DiscoverySnapshot(
+        run_id="R", schema_version="test", generated_at="", evidence_view={},
+        objectives=[{"objective_id": "obj_e", "domain": "embodied",
+                     "description": "embodied objective"}],
+        links={},
+        sessions=[{"session_id": "s1", "objective_id": "obj_e",
+                   "source_domain": "embodied",
+                   "experience": [{"experience_id": "exp1"}]}],
+        sessions_by_objective={}, experience_available=True,
+        failures={}, provenance={}, unresolved_gaps=[])
+    cands = gen._from_experience(snap)
+    assert cands and all(c.domain == "embodied" for c in cands), [
+        c.domain for c in cands]
+
+
+def test_discovery_persists_each_candidate_to_own_store(tmp_path):
+    """Discover writes by candidate.domain, not the caller's first domain."""
+    from research_runtime.research_store import (
+        ResearchStores, from_research_objective,
+    )
+    from research_runtime.objective_discovery import ObjectiveDiscovery
+    from research_runtime.objective_candidate_generator import ObjectiveCandidate
+    from research_runtime.schemas import ResearchObjective
+    stores = {d: ResearchStores(tmp_path / f"{d}.sqlite")
+              for d in ("scinet", "embodied")}
+    for d, s in stores.items():
+        obj = ResearchObjective(objective_id=f"obj_{d}", domain=d,
+                                description=f"{d} objective")
+        s.objectives.save(from_research_objective(obj, status="proposed"))
+    from research_runtime.discovery_context_provider import DiscoverySnapshot
+    snap = DiscoverySnapshot(
+        run_id="R", schema_version="test", generated_at="",
+        evidence_view={"evidence": [{"evidence_id": "sha256:" + "a" * 64}]},
+        objectives=[{"objective_id": "obj_embodied", "domain": "embodied",
+                     "description": "x"}],
+        links={}, sessions=[], sessions_by_objective={},
+        experience_available=True, failures={}, provenance={},
+        unresolved_gaps=[])
+
+    class FakeGen:
+        domain = "scinet"
+        def generate(self, snapshot):
+            return [ObjectiveCandidate(
+                candidate_id="c1", domain="embodied",
+                description="embodied only objective",
+                evidence_refs=["sha256:" + "a" * 64],
+                source_objective_ids=["obj_embodied"],
+                hypothesis_hint="refine drift",
+                success_criteria={"criterion": "x", "measurable": True},
+                proposed_intervention={"model.drift_correction": 0.1},
+                budget={}, provenance={},
+                generation_source="historical_experience")]
+    d = ObjectiveDiscovery(generator=FakeGen())
+    result = d.discover(
+        snap, objective_store=stores["scinet"].objectives,
+        domain="scinet",
+        objective_store_for_domain=lambda dom: (
+            stores[dom].objectives if dom in stores else None))
+    oid = result.proposed_objective_ids[0]
+    assert stores["embodied"].objectives.get(oid) is not None
+    assert stores["scinet"].objectives.get(oid) is None
+    assert result.ranked[0]["target_domain"] == "embodied"
+    assert result.ranked[0]["cross_domain"] is True

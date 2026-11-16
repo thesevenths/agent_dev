@@ -9,9 +9,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
+
+
+def _git_fingerprint(repo: str | Path) -> dict[str, Any]:
+    """HEAD + dirty status of a repo, or an explicit unavailable marker."""
+    p = Path(repo)
+    if not p.is_dir():
+        return {"available": False, "path": str(p)}
+    def _run(*args: str) -> str:
+        try:
+            r = subprocess.run(["git", *args], cwd=str(p),
+                               capture_output=True, text=True, timeout=15)
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:  # noqa: BLE001
+            return ""
+    head = _run("rev-parse", "HEAD")
+    status = _run("status", "--porcelain")
+    return {"available": bool(head), "path": str(p), "head": head,
+            "dirty": bool(status), "dirty_files": status.splitlines()[:20]}
 
 
 def _sha_file(path: str | Path) -> str:
@@ -38,6 +58,8 @@ class RuntimeReport:
         state = coordinator.state
         run_id = coordinator.config.run_id
         status = coordinator.status()
+        out = Path(out_dir)
+        repo_root = Path(__file__).resolve().parents[2]  # agent_dev git root
         integ = status["journal"]
         package = {
             "schema": "m5-integrated-evidence-v1",
@@ -51,13 +73,24 @@ class RuntimeReport:
             "recovery": status["recovery"],
             "config": coordinator.config.__dict__,
             "dataset_shas": coordinator.dataset_shas,
+            # P1-B: bind the produced evidence to the EXACT code that ran.
+            # Without HEAD + dirty, a SHA alone cannot prove which code version
+            # produced a historical result.
+            "code_versions": {
+                "agent_dev": _git_fingerprint(repo_root),
+                "scinet": _git_fingerprint(
+                    str(Path(os.environ.get("SCINET_DIR", "E:/LLM/SciNet++")))),
+                "python": __import__("sys").version,
+                "pytest": __import__("pytest").__version__ if __import__(
+                    "importlib.util", fromlist=["find_spec"]).find_spec("pytest")
+                else "unavailable",
+            },
             "approval_mode": "external_human_injected" if coordinator.approver
                              else "NONE_FAIL_CLOSED",
             "extra": extra or {},
         }
         pkg_sha = _stable_sha(package)
         package["package_sha256"] = pkg_sha
-        out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         path = out / filename
         path.write_text(json.dumps(package, indent=2, sort_keys=True,

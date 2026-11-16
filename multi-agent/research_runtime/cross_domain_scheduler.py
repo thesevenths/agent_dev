@@ -36,6 +36,10 @@ class CrossDomainScheduler:
         self.approver = approver
         self.out_dir = Path(out_dir)
         self.max_campaigns_per_domain = max_campaigns_per_domain
+        # P0-D: domain budgets are per ROUND. A fresh round must not inherit
+        # Round1's exhausted domain budget; the GLOBAL budget (RuntimeState) is
+        # the only cross-round authority. 0 == base run id (Round1).
+        self.budget_epoch: int = 0
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------- preflight
@@ -138,7 +142,14 @@ class CrossDomainScheduler:
         plan = service.stores.plans.get(director.context.plan_id)
         planned_campaign_id = make_campaign_id(
             director.context.plan_id, approval_id, plan.plan_sha256)
-        self.budgets.reserve(self.run_id, domain, planned_campaign_id)
+        # P0-D: per-round domain budget key; ensure it is initialized before
+        # reserving (preflight initializes only the base epoch).
+        budget_run_id = (self.run_id if self.budget_epoch <= 0
+                         else f"{self.run_id}:r{self.budget_epoch}")
+        self.budgets.initialize(
+            budget_run_id, domain,
+            max_campaigns=self.max_campaigns_per_domain)
+        self.budgets.reserve(budget_run_id, domain, planned_campaign_id)
         try:
             final = director.run_to_completion()
             ctx = director.context
@@ -147,14 +158,14 @@ class CrossDomainScheduler:
                     f"campaign id drift in {domain}: reserved="
                     f"{planned_campaign_id}, executed={ctx.campaign_id}")
             spent = self.budgets.consume(
-                self.run_id, domain, planned_campaign_id,
+                budget_run_id, domain, planned_campaign_id,
                 outcome=str(final.get("state") or "unknown"))
         except Exception:
             if director.context.campaign_id:
-                self.budgets.consume(self.run_id, domain, planned_campaign_id,
+                self.budgets.consume(budget_run_id, domain, planned_campaign_id,
                                      outcome="interrupted")
             else:
-                self.budgets.release(self.run_id, domain, planned_campaign_id,
+                self.budgets.release(budget_run_id, domain, planned_campaign_id,
                                      reason="campaign_not_created")
             raise
 
@@ -174,7 +185,7 @@ class CrossDomainScheduler:
                 "campaign_id": ctx.campaign_id,
                 "report_id": ctx.report_id,
                 "director_state": final.get("state", ""),
-                "budget": self.budgets.snapshot(self.run_id, domain),
+                "budget": self.budgets.snapshot(budget_run_id, domain),
                 "record": rec, "result": result}
 
     def run_objectives(self, objectives: list[str], **kwargs: Any) -> dict[str, Any]:
