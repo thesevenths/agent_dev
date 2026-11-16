@@ -147,3 +147,13 @@ Block），不得修改 v1。
 - Approval 是 CLI 子进程 `--yes` 授权，未证明独立真人身份与身份认证。
 - Confirmatory / M4.3-04 Final Value Report 未启动（前置条件不满足）。
 - M5-01 跨域调度、M5-02 双层 RRSI 演化不在本阶段。
+
+---
+
+## 7. M5-00 后续追加说明（本轮验收新增）
+
+本报告 §4 的 `evidence.jsonl` SHA 是 **M5-00 真实 E2E 之前**的快照。随后 M5-00
+以 append-only 方式向同一事件流写入新的真实 submitted/result 事件，因此文件级
+SHA 前进到 `1f9ca4f4…`（2026-11-16 15:18:35，39,428,155 bytes）。这是**新证据追加**，
+不是历史重写：§4 列出的原 Pilot 报告 SHA 均未变，历史 Campaign / Report /
+Experience / Verdict 均未被修改或删除。
