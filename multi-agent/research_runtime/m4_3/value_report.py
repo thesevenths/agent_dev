@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .experiment_registry import ARMS, RunRecord
+from .experiment_registry import ARMS, RUN_OUTCOMES, RunRecord
 from .metrics import (
     ALL_METRICS, PRIMARY_METRICS, SAFETY_METRICS, SECONDARY_METRICS,
     compute_metric_set, frozen_metric_contract,
@@ -178,9 +178,7 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
         "n_runs": len(runs),
         "n_runs_per_arm": {a: len(v) for a, v in by_arm.items()},
         "outcome_counts": {o: sum(1 for r in runs if r.outcome == o)
-                           for o in ("valid_finding", "negative_finding",
-                                     "inconclusive", "invalid", "failed",
-                                     "interrupted")},
+                           for o in RUN_OUTCOMES},
         "gate_completeness": _rate(lambda r: r.gate_steps_passed == 12),
         "approval_completeness": _rate(lambda r: r.external_approval),
         "report_completeness": _rate(lambda r: bool(r.report_id)),

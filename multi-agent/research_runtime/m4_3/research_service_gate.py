@@ -81,7 +81,7 @@ SCIENTIFIC_REPORT_OUTCOMES: frozenset[str] = frozenset({
 # evidence. ``invalid`` / ``failed`` / ``interrupted`` are retained as-is
 # (spec: real failures and interruptions must be preserved).
 GATED_OUTCOMES = ("valid_finding", "negative_finding", "inconclusive")
-UNGATED_OUTCOMES = ("invalid", "failed", "interrupted")
+UNGATED_OUTCOMES = ("invalid", "failed", "interrupted", "stopped")
 
 # Caller-supplied keys that used to forge a gate verdict. Passing ANY of these
 # is a hard protocol violation, not a silently ignored hint.

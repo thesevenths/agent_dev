@@ -25,7 +25,7 @@ from pathlib import Path
 from statistics import mean, variance
 from typing import Any
 
-from .experiment_registry import ARMS, RunRecord
+from .experiment_registry import ARMS, RUN_OUTCOMES, RunRecord
 from .metrics import (
     ALL_METRICS, METRIC_DEFINITIONS, PRIMARY_METRICS, compute_metric_set,
     frozen_metric_contract,
@@ -207,14 +207,15 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
         "finalized_rate": _rate(lambda r: r.finalized),
         "failure_rate": _rate(lambda r: r.outcome == "failed"),
         "interruption_rate": _rate(lambda r: r.outcome == "interrupted"),
+        "stopped_rate": _rate(lambda r: r.outcome == "stopped"),
         "invalid_rate": _rate(lambda r: r.outcome == "invalid"),
         "inconclusive_rate": _rate(lambda r: r.outcome == "inconclusive"),
         "valid_finding_rate": _rate(lambda r: r.outcome == "valid_finding"),
         "negative_finding_rate": _rate(lambda r: r.outcome == "negative_finding"),
+        # Derive from the frozen vocabulary (P0-02): a new outcome can never be
+        # silently dropped from the report's outcome_counts.
         "outcome_counts": {o: sum(1 for r in runs if r.outcome == o)
-                           for o in ("valid_finding", "negative_finding",
-                                     "inconclusive", "invalid", "failed",
-                                     "interrupted")},
+                           for o in RUN_OUTCOMES},
         "per_arm": {a: {
             "n_runs": len(v),
             "gate_pass_rate": (round(sum(1 for r in v

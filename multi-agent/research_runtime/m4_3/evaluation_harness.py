@@ -548,7 +548,7 @@ class EvaluationHarness:
             experience_id=(exp_refs[0] if exp_refs else ""),
             gate_evidence=evidence.to_dict(),
             **flags)
-        if outcome in ("failed", "interrupted", "invalid"):
+        if outcome in ("failed", "interrupted", "stopped", "invalid"):
             # (P0-03 #9) REAL failure / interruption is retained as an event.
             self.registry.append_event(
                 scope=f"run:{rec.run_id}", event_type=outcome,

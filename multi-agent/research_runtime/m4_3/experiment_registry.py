@@ -37,8 +37,27 @@ ARM_DESCRIPTIONS: dict[str, str] = {
 # none is silently discarded.
 RUN_OUTCOMES: tuple[str, ...] = (
     "valid_finding", "negative_finding", "inconclusive", "invalid",
-    "failed", "interrupted",
+    "failed", "interrupted", "stopped",
 )
+
+#: Director terminal states mapped to recorded (distinct) run outcomes (P0-02).
+#: FAILED / INTERRUPTED / STOPPED / INVALID are NEVER collapsed into one bucket.
+DIRECTOR_STATE_OUTCOME: dict[str, str] = {
+    "FAILED": "failed",
+    "INTERRUPTED": "interrupted",
+    "STOPPED": "stopped",
+    "INVALID": "invalid",
+    "REJECTED": "invalid",
+}
+
+#: ResearchReport outcomes retained as a real INCONCLUSIVE result (P0-02):
+#: a null/missing or unrecognised outcome is fail-closed, never a finding.
+REPORT_OUTCOME_MAP: dict[str, str] = {
+    "accepted_for_confirmation": "valid_finding",
+    "rejected": "negative_finding",
+    "inconclusive": "inconclusive",
+    "not_evaluated": "inconclusive",
+}
 
 
 def _hash(payload: dict[str, Any]) -> str:
@@ -410,6 +429,7 @@ class ExperimentRegistry:
 
 
 __all__ = [
-    "ARMS", "ARM_DESCRIPTIONS", "RUN_OUTCOMES", "FrozenProtocol", "Block",
-    "RunRecord", "ExperimentRegistry",
+    "ARMS", "ARM_DESCRIPTIONS", "RUN_OUTCOMES", "DIRECTOR_STATE_OUTCOME",
+    "REPORT_OUTCOME_MAP", "FrozenProtocol", "Block", "RunRecord",
+    "ExperimentRegistry",
 ]

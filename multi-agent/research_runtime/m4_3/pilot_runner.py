@@ -56,10 +56,14 @@ from ..settings import DEFAULT_SCINET_DIR, resolve_engine
 from .blind_review import BlindingLedger, BlindingViolation, is_group_leaking
 from .evaluation_harness import EvaluationHarness, ProtocolViolation
 from .experiment_controller import BudgetExhausted, ExperimentController
-from .experiment_registry import ARMS, FrozenProtocol, RunRecord
+from .experiment_registry import (
+    ARMS, DIRECTOR_STATE_OUTCOME, REPORT_OUTCOME_MAP, FrozenProtocol, RunRecord,
+)
 from .metrics import frozen_metric_contract
 from .registry_store import snapshot_sha256
-from .research_service_gate import GateRunRef, ResearchServiceGateAdapter
+from .research_service_gate import (
+    SCIENTIFIC_REPORT_OUTCOMES, GateRunRef, ResearchServiceGateAdapter,
+)
 from .review_queue import ReviewQueue
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -68,14 +72,16 @@ SP_A = "A"
 SP_B = "B"
 SP_C = "C"
 
-# The outcome vocabulary is the registry's; this maps a COMPLETED real chain to
-# the arm-level outcome the analysis consumes.
-_OUTCOME_FROM_REPORT = {
-    "accepted_for_confirmation": "valid_finding",
-    "rejected": "negative_finding",
-    "inconclusive": "negative_finding",
-    "not_evaluated": "inconclusive",
-}
+# P0-02: outcome semantics live in experiment_registry (single source of truth)
+#   * DIRECTOR_STATE_OUTCOME -- FAILED / INTERRUPTED / STOPPED / REJECTED / INVALID
+#     are recorded as DISTINCT outcomes, never collapsed into "interrupted";
+#   * REPORT_OUTCOME_MAP -- a REAL report outcome maps to an arm outcome:
+#       accepted_for_confirmation -> valid_finding
+#       rejected                  -> negative_finding (ONLY with a successful,
+#                                    real campaign + a real scientific outcome)
+#       inconclusive              -> inconclusive   (NEVER negative_finding)
+#       not_evaluated             -> inconclusive   (retained, not a finding)
+#   * any UNKNOWN state/outcome is fail-closed and preserves the raw value.
 
 
 class PreflightError(RuntimeError):
@@ -88,6 +94,49 @@ class SelectionError(RuntimeError):
 
 class ReviewIncomplete(RuntimeError):
     """A stage that REQUIRES completed human review found pending reviews."""
+
+
+def classify_director_outcome(
+    *, director_state: str, report_outcome: str = "",
+    campaign_succeeded: bool = False,
+    scientific_outcome_valid: bool = False,
+) -> tuple[str, str]:
+    """P0-02 -- pure, fail-closed mapping from REAL director/report state to a
+    recorded run outcome. Returns ``(outcome, reason)``.
+
+    Rules (no silent collapse, no optimistic default):
+      * a director terminal state in ``DIRECTOR_STATE_OUTCOME`` maps to its
+        DISTINCT recorded outcome (FAILED->failed, INTERRUPTED->interrupted,
+        STOPPED->stopped, REJECTED/INVALID->invalid);
+      * only ``COMPLETED`` consults the report;
+      * ``rejected`` becomes ``negative_finding`` ONLY when the campaign truly
+        succeeded AND a real scientific conclusion exists; otherwise it is
+        retained as ``inconclusive`` with the raw reason;
+      * ``inconclusive`` and ``not_evaluated`` stay ``inconclusive``;
+      * unknown states/outcomes -> ``invalid`` with the raw value in ``reason``.
+    """
+    raw_state = str(director_state or "")
+    state = raw_state.strip().upper()
+    if state == "COMPLETED":
+        ro = str(report_outcome or "").strip()
+        if ro not in REPORT_OUTCOME_MAP:
+            return "invalid", f"unknown report outcome {ro!r} (fail-closed)"
+        base = REPORT_OUTCOME_MAP[ro]
+        if ro == "rejected" and not (campaign_succeeded and scientific_outcome_valid):
+            # A "rejected" verdict without a successful real campaign and a
+            # verified scientific conclusion is NOT evidence of a negative
+            # finding. Retain it honestly as inconclusive.
+            return "inconclusive", (
+                f"report rejected but campaign_succeeded="
+                f"{campaign_succeeded}, scientific_outcome_valid="
+                f"{scientific_outcome_valid}; retained as inconclusive")
+        return base, f"report outcome {ro!r} (director COMPLETED)"
+    if state in DIRECTOR_STATE_OUTCOME:
+        outcome = DIRECTOR_STATE_OUTCOME[state]
+        return outcome, f"director terminal state {raw_state!r}"
+    # Unknown / intermediate director state at terminal observation: fail-closed
+    # and preserve the RAW state verbatim (never upper-cased away).
+    return "invalid", f"unknown director state {raw_state!r} (fail-closed)"
 
 
 @dataclass
@@ -1014,12 +1063,16 @@ class PilotRunner:
                              approval_id=ctx.approval_id,
                              campaign_id=ctx.campaign_id,
                              report_id=ctx.report_id)
-            outcome = self._classify(outcome_state=final.get("state", ""),
-                                     ctx=ctx)
+            outcome, reason = self._classify(
+                outcome_state=final.get("state", ""), ctx=ctx, ref=ref)
             self.harness.record_outcome(
                 block_id, arm, outcome=outcome, gate_ref=ref,
                 compute_units=1.0, wall_time_s=round(time.time() - t0, 2),
-                campaign_id=ctx.campaign_id)
+                campaign_id=ctx.campaign_id,
+                invalid_reason=("" if outcome in ("valid_finding",
+                                                   "negative_finding",
+                                                   "inconclusive")
+                                else reason))
             return outcome, ref, round(time.time() - t0, 2)
         except ProtocolViolation as exc:
             ref = GateRunRef(session_id=ctx.session_id, plan_id=ctx.plan_id,
@@ -1046,32 +1099,60 @@ class PilotRunner:
                          campaign_id=ctx.campaign_id,
                          report_id=ctx.report_id)
         state = getattr(ctx, "state", "")
-        outcome = "interrupted" if state == "INTERRUPTED" else "failed"
+        outcome, reason = classify_director_outcome(director_state=state)
+        detail = (f"{type(error).__name__}: {error}" if error
+                  else "arm preparation failed")
         self.harness.record_outcome(
             block_id, arm, outcome=outcome, gate_ref=ref,
             wall_time_s=seconds,
-            invalid_reason=(f"{type(error).__name__}: {error}" if error
-                            else "arm preparation failed"))
+            invalid_reason=f"{reason}; {detail}")
         self.harness.registry.append_event(
             scope=f"run:{block_id}_{arm}", event_type=outcome,
-            payload={"error": str(error), "arm": arm, "state": state})
+            payload={"error": str(error), "arm": arm, "state": state,
+                     "classification_reason": reason})
         return outcome, ref
 
-    def _classify(self, *, outcome_state: str, ctx: Any) -> str:
+    def _classify(self, *, outcome_state: str, ctx: Any,
+                  ref: GateRunRef | None = None) -> tuple[str, str]:
+        """Derive the recorded outcome from REAL director + gate evidence.
+
+        P0-02: ``rejected`` is a negative finding ONLY when the real campaign
+        succeeded and a real scientific conclusion exists; ``inconclusive`` /
+        ``not_evaluated`` stay inconclusive; non-COMPLETED terminal states keep
+        their DISTINCT outcomes; unknown states fail closed with the raw value.
+        """
         if outcome_state != "COMPLETED":
-            return "interrupted"
+            return classify_director_outcome(director_state=outcome_state)
+
+        if ref is None:
+            ref = GateRunRef(session_id=ctx.session_id, plan_id=ctx.plan_id,
+                             approval_id=ctx.approval_id,
+                             campaign_id=ctx.campaign_id,
+                             report_id=ctx.report_id)
+        try:
+            evidence = self.gate_adapter.inspect(ref)
+        except Exception as exc:  # noqa: BLE001
+            return "invalid", f"gate evidence read failed: {type(exc).__name__}: {exc}"
+        report_outcome = str(evidence.report_outcome or "")
+        if report_outcome and not evidence.report_found:
+            return "invalid", "report not found in the persisted chain"
+        # A frozen final split must never be used by a pilot (or any) arm.
         try:
             rep = self.service.get_research_report(session_id=ctx.session_id)
-        except Exception:  # noqa: BLE001
-            return "invalid"
-        if not rep.get("ok"):
-            return "invalid"
-        report = rep.get("report") or {}
-        if report.get("frozen_test_used"):
-            # A frozen final split must never be used by a pilot (or any) arm.
-            return "invalid"
-        return _OUTCOME_FROM_REPORT.get(str(report.get("outcome")),
-                                        "inconclusive")
+            if rep.get("ok") and (rep.get("report") or {}).get("frozen_test_used"):
+                return "invalid", "a frozen final split was used (forbidden)"
+        except Exception:  # noqa: BLE001 - fail closed below on evidence
+            pass
+        campaign_succeeded = bool(evidence.campaign_successful)
+        scientific_valid = (
+            bool(evidence.report_found)
+            and report_outcome in SCIENTIFIC_REPORT_OUTCOMES
+            and bool(evidence.experience_refs_resolved)
+        )
+        return classify_director_outcome(
+            director_state=outcome_state, report_outcome=report_outcome,
+            campaign_succeeded=campaign_succeeded,
+            scientific_outcome_valid=scientific_valid)
 
     # ------------------------------------------------------------- records
     def _save_records(self) -> None:
