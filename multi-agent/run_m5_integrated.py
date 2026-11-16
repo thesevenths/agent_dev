@@ -291,13 +291,27 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     result: dict[str, Any] = {"run_id": RUN_ID, "phases": {}}
+
+    def _subdriver(script: str, extra: list[str] | None = None) -> dict[str, Any]:
+        import subprocess
+        cmd = [sys.executable, str(ROOT / script)] + (extra or [])
+        _log(f"\n[subdriver] {' '.join(cmd)}")
+        r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True,
+                           timeout=int(os.environ.get("M5I_SUB_TIMEOUT_S", "900")))
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"{script} failed rc={r.returncode}: {r.stdout[-800:]}\n"
+                f"{r.stderr[-800:]}")
+        return {"script": script, "rc": r.returncode,
+                "tail": r.stdout[-1200:]}
+
     try:
         if args.phase in ("research", "all"):
             result["phases"]["research"] = phase_research(out_dir)
-        # RRSI and validation phases are filled in by the next implementation
-        # step; they are invoked only when explicitly requested.
-        if args.phase in ("rrsi", "validate") and args.phase != "all":
-            _log(f"[note] phase {args.phase} wired in sub-driver")
+        if args.phase in ("rrsi", "all"):
+            result["phases"]["rrsi"] = _subdriver("run_m5_rrsi.py")
+        if args.phase in ("validate", "all"):
+            result["phases"]["validate"] = _subdriver("run_m5_validation.py")
     except Exception as exc:
         result["state"] = "FAILED"
         result["error"] = f"{type(exc).__name__}: {exc}"
