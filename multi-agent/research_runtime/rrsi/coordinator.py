@@ -101,6 +101,8 @@ class RRSICoordinator:
                 status=status, gate_passed=gate,
                 evidence=exp.evidence)
             outcomes.append({"experiment_id": eid, "layer": chosen,
+                             "candidate_id": str(candidate.get("candidate_id", "")),
+                             "candidate_sha": sha,
                              "decision": decision, "gate_passed": gate,
                              "status": status, "record": record})
         return {"experiment_id": experiment_id, "selected_layer": chosen,

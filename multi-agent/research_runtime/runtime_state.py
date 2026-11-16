@@ -296,17 +296,19 @@ class RuntimeState:
                 "SELECT * FROM rt_round WHERE run_id=? AND round_no=? "
                 "AND domain_id=?", (run_id, round_no, domain_id)).fetchone()
             if old is not None:
-                if (old["state"] == state and old["objective_id"] ==
-                        str(payload.get("objective_id", old["objective_id"]))
-                        and old["payload_json"] == blob):
-                    return dict(old)
-                # a round may advance state but must not rewrite evidence ids
+                # Evidence ids are IMMUTABLE: check conflicts BEFORE any
+                # idempotency short-circuit, otherwise a changed report_id with
+                # an otherwise identical payload would be silently ignored.
                 for col in ("objective_id", "campaign_id", "report_id",
                             "experience_id"):
                     if col in payload and old[col] and str(old[col]) != str(payload[col]):
                         raise ResearchStoreConflict(
                             f"round {run_id}/{round_no}/{domain_id} {col} changed "
                             f"from {old[col]!r} to {payload[col]!r}")
+                if (old["state"] == state and old["objective_id"] ==
+                        str(payload.get("objective_id", old["objective_id"]))
+                        and old["payload_json"] == blob):
+                    return dict(old)
             conn.execute(
                 """INSERT INTO rt_round
                    (run_id,round_no,domain_id,state,objective_id,campaign_id,

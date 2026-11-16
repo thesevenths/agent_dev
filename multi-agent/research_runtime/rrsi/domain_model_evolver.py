@@ -18,7 +18,8 @@ def generate(*, domain: str, dominant_failure: str,
     """
     candidates = generate_domain_candidates(
         domain=domain, dominant=dominant_failure, limit=limit)
-    return [c.model_dump(mode="json") for c in candidates]
+    # DomainModelCandidate is a dataclass (to_dict), not a pydantic model.
+    return [c.to_dict() for c in candidates]
 
 
 def evaluate(*, domain: str, candidate: dict[str, Any],
@@ -29,7 +30,17 @@ def evaluate(*, domain: str, candidate: dict[str, Any],
              ood_config_path: str | None = None) -> dict[str, Any]:
     """Evaluate with a REAL injected engine runner; no runner = no evidence."""
     from ..evolution.candidate import DomainModelCandidate
-    model = DomainModelCandidate.model_validate(candidate)
+    # DomainModelCandidate is a dataclass: build it from the constructor fields
+    # only (to_dict carries extra bookkeeping keys that are not ctor args).
+    _fields = {"candidate_id", "domain", "target", "old", "new",
+               "taxonomy", "overrides", "hypothesis", "status",
+               "hyp_fingerprint"}
+    kwargs = {k: v for k, v in candidate.items() if k in _fields}
+    if "domain" not in kwargs:
+        kwargs["domain"] = domain
+    if not kwargs.get("target"):
+        raise ValueError("candidate has no whitelisted target")
+    model = DomainModelCandidate(**kwargs)
     result = evaluate_domain_candidate(
         domain=domain, candidate=model, base_config=base_config,
         project_dir=project_dir, campaign_id=campaign_id, seeds=seeds,

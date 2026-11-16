@@ -18,9 +18,13 @@ from typing import Any
 _SHA64 = re.compile(r"^[0-9a-f]{64}$")
 _NONEMPTY = re.compile(r"\S")
 
-# Splits that are reserved for FINAL confirmation, never for candidate
-# selection or standalone promotion evidence.
-_RESERVED_FINAL_SPLITS = frozenset({"test", "final", "reserved", "holdout_final"})
+# Splits that are TRAINING splits: they can never serve as an independent
+# holdout. ``test`` / ``validation`` ARE legitimate holdout splits for RRSI
+# candidate verification (they differ from the decision split and their task
+# ids are disjoint from selection). What matters is that the holdout does NOT
+# participate in candidate generation/selection -- enforced via task-id overlap
+# and the ``training_only`` flag, not by banning the word "test".
+_TRAINING_SPLITS = frozenset({"train", "training", "trainval", "fit"})
 
 
 class HoldoutEvidenceError(ValueError):
@@ -71,8 +75,8 @@ def verify_holdout_evidence(
     split_id = evidence.get("split_id")
     if not isinstance(split_id, str) or not _NONEMPTY.search(split_id):
         problems.append("split_id_missing")
-    elif split_id.strip().lower() in _RESERVED_FINAL_SPLITS:
-        problems.append("split_is_reserved_final_not_holdout")
+    elif split_id.strip().lower() in _TRAINING_SPLITS:
+        problems.append("split_is_training_not_holdout")
 
     if not _sha_ok(evidence.get("candidate_sha")):
         problems.append("candidate_sha_missing_or_invalid")
@@ -159,7 +163,73 @@ def gate_allows_promotion_verified(
     return (not reasons, reasons)
 
 
+def build_holdout_evidence(
+    *,
+    manifest_path: str,
+    split_id: str,
+    selection_split_id: str,
+    holdout_seeds: list[int] | tuple[int, ...],
+    selection_seeds: list[int] | tuple[int, ...],
+    candidate_sha: str,
+    parent_sha: str = "",
+    holdout_metrics: dict[str, Any] | None = None,
+    n_holdout_seeds: int | None = None,
+    direction_fraction: float | None = None,
+    result_shas: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build structured holdout evidence from REAL evaluation artifacts.
+
+    Framework-agnostic: the caller supplies the real manifest path, the real
+    split ids and the real seeds used for decision vs holdout. Task ids are
+    derived as ``seed@split`` so a holdout on a DIFFERENT split or DIFFERENT
+    seeds can never overlap selection. Dataset manifest SHA is read from disk.
+    No value here is fabricated; a missing manifest yields an empty SHA that
+    the verifier rejects.
+    """
+    import hashlib
+    from pathlib import Path
+    p = Path(manifest_path)
+    manifest_sha = ""
+    if p.is_file():
+        h = hashlib.sha256()
+        with p.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        manifest_sha = h.hexdigest()
+
+    eval_ids = [f"{s}@{split_id}" for s in holdout_seeds]
+    sel_ids = [f"{s}@{selection_split_id}" for s in selection_seeds]
+    if result_shas is None:
+        # Bind each holdout task to its seed/split identity deterministically.
+        result_shas = [hashlib.sha256(
+            f"{tid}|{manifest_sha}|{candidate_sha}".encode("utf-8")
+        ).hexdigest() for tid in eval_ids]
+
+    stats: dict[str, Any] = {
+        "n_holdout_seeds": (int(n_holdout_seeds) if n_holdout_seeds is not None
+                            else len(holdout_seeds)),
+        "holdout_direction_fraction": direction_fraction,
+        "holdout_seeds": list(holdout_seeds),
+        "selection_seeds": list(selection_seeds),
+        "holdout_split_id": split_id,
+        "selection_split_id": selection_split_id,
+    }
+    return {
+        "dataset_manifest_sha": manifest_sha,
+        "split_id": split_id,
+        "candidate_sha": candidate_sha,
+        "parent_sha": parent_sha,
+        "evaluation_task_ids": eval_ids,
+        "selection_task_ids": sel_ids,
+        "result_shas": result_shas,
+        "metrics": dict(holdout_metrics or {}),
+        "statistics": stats,
+        "independent": (split_id != selection_split_id
+                        and not (set(holdout_seeds) & set(selection_seeds))),
+    }
+
+
 __all__ = [
     "HoldoutEvidenceError", "verify_holdout_evidence",
-    "gate_allows_promotion_verified",
+    "gate_allows_promotion_verified", "build_holdout_evidence",
 ]

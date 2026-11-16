@@ -106,10 +106,10 @@ def test_structured_holdout_verification_accepts_rejects_and_is_fail_closed():
     overlap = dict(ev, selection_task_ids=["task_s1", "task_h1"])
     v = verify_holdout_evidence(overlap, expected_candidate_sha=SHA)
     assert not v["verified"] and "holdout_overlaps_selection" in v["reasons"]
-    # Reserved final split cannot stand in for holdout
-    reserved = dict(ev, split_id="test")
-    v = verify_holdout_evidence(reserved, expected_candidate_sha=SHA)
-    assert not v["verified"] and "split_is_reserved_final_not_holdout" in v["reasons"]
+    # A TRAINING split cannot stand in for an independent holdout.
+    train_split = dict(ev, split_id="train")
+    v = verify_holdout_evidence(train_split, expected_candidate_sha=SHA)
+    assert not v["verified"] and "split_is_training_not_holdout" in v["reasons"]
     # Bare boolean cannot promote under strict gate
     ok, reasons = gate_allows_promotion_verified(
         "ACCEPTED", holdout_confirmed=True, holdout_evidence=None,

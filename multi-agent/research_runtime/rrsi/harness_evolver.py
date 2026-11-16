@@ -26,9 +26,8 @@ def evaluate(*, base_harness: Any, candidate_harness: Any,
              cfg: Any | None = None) -> dict[str, Any]:
     """Paired harness evaluation with fixed tasks + independent held-out."""
     from adaptive_runtime.harness_evolution import (
-        EvolutionRecord, evaluate_candidate,
+        EvolutionRecord, HarnessCandidate, evaluate_candidate,
     )
-    from adaptive_runtime.evolution_spaces import HarnessCandidate
     model = HarnessCandidate(**candidate) if not isinstance(
         candidate, HarnessCandidate) else candidate
     record: EvolutionRecord = evaluate_candidate(
@@ -36,9 +35,10 @@ def evaluate(*, base_harness: Any, candidate_harness: Any,
         candidate=model, tasks=tasks, heldout_task=heldout_task,
         run_root=Path(run_root), experience_path=Path(experience_path),
         repo_root=Path(repo_root), cfg=cfg)
-    return {"layer": RESEARCH_HARNESS_LAYER,
-            "record": record.model_dump(mode="json")
-            if hasattr(record, "model_dump") else dict(record)}
+    # EvolutionRecord is a dataclass with to_dict(); keep one canonical form.
+    payload = (record.to_dict() if hasattr(record, "to_dict")
+               else dict(record))
+    return {"layer": RESEARCH_HARNESS_LAYER, "record": payload}
 
 
 __all__ = ["generate", "evaluate", "RESEARCH_HARNESS_LAYER"]
