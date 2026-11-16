@@ -203,7 +203,258 @@ def estimate_sample_size(*, paired_differences: dict[str, list[float]],
     }
 
 
+# ---------------------------------------------------------------------------
+# M4.3-02.1 P1-01 -- TWO primary metrics, each with its OWN variance + SEOI.
+# The original single-metric estimator above is kept for backward compatibility
+# (and its tests); the pilot now uses the dual-metric estimator below.
+# ---------------------------------------------------------------------------
+
+VARIANCE_ESTIMATED = "estimated"
+VARIANCE_ZERO = "zero_variance"
+VARIANCE_INSUFFICIENT = "insufficient_pairs"
+VARIANCE_NO_HUMAN_REVIEW = "no_human_review"
+
+#: A zero variance is NOT evidence of a known effect size: a handful of pilot
+#: blocks that happen to be identical cannot justify "n=1". It is reported as
+#: its OWN status and never used as a real variance (P1-01).
+_VARIANCE_STATUSES = (
+    VARIANCE_ESTIMATED, VARIANCE_ZERO, VARIANCE_INSUFFICIENT,
+    VARIANCE_NO_HUMAN_REVIEW,
+)
+
+
+def _sensitivity_rows(*, base_variance: float | None, seoi: float,
+                      alpha_corrected: float, target_power: float,
+                      sensitivity_inflation: tuple[float, ...]
+                      ) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for factor in sensitivity_inflation:
+        for seoi_v in (seoi, seoi * 1.5, seoi * 2.0):
+            if base_variance:
+                rows.append({
+                    "variance_factor": factor, "seoi": seoi_v,
+                    "n_blocks": blocks_required(
+                        variance_d=base_variance * factor, seoi=seoi_v,
+                        alpha=alpha_corrected, power=target_power,
+                        inflation=1.0),
+                    "source": "pilot_variance_inflated"})
+            else:
+                for d_std in (0.5, 0.8, 1.0):
+                    rows.append({
+                        "standardised_effect": d_std,
+                        "n_blocks": int(math.ceil(
+                            ((z_quantile(1 - alpha_corrected / 2)
+                              + z_quantile(target_power)) ** 2)
+                            / (d_std ** 2))),
+                        "source": "hypothetical_standardised_effect"})
+                break
+    return rows
+
+
+def estimate_primary_metric_sample_size(
+        *, metric: str, paired_differences: dict[str, list[float]],
+        seoi: float, contrasts: tuple[str, ...],
+        alpha_corrected: float, target_power: float,
+        inflation: float = 1.25,
+        sensitivity_inflation: tuple[float, ...] = (1.0, 1.25, 1.5, 2.0),
+        human_review_required: bool = False,
+        human_reviews_present: bool = True,
+) -> dict[str, Any]:
+    """Sample size for ONE primary metric, from ITS OWN paired variances.
+
+    Each contrast gets an explicit ``variance_status``; only a real, non-zero
+    pilot variance from at least ``MIN_BLOCKS_FOR_VARIANCE`` blocks counts as
+    ``estimated``. A metric-level recommendation requires EVERY pre-registered
+    contrast to be estimable.
+    """
+    if seoi <= 0:
+        raise ValueError(f"seoi must be positive for {metric!r}")
+    per_contrast: dict[str, Any] = {}
+    without: list[str] = []
+    for name in contrasts:
+        diffs = [float(d) for d in paired_differences.get(name, [])]
+        stats = summarise(diffs)
+        if human_review_required and not human_reviews_present:
+            vstatus = VARIANCE_NO_HUMAN_REVIEW
+        elif stats["n"] < MIN_BLOCKS_FOR_VARIANCE or stats["variance"] is None:
+            vstatus = VARIANCE_INSUFFICIENT
+        elif stats["variance"] <= 0.0:
+            vstatus = VARIANCE_ZERO
+        else:
+            vstatus = VARIANCE_ESTIMATED
+        row: dict[str, Any] = {
+            **stats, "seoi": seoi, "metric": metric,
+            "variance_status": vstatus, "n_blocks": None,
+            "variance_used": None, "inflation": inflation,
+        }
+        if vstatus == VARIANCE_ESTIMATED:
+            row["n_blocks"] = blocks_required(
+                variance_d=stats["variance"], seoi=seoi,
+                alpha=alpha_corrected, power=target_power,
+                inflation=inflation)
+            row["variance_used"] = stats["variance"]
+        else:
+            without.append(name)
+        row["sensitivity"] = _sensitivity_rows(
+            base_variance=(stats["variance"] if vstatus == VARIANCE_ESTIMATED
+                           else None),
+            seoi=seoi, alpha_corrected=alpha_corrected,
+            target_power=target_power,
+            sensitivity_inflation=sensitivity_inflation)
+        per_contrast[name] = row
+
+    estimable = [r["n_blocks"] for r in per_contrast.values()
+                 if r["variance_status"] == VARIANCE_ESTIMATED]
+    status = "estimated" if len(estimable) == len(contrasts) else \
+        "evidence_insufficient"
+    return {
+        "metric": metric,
+        "status": status,
+        "seoi": seoi,
+        "per_contrast": per_contrast,
+        "contrasts_without_variance": without,
+        "n_blocks_recommended": max(estimable) if estimable else None,
+        "variance_source": ("pilot_paired_differences"
+                            if status == "estimated" else "none"),
+        "assumptions": [
+            f"independent unit is a block; paired {metric} differences",
+            f"pre-specified SEOI={seoi} (largest observed pilot effect never used)",
+            f"two-sided alpha'={alpha_corrected:.8g} (Bonferroni-equivalent for power)",
+            f"pilot variance inflated by {inflation} for conservatism",
+            ("a zero variance, missing pairs or absent human review is NEVER "
+             "treated as a known true variance"),
+        ],
+        "variance_statuses": list(_VARIANCE_STATUSES),
+    }
+
+
+def estimate_dual_primary_sample_size(
+        *, paired_by_metric: dict[str, dict[str, list[float]]],
+        seoi_by_metric: dict[str, float],
+        required_metrics: tuple[str, ...],
+        contrasts: tuple[str, ...] = ("B-A", "C-B", "C-A"),
+        alpha: float = 0.05, target_power: float = 0.8,
+        inflation: float = 1.25,
+        sensitivity_inflation: tuple[float, ...] = (1.0, 1.25, 1.5, 2.0),
+        cost_per_campaign_s: float | None = None,
+        campaigns_per_block: int = 3,
+        human_reviews_present: bool = True,
+        human_review_metric: str = "independently_reviewed_objective_quality",
+) -> dict[str, Any]:
+    """Recommend a block count from BOTH primary metrics (P1-01).
+
+    Every required primary metric is estimated with its OWN paired differences
+    and its OWN pre-registered SEOI. The overall recommendation is the most
+    conservative (largest) across metrics; if ANY required metric cannot be
+    estimated the status is ``evidence_insufficient`` and NO number is invented.
+    """
+    n_contrasts = max(1, len(contrasts))
+    alpha_corrected = alpha / n_contrasts
+    per_metric: dict[str, Any] = {}
+    for metric in required_metrics:
+        if metric not in seoi_by_metric:
+            raise ValueError(f"missing pre-registered SEOI for {metric!r}")
+        per_metric[metric] = estimate_primary_metric_sample_size(
+            metric=metric,
+            paired_differences=paired_by_metric.get(metric, {}),
+            seoi=seoi_by_metric[metric], contrasts=contrasts,
+            alpha_corrected=alpha_corrected, target_power=target_power,
+            inflation=inflation,
+            sensitivity_inflation=sensitivity_inflation,
+            human_review_required=(metric == human_review_metric),
+            human_reviews_present=human_reviews_present)
+
+    all_estimated = all(per_metric[m]["status"] == "estimated"
+                        for m in required_metrics)
+    metric_sizes = [per_metric[m]["n_blocks_recommended"]
+                    for m in required_metrics
+                    if per_metric[m]["n_blocks_recommended"] is not None]
+    n_recommended = max(metric_sizes) if (all_estimated and metric_sizes) \
+        else None
+    status = "estimated" if (all_estimated and n_recommended) else \
+        "evidence_insufficient"
+
+    # Union of contrasts that lack a variance, labelled by metric, so a reader
+    # can see WHICH primary metric blocked the recommendation.
+    without: list[str] = [
+        f"{metric}::{label}"
+        for metric in required_metrics
+        for label in per_metric[metric]["contrasts_without_variance"]]
+    sensitivity_grid = {
+        f"{metric}::{label}": row["sensitivity"]
+        for metric in required_metrics
+        for label, row in per_metric[metric]["per_contrast"].items()}
+    budget = None
+    if n_recommended and cost_per_campaign_s:
+        campaigns = n_recommended * campaigns_per_block
+        budget = {"campaigns": campaigns,
+                  "estimated_seconds": round(campaigns * cost_per_campaign_s, 1),
+                  "estimated_hours": round(
+                      campaigns * cost_per_campaign_s / 3600.0, 2),
+                  "cost_per_campaign_s": cost_per_campaign_s,
+                  "campaigns_per_block": campaigns_per_block}
+
+    # Legacy projection: keep the single-metric keys used by the report
+    # renderer and the confirmatory gate working without change.
+    first = required_metrics[0]
+    legacy_per_contrast = {
+        label: {"n_blocks": row["n_blocks"],
+                "variance_used": row["variance_used"],
+                "inflation": inflation}
+        for label, row in per_metric[first]["per_contrast"].items()}
+
+    notes = [
+        "two primary metrics are estimated INDEPENDENTLY: each uses its own "
+        "paired differences, own variance and own pre-registered SEOI",
+        "one primary metric's variance is NEVER substituted for another's",
+        "the overall recommendation is the most conservative (largest) across "
+        "all required primary metrics",
+    ]
+    if not all_estimated:
+        notes.append(
+            "at least one required primary metric has no trustworthy variance "
+            "(zero / insufficient / no human review): status stays "
+            "evidence_insufficient and no recommendation is invented")
+
+    return {
+        "schema": "m4_3_dual_primary_sample_size_v1",
+        "status": status,
+        "design": "paired blocks (A/B/C within block), two-sided",
+        "independent_unit": "block",
+        "formula": ("n = ceil(((z_{1-alpha'/2} + z_{power})^2 * var_d * "
+                    "inflation) / seoi^2), per metric per contrast"),
+        "alpha": alpha,
+        "alpha_per_contrast": round(alpha_corrected, 8),
+        "multiple_comparison_correction": (
+            f"holm over {n_contrasts} contrasts; power computed with the "
+            "conservative Bonferroni-equivalent alpha"),
+        "target_power": target_power,
+        "variance_inflation": inflation,
+        "smallest_effect_of_interest_policy": (
+            "pre-specified PER PRIMARY METRIC; the largest pilot effect is NEVER used"),
+        "primary_metrics": list(required_metrics),
+        "seoi_by_metric": dict(seoi_by_metric),
+        "per_metric": per_metric,
+        # legacy keys (kept so existing renderers/gates keep working)
+        "pilot_paired_differences": {
+            metric: {label: summarise(paired_by_metric.get(metric, {}).get(label, []))
+                     for label in contrasts} for metric in required_metrics},
+        "per_contrast": legacy_per_contrast,
+        "contrasts_without_variance": without,
+        "n_blocks_recommended": n_recommended,
+        "sensitivity_grid": sensitivity_grid,
+        "budget_estimate": budget,
+        "recommendation_rule": "max over all required primary metrics",
+        "variance_statuses": list(_VARIANCE_STATUSES),
+        "notes": notes,
+        "min_blocks_for_variance": MIN_BLOCKS_FOR_VARIANCE,
+    }
+
+
 __all__ = [
     "z_quantile", "MIN_BLOCKS_FOR_VARIANCE", "ContrastSpec", "blocks_required",
     "summarise", "estimate_sample_size",
+    "VARIANCE_ESTIMATED", "VARIANCE_ZERO", "VARIANCE_INSUFFICIENT",
+    "VARIANCE_NO_HUMAN_REVIEW", "estimate_primary_metric_sample_size",
+    "estimate_dual_primary_sample_size",
 ]

@@ -32,7 +32,10 @@ from .metrics import (
 )
 from .paired_eligibility import select_paired_blocks
 from .registry_store import RegistryStore
-from .sample_size import ContrastSpec, estimate_sample_size, summarise
+from .sample_size import (
+    ContrastSpec, estimate_dual_primary_sample_size, estimate_sample_size,
+    summarise,
+)
 
 #: Primary contrasts are FIXED before the analysis (spec section 7).
 PRIMARY_CONTRASTS: tuple[tuple[str, str, str], ...] = (
@@ -245,8 +248,11 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
         "separately and never enter it")
 
     # ----------------------------------------------------- paired contrasts
+    # P1-01: build paired differences for EACH primary metric separately. The
+    # quality metric and the findings metric never share a variance.
     contrasts: dict[str, Any] = {}
-    diffs_by_contrast: dict[str, list[float]] = {}
+    paired_by_metric: dict[str, dict[str, list[float]]] = {
+        m: {} for m in PRIMARY_METRICS}
     for label, hi, lo in PRIMARY_CONTRASTS:
         per_metric: dict[str, Any] = {}
         for metric in PRIMARY_METRICS:
@@ -268,8 +274,7 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
                     diffs, resamples=bootstrap_resamples),
                 "direction": f"{hi} minus {lo}",
             }
-            if metric == PRIMARY_METRICS[0]:
-                diffs_by_contrast[label] = diffs
+            paired_by_metric[metric][label] = diffs
         contrasts[label] = {"arms": f"{hi} vs {lo}", "metrics": per_metric}
 
     # ------------------------------------------------------------ economics
@@ -306,15 +311,23 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
     }
 
     # ----------------------------------------------------- sample size
+    # P1-01: TWO primary metrics, each with its OWN SEOI and OWN variance.
+    # ``seoi_valid_findings`` is now actually used; no metric's variance is
+    # substituted for another's. Human reviews present gates the objective-
+    # quality variance (no human scores -> explicit status, never a real n).
     per_campaign = (mean([r.wall_time_s for r in runs if r.wall_time_s > 0])
                     if any(r.wall_time_s > 0 for r in runs) else None)
-    sample = estimate_sample_size(
-        paired_differences=diffs_by_contrast,
-        contrasts=[ContrastSpec("B-A", seoi_quality),
-                   ContrastSpec("C-B", seoi_quality),
-                   ContrastSpec("C-A", seoi_quality)],
+    sample = estimate_dual_primary_sample_size(
+        paired_by_metric=paired_by_metric,
+        seoi_by_metric={
+            "independently_reviewed_objective_quality": seoi_quality,
+            "valid_research_findings_per_compute_budget": seoi_valid_findings,
+        },
+        required_metrics=PRIMARY_METRICS,
+        contrasts=tuple(label for label, _hi, _lo in PRIMARY_CONTRASTS),
         alpha=alpha, target_power=target_power,
-        cost_per_campaign_s=per_campaign)
+        cost_per_campaign_s=per_campaign,
+        human_reviews_present=bool(human))
 
     analysis = {
         "schema": "m4_3_pilot_analysis_v1",
@@ -505,15 +518,24 @@ def render_pilot_report(a: dict[str, Any]) -> str:
     lines.append("## 7. Sample-size recommendation (confirmatory planning)")
     lines.append("")
     s = a["sample_size"]
+    seoi_map = s.get("seoi_by_metric", {})
     lines.append(f"- status: **{s['status']}**")
-    lines.append(f"- blocks recommended: {s['n_blocks_recommended']}")
+    lines.append(f"- blocks recommended (most conservative across BOTH primary "
+                 f"metrics): {s['n_blocks_recommended']}")
+    lines.append(f"- recommendation rule: {s.get('recommendation_rule', 'n/a')}")
     lines.append(f"- alpha per contrast: {s['alpha_per_contrast']} "
                  f"(power {s['target_power']}, inflation {s['variance_inflation']})")
-    for name, v in s["per_contrast"].items():
-        lines.append(f"- {name}: {v['n_blocks']} blocks "
-                     f"(variance {v['variance_used']})")
+    for metric, mrec in s.get("per_metric", {}).items():
+        lines.append(f"- **{metric}** (pre-registered SEOI="
+                     f"{seoi_map.get(metric)}): status={mrec['status']}, "
+                     f"variance_source={mrec['variance_source']}, "
+                     f"n={mrec['n_blocks_recommended']}")
+        for name, v in mrec["per_contrast"].items():
+            lines.append(f"    - {name}: variance_status={v['variance_status']}, "
+                         f"n={v['n_blocks']}, variance={v['variance_used']}")
     if s["contrasts_without_variance"]:
-        lines.append(f"- NOT estimated (insufficient pilot data): "
+        lines.append(f"- NOT estimated (metric::contrast / zero variance / "
+                     f"no human review / missing pairs): "
                      f"{s['contrasts_without_variance']}")
     if s["budget_estimate"]:
         lines.append(f"- budget: {s['budget_estimate']}")

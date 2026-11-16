@@ -232,6 +232,8 @@ def cmd_analyze_pilot(args) -> int:
                              experiment_id=args.experiment_id,
                              alpha=args.alpha,
                              seoi_quality=args.seoi,
+                             seoi_valid_findings=getattr(
+                                 args, "seoi_valid", 0.01),
                              protocol=protocol, write=True)
     generate_value_report(db=db, out_dir=_root(args) / "pilot",
                           experiment_id=args.experiment_id, stage="pilot",
@@ -566,7 +568,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("analyze-pilot", help="pilot analysis + sample size")
     sp.add_argument("--alpha", type=float, default=0.05)
-    sp.add_argument("--seoi", type=float, default=0.5)
+    sp.add_argument("--seoi", type=float, default=0.5,
+                    help="pre-registered SEOI for objective quality")
+    sp.add_argument("--seoi-valid", type=float, default=0.01,
+                    help="pre-registered SEOI for valid findings per compute")
     sp.set_defaults(func=cmd_analyze_pilot)
 
     for name, func in (("prepare-confirmatory", cmd_prepare_confirmatory),
