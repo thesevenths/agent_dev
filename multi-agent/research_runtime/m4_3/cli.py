@@ -445,6 +445,22 @@ def cmd_export(args) -> int:
 
     store = RegistryStore(db=_db(args, args.stage))
     bundle = store.export()
+    if getattr(args, "with_evidence", False):
+        from ..settings import DEFAULT_SCINET_DIR
+        from .evidence_bundle import build_evidence_bundle
+        evidence_dir = (_root(args) / args.stage / "evidence")
+        ev = build_evidence_bundle(
+            db=_db(args, args.stage), out_dir=evidence_dir,
+            experiment_id=args.experiment_id,
+            campaign_root=Path(DEFAULT_SCINET_DIR)
+            / "outputs" / "research_campaigns",
+            job_log_dir=Path(DEFAULT_SCINET_DIR) / "outputs" / "agent_jobs")
+        _print({"ok": True, "evidence_dir": str(evidence_dir),
+                "registry_integrity": ev["registry_integrity"],
+                "n_runs": ev["n_runs"],
+                "copied_engine_logs": len(ev["copied_engine_logs"]),
+                "missing_artefacts": ev["missing_artefacts"]})
+        return 0
     if args.out:
         Path(args.out).write_text(
             json.dumps(bundle, indent=2, sort_keys=True, default=str),
@@ -579,6 +595,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--stage", choices=("pilot", "confirmatory"),
                     default="pilot")
     sp.add_argument("--out", default="")
+    sp.add_argument("--with-evidence", action="store_true",
+                    help="also copy real engine logs + campaign artefacts")
     sp.set_defaults(func=cmd_export)
 
     sp = sub.add_parser("verify-integrity", help="verify the event hash chain")
