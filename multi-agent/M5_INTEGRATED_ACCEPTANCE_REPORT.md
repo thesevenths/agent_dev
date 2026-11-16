@@ -167,3 +167,41 @@ PROMOTED 版本作为 rollback 目标，失败候选保留但不作为回滚目�
 6. **CI ARR workflow 尚在运行**：查询时 in_progress，最终结论以 run 43841581029 为准。
 
 现在暂停，等待代码审查。
+
+---
+
+# M5 Acceptance Hardening（源码审查后加固，最终章节）
+
+用户基于真实源码审查提出 P0/P1 缺陷后，逐条修复并重新真实运行。起点 `49438f25`，
+终点以本节提交为准。**这是本报告的最新结论**；上方章节保留为加固前历史记录。
+
+## H-P0 五项缺陷修复（源码级，附真实证据）
+
+| 优先级 | 审查发现 | 修复 | 源码/测试证据 |
+|---|---|---|---|
+| P0 | 预算执行后才 reserve | 新增 `rt_reservation` 表，确定性 reservation_id，Campaign 启动前原子预留；bind→consume 幂等；崩溃后 orphan reservation 不重获预算 | `runtime_state.reserve_execution/bind_reservation/consume_reservation`；`test_budget_one_three_domains_only_one_campaign_starts`（budget=1 三域只启动 1 个 Campaign） |
+| P0 | start() 无条件设 INIT；并发启动无保护 | 终态（COMPLETED/STOPPED/…）拒绝启动；RUNNING 重启先分类恢复；`claim_executor` 原子单例执行者 | `start()` / `claim_executor`；`test_start_refuses_terminal_run_and_running_restart`、`test_concurrent_start_only_one_executor` |
+| P0 | Round 状态字段非空即判 COMPLETED；report/experience 可空 | 细化 CAMPAIGN_COMPLETED/REPORT_PENDING/EXPERIENCE_PENDING/ROUND_COMPLETED；`put_round` 拒绝无证据的 ROUND_COMPLETED；`classify` 用 `reality_verifier` 重读真实 Store（campaign binding→session→report→experience）；finalize 只在 C_COMPLETE 时标记完成 | `runtime_state.classify`、`runtime_coordinator._verify_round_reality`；`test_classify_uses_real_store_not_round_flag` |
+| P0 | Round2 只生成 Objective 未执行；RRSI/Validation 脱离 Runtime | `phase_research` 真实执行 Round2 新 Objective 的 hypothesis/plan/approval/real campaign；RRSI 在 `--phase all` 中 in-process 写同一 RuntimeState journal；finalize 统一收口 | `run_m5_integrated.phase_research`；真实运行 `e2e_final`（见下） |
+| P0 | Holdout result SHA 自造；Harness candidate SHA 身份不一致 | builder 不再自造 SHA（从真实 result_files 读）；verifier 支持 `artifact_reader` 重读磁盘 + manifest SHA 复核；candidate_sha 统一由 coordinator 对同一 dict 计算；parent_sha 来自 Registry | `holdout_evidence.build/verify`；`test_holdout_rejects_self_derived_result_sha`、`test_holdout_candidate_identity_uses_coordinator_sha` |
+
+## H-P1 两项修复
+
+- **P1-A 跨域 Objective 归属**：ObjectiveCandidate 的 domain 现从证据来源推断（experience/failure 的 source_domain、OOD 的 dname），Discover 按 candidate.domain 分别写入对应域 Store 并标 `cross_domain`；Scheduler 按真实归属路由。真实 Round2 证据：3 个 objective 分别路由到 quant/scinet/embodied（2 个 cross_domain=True）。
+- **P1-B 代码版本与 Scientific Judgment**：Evidence Package 记录 agent_dev/SciNet++ 的 Git HEAD + dirty 状态 + Python 版本（真实证据包 HEAD `fc19ded2`，dirty=true）；新增确定性 `scientific_judgment`（novelty 明确 `literature_check=not_performed`，不假称新颖；research_value 为规则评分，不发 ACCEPT/REJECT 裁决）。
+
+## H-真实完整闭环（M5 Acceptance Hardening 运行）
+
+输出目录 `M5_INTEGRATED_runs/e2e_final/`，evidence SHA `bfd9e146…`，journal 20 事件 integrity_ok：
+
+- **Round1**：scinet/embodied/quant 三域真实 Campaign 全部成功（外部 CLI approval + 原 12-step Gate）。
+- **Round2**：3 个 Experience-driven objective（generation_source 全部 `historical_experience`）分别路由到 quant/scinet/embodied，其中 2 个标 `cross_domain=True`；三域**真实执行**新 Campaign：`campaign_22e74d797b185534` / `campaign_8da0f3bb9b83581e` / `campaign_d57f6d171ca45a72`，全部 `ROUND_COMPLETED` 且带真实 `experience_id`。
+- **预算**：全局 consumed=6（两轮各 3），limit=12；域预算按轮隔离（P0-D）。
+- **终态**：`integrated_result.json` state=COMPLETED，finalize checkpoint SHA `ae982f29…`（P0-C：所有 round 真实 Store 核验通过才允许 COMPLETED）。
+- **opt-in 真实证据测试**：`M5_INTEGRATED_RUN_DIR=.../e2e_final M5_INTEGRATED_RUN_REAL=1` → 3 passed（含 Round2 真执行、experience_id、跨域路由、代码版本绑定断言）。
+
+## H-验证与边界
+
+- engine-free 加固测试 17 项（`test_m5_hardening_p0.py`）全绿；相关 discovery/runtime 回归通过；语法门禁通过。
+- 24h 连续运行仍 BLOCKED；真人 Confirmatory Blind Review 仍未启动；Harness 层实时晋级仍受环境 safe-delete 钩子限制（回退真实历史产物判 INCONCLUSIVE）。这些均未宣称通过。
+- SciNet++ 训练/验证/Test split 隔离、按 split 保存 result/meta 的设计已核实正确；建议后续补 Dataset Manifest SHA 绑定与 Resume 身份复核（P2，非本次 M5 阻塞项）。
