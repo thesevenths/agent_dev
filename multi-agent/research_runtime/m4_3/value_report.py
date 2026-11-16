@@ -1,0 +1,469 @@
+"""M4.3-02 -- M4.3-04 Value Report generator (pilot AND final).
+
+Every number is read back from the persisted registry (blocks, runs, trusted
+ids), the append-only review rows and, for the confirmatory stage, the frozen
+protocol. Nothing is copied from a previous report and nothing is hardcoded.
+
+The report has SEVEN sections (spec M4.3-04):
+  A design   B data integrity   C primary metrics   D secondary metrics
+  E safety   F economics        G conclusion
+
+Each key claim carries an evidence chain (block -> run -> campaign -> report ->
+experience -> evidence refs) so a reader can audit it.
+
+A pilot report and the final value report are DIFFERENT artefacts and are
+labelled as such: the pilot never declares a winner, and the final report is
+only allowed to pick one of four outcomes.
+"""
+from __future__ import annotations
+
+import datetime
+import json
+from pathlib import Path
+from typing import Any
+
+from .experiment_registry import ARMS, RunRecord
+from .metrics import (
+    ALL_METRICS, PRIMARY_METRICS, SAFETY_METRICS, SECONDARY_METRICS,
+    compute_metric_set, frozen_metric_contract,
+)
+from .pilot_analysis import PRIMARY_CONTRASTS, load_runs
+from .registry_store import RegistryStore
+from .statistical_analysis import analyse_primary_contrasts
+
+OUTCOME_KEYS: dict[str, str] = {
+    "ARR has clear incremental value": "arr_has_clear_incremental_value",
+    "efficiency improved without a scientific discovery improvement":
+        "efficiency_only",
+    "no clear incremental value": "no_clear_incremental_value",
+    "evidence insufficient": "evidence_insufficient",
+}
+
+VALUE_OUTCOMES: tuple[str, ...] = (
+    "ARR has clear incremental value",
+    "efficiency improved without a scientific discovery improvement",
+    "no clear incremental value",
+    "evidence insufficient",
+)
+
+#: Which contrasts are PRIMARY vs secondary (fixed BEFORE results are seen).
+PRIMARY_CONTRAST_LABELS: tuple[str, ...] = ("C-B",)
+SECONDARY_CONTRAST_LABELS: tuple[str, ...] = ("B-A", "C-A")
+
+
+def _runs_by_arm(runs: list[RunRecord]) -> dict[str, list[RunRecord]]:
+    return {a: [r for r in runs if r.arm == a] for a in ARMS}
+
+
+def _evidence_chain(rec: RunRecord) -> dict[str, Any]:
+    """The traceable chain behind ONE run (no interpretation)."""
+    return {"run_id": rec.run_id, "block_id": rec.block_id,
+            "arm": rec.arm, "objective_id": rec.objective_id,
+            "plan_id": rec.plan_id, "approval_id": rec.approval_id,
+            "campaign_id": rec.campaign_id, "report_id": rec.report_id,
+            "experience_id": rec.experience_id,
+            "snapshot_id": rec.snapshot_id, "seed": rec.seed,
+            "outcome": rec.outcome,
+            "gate_passed": bool(rec.gate_evidence.get("gate_passed")),
+            "gate_steps_passed": rec.gate_steps_passed,
+            "external_approval": rec.external_approval,
+            "evidence_refs": list(rec.evidence_refs),
+            "finalized": rec.finalized}
+
+
+def _contrast_differences(runs: list[RunRecord], metric: str
+                          ) -> dict[str, list[float]]:
+    by_block: dict[str, dict[str, RunRecord]] = {}
+    for r in runs:
+        by_block.setdefault(r.block_id, {})[r.arm] = r
+    out: dict[str, list[float]] = {label: [] for label, _, _ in PRIMARY_CONTRASTS}
+    for _bid, arms in by_block.items():
+        if len(arms) != len(ARMS):
+            continue
+        for label, hi, lo in PRIMARY_CONTRASTS:
+            a = compute_metric_set([arms[hi]])[metric]
+            b = compute_metric_set([arms[lo]])[metric]
+            if a is None or b is None:
+                continue
+            if metric == PRIMARY_METRICS[0] and (
+                    not arms[hi].quality_review or not arms[lo].quality_review):
+                continue        # never impute a missing human review
+            out[label].append(round(float(a) - float(b), 6))
+    return out
+
+
+def generate_value_report(*, db: Any, out_dir: str | Path,
+                          experiment_id: str = "m4_3",
+                          stage: str = "final",
+                          alpha: float = 0.05,
+                          correction: str = "holm",
+                          protocol: dict[str, Any] | None = None,
+                          pilot_analysis: dict[str, Any] | None = None,
+                          write: bool = True) -> dict[str, Any]:
+    """Build the value report for ``stage`` ('pilot' or 'final')."""
+    if stage not in ("pilot", "final"):
+        raise ValueError("stage must be 'pilot' or 'final'")
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    runs = load_runs(db)
+    blocks = RegistryStore(db=db).load_blocks()
+    by_arm = _runs_by_arm(runs)
+    integrity = RegistryStore(db=db).verify_integrity()
+    protocol = protocol or {}
+
+    # ------------------------------------------------------------- A design
+    design = {
+        "experiment_id": experiment_id,
+        "stage": stage,
+        "n_blocks": len(blocks),
+        "snapshot_ids": sorted({b["snapshot_id"] for b in blocks}),
+        "protocol_sha256": protocol.get("protocol_sha256")
+        or (blocks[0].get("protocol_sha256") if blocks else ""),
+        "model_version": protocol.get("model_version", ""),
+        "prompt_version": protocol.get("prompt_version", ""),
+        "ranker_version": protocol.get("ranker_version", ""),
+        "domain_policy_version": protocol.get("domain_policy_version", ""),
+        "paired_seeds": protocol.get("paired_seeds", []),
+        "campaign_budget": protocol.get("campaign_budget", {}),
+        "exclusion_rules": protocol.get("exclusion_rules", []),
+        "statistical_method": protocol.get("statistical_method", ""),
+        "multiple_comparison_correction": protocol.get(
+            "multiple_comparison_correction", correction),
+        "primary_contrasts": list(PRIMARY_CONTRAST_LABELS),
+        "secondary_contrasts": list(SECONDARY_CONTRAST_LABELS),
+        "arms": {a: {"n_runs": len(v)} for a, v in by_arm.items()},
+        "metric_contract_sha256": frozen_metric_contract()["contract_sha256"],
+    }
+
+    # ----------------------------------------------------- B data integrity
+    def _rate(pred) -> float:
+        return round(sum(1 for r in runs if pred(r)) / len(runs), 6) if runs else 0.0
+
+    campaign_owners: dict[str, set[str]] = {}
+    for r in runs:
+        if r.campaign_id:
+            campaign_owners.setdefault(r.campaign_id, set()).add(r.run_id)
+    duplicates = sorted(cid for cid, o in campaign_owners.items() if len(o) > 1)
+    missing = []
+    for r in runs:
+        gaps = [name for name, value in (("plan", r.plan_id),
+                                         ("approval", r.approval_id),
+                                         ("campaign", r.campaign_id),
+                                         ("report", r.report_id),
+                                         ("experience", r.experience_id))
+                if not value]
+        if gaps:
+            missing.append({"run_id": r.run_id, "arm": r.arm,
+                            "missing": gaps, "outcome": r.outcome})
+    integrity_section = {
+        "n_runs": len(runs),
+        "n_runs_per_arm": {a: len(v) for a, v in by_arm.items()},
+        "outcome_counts": {o: sum(1 for r in runs if r.outcome == o)
+                           for o in ("valid_finding", "negative_finding",
+                                     "inconclusive", "invalid", "failed",
+                                     "interrupted")},
+        "gate_completeness": _rate(lambda r: r.gate_steps_passed == 12),
+        "approval_completeness": _rate(lambda r: r.external_approval),
+        "report_completeness": _rate(lambda r: bool(r.report_id)),
+        "experience_completeness": _rate(lambda r: bool(r.experience_id)),
+        "registry_event_chain_valid": integrity,
+        "duplicate_campaign_ids": duplicates,
+        "missing_records": missing,
+        "excluded_runs": [],
+        "note": ("failed / interrupted / invalid runs are RETAINED and stay in "
+                 "every denominator; nothing is deleted"),
+    }
+
+    # -------------------------------------------------------- C primary
+    contrast_runs: dict[str, dict[str, Any]] = {}
+    for metric in PRIMARY_METRICS:
+        diffs = _contrast_differences(runs, metric)
+        analysed = analyse_primary_contrasts(differences=diffs, alpha=alpha,
+                                             correction=correction)
+        contrast_runs[metric] = analysed
+    primary = {
+        "metrics": list(PRIMARY_METRICS),
+        "by_arm": {a: {m: compute_metric_set(v)[m] for m in PRIMARY_METRICS}
+                   for a, v in by_arm.items()},
+        "contrasts": contrast_runs,
+        "primary_contrast": PRIMARY_CONTRAST_LABELS[0],
+        "significance_claimed": bool(
+            stage == "final" and any(
+                c.get("significant")
+                for payload in contrast_runs.values()
+                for c in payload["contrasts"].values())),
+    }
+
+    # ------------------------------------------------------ D secondary
+    secondary = {
+        "metrics": list(SECONDARY_METRICS),
+        "by_arm": {a: {m: compute_metric_set(v)[m] for m in SECONDARY_METRICS}
+                   for a, v in by_arm.items()},
+    }
+
+    # --------------------------------------------------------- E safety
+    safety = {
+        "metrics": list(SAFETY_METRICS),
+        "by_arm": {a: {m: compute_metric_set(v)[m] for m in SAFETY_METRICS}
+                   for a, v in by_arm.items()},
+        "counts": {
+            "unsupported_evidence_claim": sum(
+                1 for r in runs if r.unsupported_evidence_claim),
+            "false_objective": sum(1 for r in runs if r.false_objective),
+            "frozen_split_violation": sum(
+                1 for r in runs if r.frozen_split_violation),
+            "approval_bypass": sum(1 for r in runs if r.approval_bypass),
+            "duplicate_campaign": sum(1 for r in runs if r.duplicate_campaign),
+        },
+    }
+
+    # ------------------------------------------------------- F economics
+    economics = {
+        "compute_units_total": round(sum(r.compute_units for r in runs), 6),
+        "compute_units_by_arm": {a: round(sum(r.compute_units for r in v), 6)
+                                 for a, v in by_arm.items()},
+        "wall_time_s_total": round(sum(r.wall_time_s for r in runs), 3),
+        "wall_time_s_by_arm": {a: round(sum(r.wall_time_s for r in v), 3)
+                               for a, v in by_arm.items()},
+        "n_valid_findings": sum(1 for r in runs if r.outcome == "valid_finding"),
+        "compute_per_valid_finding": compute_metric_set(runs)[
+            "compute_per_valid_finding"],
+        "compute_per_objective": {
+            a: (round(sum(r.compute_units for r in v) / len(v), 6) if v else None)
+            for a, v in by_arm.items()},
+        "selection_cost": {
+            "automated_discovery_runs": sum(
+                1 for r in runs if r.notes.get("selection_context")),
+        },
+    }
+
+    # ------------------------------------------------------- G conclusion
+    conclusion = _conclusion(stage=stage, primary=primary,
+                             integrity_section=integrity_section,
+                             runs=runs, economics=economics)
+    conclusion["outcome_key"] = OUTCOME_KEYS.get(conclusion["outcome"],
+                                                 "unknown")
+
+    chains = [_evidence_chain(r) for r in runs]
+    key_links = {
+        label: [c for c in chains if c["arm"] in (label.split("-")[0],
+                                                  label.split("-")[1])]
+        for label in PRIMARY_CONTRAST_LABELS + SECONDARY_CONTRAST_LABELS}
+
+    report = {
+        "schema": "m4_3_value_report_v1",
+        "stage": stage,
+        "experiment_id": experiment_id,
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "is_pilot": stage == "pilot",
+        "design": design,
+        "data_integrity": integrity_section,
+        "primary": primary,
+        "secondary": secondary,
+        "safety": safety,
+        "economics": economics,
+        "conclusion": conclusion,
+        "evidence_chains": chains,
+        "contrast_evidence": key_links,
+        "pilot_analysis_ref": ("pilot_analysis.json" if pilot_analysis else ""),
+        "metric_contract": frozen_metric_contract(),
+    }
+    if write:
+        name = "value_report.json" if stage == "final" else "pilot_value_report.json"
+        (out / name).write_text(
+            json.dumps(report, indent=2, sort_keys=True, default=str),
+            encoding="utf-8")
+        md_name = ("M4_3_VALUE_REPORT.md" if stage == "final"
+                   else "M4_3_PILOT_VALUE_REPORT.md")
+        (out / md_name).write_text(render_value_report(report), encoding="utf-8")
+    return report
+
+
+def _conclusion(*, stage: str, primary: dict[str, Any],
+                integrity_section: dict[str, Any], runs: list[RunRecord],
+                economics: dict[str, Any]) -> dict[str, Any]:
+    """Choose ONE of the four allowed outcomes -- never a forced C win."""
+    if not runs:
+        return {"outcome": VALUE_OUTCOMES[3], "significance_claimed": False,
+                "reason": "no persisted runs: nothing to report",
+                "evidence": []}
+    cb = primary["contrasts"][PRIMARY_METRICS[0]]["contrasts"].get("C-B", {})
+    ca = primary["contrasts"][PRIMARY_METRICS[0]]["contrasts"].get("C-A", {})
+    ba = primary["contrasts"][PRIMARY_METRICS[0]]["contrasts"].get("B-A", {})
+    n_pairs = cb.get("n") or 0
+    if stage != "final":
+        return {
+            "outcome": VALUE_OUTCOMES[3],
+            "significance_claimed": False,
+            "reason": ("PILOT: this report is a pilot artefact. The pilot never "
+                       "declares a winner; the four-way value conclusion is "
+                       "reserved for the frozen confirmatory analysis."),
+            "pilot_contrast_snapshot": {"C-B": cb, "C-A": ca, "B-A": ba,
+                                        "n_pairs": n_pairs},
+            "evidence": [],
+        }
+    if n_pairs < 3 or integrity_section["duplicate_campaign_ids"]:
+        return {"outcome": VALUE_OUTCOMES[3], "significance_claimed": False,
+                "reason": (f"{n_pairs} paired block(s) and/or an integrity "
+                           "problem cannot support a value conclusion"),
+                "evidence": []}
+    if cb.get("significant") and ca.get("significant"):
+        return {"outcome": VALUE_OUTCOMES[0], "significance_claimed": True,
+                "reason": ("primary contrast C-B and secondary C-A are both "
+                           "significant after correction"),
+                "evidence": ["C-B", "C-A"]}
+    if cb.get("significant") and not ca.get("significant"):
+        return {"outcome": VALUE_OUTCOMES[1], "significance_claimed": True,
+                "reason": ("C beats B but not the manual baseline: automation "
+                           "adds efficiency, not discovery power"),
+                "evidence": ["C-B"]}
+    if not cb.get("significant") and not ca.get("significant"):
+        return {"outcome": VALUE_OUTCOMES[2], "significance_claimed": False,
+                "reason": "no contrast survives the correction",
+                "evidence": ["C-B", "C-A"]}
+    return {"outcome": VALUE_OUTCOMES[3], "significance_claimed": False,
+            "reason": "the pattern does not support any of the three positive "
+                      "outcomes", "evidence": []}
+
+
+# ------------------------------------------------------------------ render
+def render_value_report(r: dict[str, Any]) -> str:
+    lines: list[str] = []
+    title = ("M4.3-04 PILOT Value Report" if r["is_pilot"]
+             else "M4.3-04 VALUE REPORT")
+    lines.append(f"# {title} -- {r['experiment_id']}")
+    lines.append("")
+    lines.append(f"Generated: {r['generated_at']}  ")
+    lines.append(f"Stage: **{r['stage']}**  ")
+    lines.append(f"Protocol SHA-256: `{r['design']['protocol_sha256']}`")
+    lines.append("")
+    if r["is_pilot"]:
+        lines.append("> **PILOT ARTEFACT.** The value conclusion below is "
+                     "deliberately `evidence insufficient`; pilots do not "
+                     "declare winners. The frozen confirmatory analysis "
+                     "produces `M4_3_VALUE_REPORT.md`.")
+        lines.append("")
+
+    d = r["design"]
+    lines.append("## A. Experiment design")
+    lines.append("")
+    lines.append(f"- blocks: {d['n_blocks']}; snapshots: {len(d['snapshot_ids'])}")
+    lines.append(f"- arms: A manual / B memory-assisted / C autonomous discovery")
+    lines.append(f"- model / prompt / ranker / policy: `{d['model_version']}` / "
+                 f"`{d['prompt_version']}` / `{d['ranker_version']}` / "
+                 f"`{d['domain_policy_version']}`")
+    lines.append(f"- paired seeds: {d['paired_seeds']}; budget: "
+                 f"{d['campaign_budget']}")
+    lines.append(f"- exclusion rules: {d['exclusion_rules']}")
+    lines.append(f"- statistical method: {d['statistical_method']} "
+                 f"(correction: {d['multiple_comparison_correction']})")
+    lines.append(f"- primary contrast: {d['primary_contrasts']}; secondary: "
+                 f"{d['secondary_contrasts']}")
+    lines.append("")
+
+    b = r["data_integrity"]
+    lines.append("## B. Data integrity")
+    lines.append("")
+    lines.append("| check | value |")
+    lines.append("|---|---|")
+    for key in ("n_runs", "gate_completeness", "approval_completeness",
+                "report_completeness", "experience_completeness",
+                "registry_event_chain_valid", "outcome_counts"):
+        lines.append(f"| {key} | {b[key]} |")
+    lines.append("")
+    if b["duplicate_campaign_ids"]:
+        lines.append(f"**Duplicate campaign ids:** {b['duplicate_campaign_ids']}")
+        lines.append("")
+    if b["missing_records"]:
+        lines.append("Missing trusted ids per run:")
+        lines.append("")
+        for m in b["missing_records"]:
+            lines.append(f"- {m['run_id']} ({m['arm']}, {m['outcome']}): "
+                         f"{m['missing']}")
+        lines.append("")
+
+    c = r["primary"]
+    lines.append("## C. Primary metrics")
+    lines.append("")
+    lines.append("| metric | " + " | ".join(ARMS) + " |")
+    lines.append("|---|" + "---|" * len(ARMS))
+    for metric in c["metrics"]:
+        lines.append(f"| {metric} | " + " | ".join(
+            str(c["by_arm"][a][metric]) for a in ARMS) + " |")
+    lines.append("")
+    for metric, payload in c["contrasts"].items():
+        lines.append(f"### {metric}")
+        lines.append("")
+        lines.append("| contrast | n | mean diff | 95% CI | effect (dz) | "
+                     "p | corrected | significant |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for label, m in payload["contrasts"].items():
+            ci = m.get("confidence_interval_95")
+            corr = (m.get("correction") or {}).get("effective_alpha")
+            lines.append(
+                f"| {label} | {m.get('n')} | {m.get('mean')} | {ci} | "
+                f"{m.get('effect_size_dz')} | {m.get('p_value')} | "
+                f"{corr} | {m.get('significant')} |")
+        lines.append("")
+
+    s = r["secondary"]
+    lines.append("## D. Secondary metrics")
+    lines.append("")
+    lines.append("| metric | " + " | ".join(ARMS) + " |")
+    lines.append("|---|" + "---|" * len(ARMS))
+    for metric in s["metrics"]:
+        lines.append(f"| {metric} | " + " | ".join(
+            str(s["by_arm"][a][metric]) for a in ARMS) + " |")
+    lines.append("")
+
+    sf = r["safety"]
+    lines.append("## E. Safety")
+    lines.append("")
+    lines.append("| metric | " + " | ".join(ARMS) + " |")
+    lines.append("|---|" + "---|" * len(ARMS))
+    for metric in sf["metrics"]:
+        lines.append(f"| {metric} | " + " | ".join(
+            str(sf["by_arm"][a][metric]) for a in ARMS) + " |")
+    lines.append("")
+    lines.append(f"Counts: {sf['counts']}")
+    lines.append("")
+
+    e = r["economics"]
+    lines.append("## F. Economics")
+    lines.append("")
+    lines.append(f"- total compute units: {e['compute_units_total']} "
+                 f"({e['compute_units_by_arm']})")
+    lines.append(f"- total wall time (s): {e['wall_time_s_total']} "
+                 f"({e['wall_time_s_by_arm']})")
+    lines.append(f"- valid findings: {e['n_valid_findings']}; compute per valid "
+                 f"finding: {e['compute_per_valid_finding']}")
+    lines.append(f"- compute per objective: {e['compute_per_objective']}")
+    lines.append("")
+
+    con = r["conclusion"]
+    lines.append("## G. Conclusion")
+    lines.append("")
+    lines.append(f"**{con['outcome']}**")
+    lines.append("")
+    lines.append(f"{con['reason']}")
+    lines.append("")
+    lines.append(f"Significance claimed: **{con['significance_claimed']}**")
+    lines.append("")
+    if r["contrast_evidence"]:
+        lines.append("Evidence chains (block -> campaign -> report -> experience):")
+        lines.append("")
+        for label, chains in r["contrast_evidence"].items():
+            lines.append(f"- **{label}**")
+            for ch in chains:
+                lines.append(
+                    f"  - `{ch['run_id']}` block=`{ch['block_id']}` "
+                    f"campaign=`{ch['campaign_id']}` report=`{ch['report_id']}` "
+                    f"experience=`{ch['experience_id']}` "
+                    f"outcome={ch['outcome']} gate={ch['gate_steps_passed']}/12")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+__all__ = ["VALUE_OUTCOMES", "OUTCOME_KEYS", "PRIMARY_CONTRAST_LABELS",
+           "SECONDARY_CONTRAST_LABELS", "generate_value_report",
+           "render_value_report"]
