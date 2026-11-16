@@ -314,7 +314,12 @@ class ObjectiveCandidateGenerator:
                     f"Investigate negative evidence {eid} "
                     f"(verdicts={sorted(verdicts)}) and propose a direction that "
                     f"resolves it."),
-                evidence_refs=[eid, *[s for s in ent.get("sources", []) if s]],
+                # Every evidence reference must be a machine-readable
+                # ``key:value`` claim (the hypothesis Critic rejects bare text).
+                # A carrier file path is a REAL artefact, so it is cited as
+                # ``path:<relpath>`` instead of being dropped.
+                evidence_refs=[eid, *[f"path:{s}" for s in ent.get("sources", [])
+                                      if s]],
                 source_objective_ids=list(snapshot.objectives
                                           and [o.get("objective_id") for o in
                                                snapshot.objectives] or []),
