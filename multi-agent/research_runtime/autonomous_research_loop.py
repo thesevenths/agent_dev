@@ -29,6 +29,7 @@ HARD RULES (spec M5-00)
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,7 +42,8 @@ from .autonomous_loop_state import (
     S_PREFLIGHTED, S_RECOVERING, S_ROUND_COMPLETED, S_STOPPED, S_EXECUTING,
 )
 from .autonomous_loop_recovery import (
-    apply_recovery, reconcile, LoopRecoveryReport,
+    CORRUPT, RECOVERY_REQUIRED, ROUND_COMPLETED, apply_recovery,
+    load_round_records, reconcile, LoopRecoveryReport,
 )
 from .discovery_context_provider import DiscoveryContextProvider
 from .loop_budget_ledger import (
@@ -52,7 +54,7 @@ from .objective_discovery import ObjectiveDiscovery
 from .objective_ranker import ObjectiveRanker
 from .objective_candidate_generator import ObjectiveCandidateGenerator
 from .research_director import ResearchDirector
-from .research_store import ResearchStoreConflict
+from .research_store import ResearchStoreConflict, content_sha256
 
 
 class LoopPreflightError(RuntimeError):
@@ -61,6 +63,10 @@ class LoopPreflightError(RuntimeError):
 
 class LoopApprovalRequired(RuntimeError):
     """No external approver supplied -- never auto-grant."""
+
+
+class LoopRecoveryRequired(RuntimeError):
+    """Recovery could not prove a safe state; a human must intervene."""
 
 
 class _ReusePriorObjectiveStore:
@@ -312,20 +318,98 @@ class AutonomousResearchLoop:
     def _round_path(self, round_no: int) -> Path:
         return self.rounds_dir / f"round_{round_no:02d}.json"
 
-    def _write_round(self, round_no: int, payload: dict[str, Any]) -> None:
-        """Append-only-by-version: never overwrite an existing completed round."""
+    @staticmethod
+    def _round_sha(payload: dict[str, Any]) -> str:
+        """Hash only the EVIDENCE payload, never the wall-clock write stamp."""
+        stable = {k: v for k, v in payload.items()
+                  if k not in ("written_at", "evidence_sha256")}
+        return content_sha256(stable)
+
+    def _write_round(self, round_no: int,
+                     payload: dict[str, Any]) -> dict[str, Any]:
+        """Immutable round evidence: O_EXCL create; same SHA = idempotent reuse.
+
+        A different payload for the same round is a conflict, never a silent
+        replace. This keeps a completed round from being rewritten by a retry
+        or by recovery with a different (possibly fabricated) evidence chain.
+        """
         path = self._round_path(round_no)
         final = {"round_no": round_no, **payload, "written_at": _now()}
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(final, indent=2, sort_keys=True,
-                                  default=str), encoding="utf-8")
-        tmp.replace(path)
+        final["evidence_sha256"] = self._round_sha(final)
+        text = json.dumps(final, indent=2, sort_keys=True, default=str)
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError) as exc:
+                raise ResearchStoreConflict(
+                    f"round {round_no} evidence is unreadable: {exc}") from exc
+            existing_sha = self._round_sha(existing)
+            if existing_sha != final["evidence_sha256"]:
+                raise ResearchStoreConflict(
+                    f"round {round_no} evidence already exists with different "
+                    "content; refusing to overwrite completed round")
+            return existing
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return final
 
     # ------------------------------------------------------------------- run
     def run(self) -> dict[str, Any]:
-        """Execute (or resume) all rounds, fail-closed on preflight/budget."""
+        """Execute/resume rounds, but ONLY after REAL store reconciliation."""
         self.preflight()
+        report = self.recover(apply=False)
+        self._emit("auto_recovery_checked", {
+            "classification": report.classification,
+            "integrity_ok": report.integrity_ok,
+            "n_rounds": len(report.rounds)})
         outcomes: list[dict[str, Any]] = list(self.record.rounds)
+
+        if report.classification == CORRUPT:
+            self.recover(apply=True)
+            raise LoopRecoveryRequired(
+                f"loop {self.config.loop_id!r} is CORRUPT: "
+                + "; ".join(report.corruption[:5]))
+
+        # Round JSON written but LoopRecord not updated: resume from the REAL
+        # immutable files, never re-run the campaign.
+        if report.classification == ROUND_COMPLETED and not outcomes and report.rounds:
+            outcomes = [r for r in load_round_records(self.rounds_dir)
+                        if not r.get("corrupt")]
+            self.record.rounds = outcomes
+            self.record.round_no = len(outcomes)
+            self.store.save(self.record)
+            report = self.recover(apply=False)
+
+        # Experience/report written but round JSON lost: rebuild ONLY from
+        # real stores + Director journal, then require the same reconciliation.
+        if not report.rounds and self.record.round_no > 0:
+            rebuilt = self._rebuild_completed_round(self.record.round_no)
+            if rebuilt is None:
+                self.recover(apply=True)
+                raise LoopRecoveryRequired(
+                    f"round {self.record.round_no} has no provable round "
+                    "evidence; waiting for human review")
+            written = self._write_round(self.record.round_no, rebuilt)
+            rebuilt["evidence_sha256"] = written["evidence_sha256"]
+            rebuilt["written_at"] = written.get("written_at", "")
+            if rebuilt not in outcomes:
+                outcomes.append(rebuilt)
+            self.record.rounds = outcomes
+            self.store.save(self.record)
+            self._emit("round_rebuilt_from_real_stores", {
+                "round_no": self.record.round_no,
+                "evidence_sha256": written["evidence_sha256"]})
+            report = self.recover(apply=False)
+
+        if report.rounds and report.classification != ROUND_COMPLETED:
+            self.recover(apply=True)
+            raise LoopRecoveryRequired(
+                f"loop {self.config.loop_id!r} recovery classification="
+                f"{report.classification}; refusing to re-run or re-charge")
+        if report.classification == ROUND_COMPLETED:
+            self.recover(apply=True)
+
         start_round = len(outcomes) + 1
         for round_no in range(start_round, self.config.max_rounds + 1):
             self._check_budget()
@@ -341,9 +425,11 @@ class AutonomousResearchLoop:
                 len(outcomes) >= self.config.max_rounds:
             self._transition("complete_loop", S_LOOP_COMPLETED,
                              {"n_rounds": len(outcomes)})
+        final_report = self.recover(apply=False)
         return {"loop_id": self.config.loop_id, "state": self.record.state,
                 "n_rounds": len(outcomes), "rounds": outcomes,
-                "integrity_ok": self.store.verify_integrity(self.config.loop_id)}
+                "integrity_ok": self.store.verify_integrity(self.config.loop_id),
+                "recovery_classification": final_report.classification}
 
     def _run_round(self, round_no: int,
                    prior_experience: dict[str, Any]) -> dict[str, Any]:
@@ -436,6 +522,8 @@ class AutonomousResearchLoop:
             "hypothesis_ids": list(ctx.hypothesis_ids),
             "plan_id": ctx.plan_id,
             "approval_id": ctx.approval_id,
+            "session_id": ctx.session_id,
+            "director_id": director.director_id,
             "campaign_id": ctx.campaign_id,
             "report_id": ctx.report_id,
             "experience_id": (final.get("experience_id")
@@ -449,7 +537,9 @@ class AutonomousResearchLoop:
         }
         self._transition("experience_recorded", S_EXPERIENCE_RECORDED,
                          {"experience_id": round_rec["experience_id"]})
-        self._write_round(round_no, round_rec)
+        written = self._write_round(round_no, round_rec)
+        round_rec["evidence_sha256"] = written["evidence_sha256"]
+        round_rec["written_at"] = written.get("written_at", "")
         self._transition("complete_round", S_ROUND_COMPLETED,
                          {"round_no": round_no,
                           "experience_id": round_rec["experience_id"]})
@@ -468,14 +558,65 @@ class AutonomousResearchLoop:
 
     # -------------------------------------------------------------- recovery
     def recover(self, *, apply: bool = False) -> LoopRecoveryReport:
-        report = reconcile(store=self.store, record=self.record,
-                           rounds_dir=self.rounds_dir)
+        """REAL store reconciliation; never creates/grants/executes anything."""
+        report = reconcile(
+            store=self.store, record=self.record, rounds_dir=self.rounds_dir,
+            service=self.service,
+            state_dir=self.out_dir / "director",
+            budget_ledger=self.budget, config_sha=self.config_sha)
         if apply:
             apply_recovery(store=self.store, record=self.record, report=report)
         return report
 
+    def _rebuild_completed_round(self, round_no: int) -> dict[str, Any] | None:
+        """Rebuild round evidence ONLY from real artifacts when JSON was lost.
+
+        This never invents an id: every field comes from the persisted Director
+        context and the trusted Stores. If the resulting record cannot pass the
+        same reality reconciliation, it is discarded and recovery fails closed.
+        """
+        from .loop_reality_reconciler import (
+            ROUND_COMPLETED, reconcile_round,
+        )
+        director_id = f"m5_round_{round_no}_{self.config.loop_id}"
+        ctx_path = (self.out_dir / "director" / f"round_{round_no:02d}"
+                    / f"{director_id}.json")
+        try:
+            ctx = json.loads(ctx_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+        if ctx.get("state") != "COMPLETED":
+            return None
+        rep = self.service.get_research_report(session_id=ctx.get("session_id", ""))
+        report = rep.get("report") or {}
+        candidate = {
+            "round_no": round_no,
+            "objective_id": ctx.get("objective_id", ""),
+            "hypothesis_ids": list(ctx.get("hypothesis_ids") or []),
+            "plan_id": ctx.get("plan_id", ""),
+            "approval_id": ctx.get("approval_id", ""),
+            "session_id": ctx.get("session_id", ""),
+            "director_id": director_id,
+            "campaign_id": ctx.get("campaign_id", ""),
+            "report_id": report.get("report_id", ""),
+            "experience_id": ((report.get("experience_refs") or [""])[0]),
+            "director_state": "COMPLETED",
+            "gate_passed": True,
+            "reconstructed_from_real_stores": True,
+        }
+        if not all(candidate.get(k) for k in (
+                "objective_id", "plan_id", "approval_id", "campaign_id",
+                "report_id", "experience_id")):
+            return None
+        reality = reconcile_round(
+            self.service, candidate, rounds_dir=self.rounds_dir,
+            state_dir=self.out_dir / "director",
+            budget_ledger=self.budget, loop_id=self.config.loop_id,
+            config_sha=self.config_sha)
+        return candidate if reality.classification == ROUND_COMPLETED else None
+
 
 __all__ = [
     "LoopConfig", "LoopBudgetExhausted", "LoopPreflightError",
-    "LoopApprovalRequired", "AutonomousResearchLoop",
+    "LoopApprovalRequired", "LoopRecoveryRequired", "AutonomousResearchLoop",
 ]
