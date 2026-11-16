@@ -27,6 +27,7 @@ from .metrics import (
     ALL_METRICS, PRIMARY_METRICS, SAFETY_METRICS, SECONDARY_METRICS,
     compute_metric_set, frozen_metric_contract,
 )
+from .paired_eligibility import select_paired_blocks
 from .pilot_analysis import PRIMARY_CONTRASTS, load_runs
 from .registry_store import RegistryStore
 from .statistical_analysis import analyse_primary_contrasts
@@ -71,15 +72,24 @@ def _evidence_chain(rec: RunRecord) -> dict[str, Any]:
             "finalized": rec.finalized}
 
 
-def _contrast_differences(runs: list[RunRecord], metric: str
-                          ) -> dict[str, list[float]]:
-    by_block: dict[str, dict[str, RunRecord]] = {}
-    for r in runs:
-        by_block.setdefault(r.block_id, {})[r.arm] = r
+def _contrast_differences(
+        runs: list[RunRecord], metric: str,
+        *, blocks: list[dict[str, Any]] | None = None,
+        expected_protocol_sha256: str = "",
+) -> dict[str, list[float]]:
+    """Per-block paired differences using the SHARED eligibility rule (P0-01).
+
+    Pilot Analysis and the Value Report both call
+    :func:`select_paired_blocks`, so their paired ``n`` can never diverge.
+    Failed / interrupted / invalid runs remain in the overall statistics; they
+    simply do not contribute a paired difference.
+    """
+    selection = select_paired_blocks(
+        runs=runs, blocks=blocks,
+        expected_protocol_sha256=expected_protocol_sha256)
     out: dict[str, list[float]] = {label: [] for label, _, _ in PRIMARY_CONTRASTS}
-    for _bid, arms in by_block.items():
-        if len(arms) != len(ARMS):
-            continue
+    for block in selection["eligible"]:
+        arms: dict[str, RunRecord] = block["arms"]
         for label, hi, lo in PRIMARY_CONTRASTS:
             a = compute_metric_set([arms[hi]])[metric]
             b = compute_metric_set([arms[lo]])[metric]
@@ -110,6 +120,15 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
     by_arm = _runs_by_arm(runs)
     integrity = RegistryStore(db=db).verify_integrity()
     protocol = protocol or {}
+    expected_protocol_sha256 = str(
+        protocol.get("protocol_sha256")
+        or (blocks[0].get("protocol_sha256") if blocks else "")
+        or "")
+    # Shared paired-eligibility selection (P0-01): the SAME rule the pilot
+    # analysis uses. Every excluded block carries explicit reasons.
+    paired = select_paired_blocks(
+        runs=runs, blocks=blocks,
+        expected_protocol_sha256=expected_protocol_sha256)
 
     # ------------------------------------------------------------- A design
     design = {
@@ -170,6 +189,10 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
         "duplicate_campaign_ids": duplicates,
         "missing_records": missing,
         "excluded_runs": [],
+        # P0-01: paired-eligibility is shared with the pilot analysis.
+        "n_blocks_eligible_for_pairing": len(paired["eligible"]),
+        "excluded_blocks": paired["excluded"],
+        "paired_eligibility_rules": paired["rules"],
         "note": ("failed / interrupted / invalid runs are RETAINED and stay in "
                  "every denominator; nothing is deleted"),
     }
@@ -177,7 +200,9 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
     # -------------------------------------------------------- C primary
     contrast_runs: dict[str, dict[str, Any]] = {}
     for metric in PRIMARY_METRICS:
-        diffs = _contrast_differences(runs, metric)
+        diffs = _contrast_differences(
+            runs, metric, blocks=blocks,
+            expected_protocol_sha256=expected_protocol_sha256)
         analysed = analyse_primary_contrasts(differences=diffs, alpha=alpha,
                                              correction=correction)
         contrast_runs[metric] = analysed

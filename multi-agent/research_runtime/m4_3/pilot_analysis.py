@@ -30,6 +30,7 @@ from .metrics import (
     ALL_METRICS, METRIC_DEFINITIONS, PRIMARY_METRICS, compute_metric_set,
     frozen_metric_contract,
 )
+from .paired_eligibility import select_paired_blocks
 from .registry_store import RegistryStore
 from .sample_size import ContrastSpec, estimate_sample_size, summarise
 
@@ -130,9 +131,19 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
     overall = {"n_runs": len(runs), **compute_metric_set(runs)}
 
     # ---------------------------------------------------------- block level
-    runs_by_block: dict[str, dict[str, RunRecord]] = {}
-    for r in runs:
-        runs_by_block.setdefault(r.block_id, {})[r.arm] = r
+    # P0-01: ONE shared eligibility rule with the value report. ``paired`` is
+    # the single source of truth for which blocks may enter a paired contrast.
+    expected_protocol_sha256 = str(
+        (protocol or {}).get("protocol_sha256")
+        or (blocks[0].get("protocol_sha256") if blocks else "")
+        or "")
+    paired = select_paired_blocks(
+        runs=runs, blocks=blocks,
+        expected_protocol_sha256=expected_protocol_sha256)
+    eligible_ids = {b["block_id"] for b in paired["eligible"]}
+    excluded_reasons = {e["block_id"]: e["reasons"] for e in paired["excluded"]}
+
+    runs_by_block: dict[str, dict[str, RunRecord]] = paired["runs_by_block"]
     block_rows: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
     for block in blocks:
@@ -143,11 +154,9 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
                                "seed": block["seed"],
                                "snapshot_sha256": block.get("snapshot_sha256", ""),
                                "arms": {}}
-        reasons: list[str] = []
         for arm in ARMS:
             rec = arms.get(arm)
             if rec is None:
-                reasons.append(f"arm {arm} missing")
                 continue
             quality = rec.quality_review.get("total") if rec.quality_review else None
             row["arms"][arm] = {
@@ -170,13 +179,14 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
                 "notes": rec.notes,
             }
         complete = len(row["arms"]) == len(ARMS)
-        finalized = complete and all(a["finalized"] for a in row["arms"].values())
+        finalized = bid in eligible_ids
         row["complete"] = complete
         row["finalized"] = finalized
-        row["exclusion_reasons"] = reasons
+        row["exclusion_reasons"] = excluded_reasons.get(bid, [])
         block_rows.append(row)
         if not finalized:
-            excluded.append({"block_id": bid, "reasons": reasons
+            excluded.append({"block_id": bid,
+                             "reasons": excluded_reasons.get(bid)
                              or ["not all arms finalized"]})
 
     eligible = [b for b in block_rows if b["finalized"]]
@@ -289,6 +299,7 @@ def analyze_pilot(*, db: Any, out_dir: str | Path,
         "n_blocks_eligible": len(eligible),
         "n_blocks_excluded": len(excluded),
         "excluded_blocks": excluded,
+        "paired_eligibility_rules": paired["rules"],
         "protocol_sha256": (blocks[0].get("protocol_sha256") if blocks else ""),
         "protocol_shas": sorted({b.get("protocol_sha256", "") for b in blocks}),
     }
