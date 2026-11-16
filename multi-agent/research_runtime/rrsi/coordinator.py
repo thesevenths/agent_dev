@@ -113,6 +113,16 @@ class RRSICoordinator:
                 "parent_sha": parent_sha, "n_candidates": len(candidates),
                 "outcomes": outcomes}
 
+    def run_formal_harness_promotion(self, **kwargs: Any) -> dict[str, Any]:
+        """M6: formal, fail-closed harness promotion through THIS registry.
+
+        Delegates the strict verification to the M6 promotion gate but keeps a
+        single source of truth: the same EvolutionRegistry instance owned by
+        this coordinator. No second registry or gate is introduced.
+        """
+        from ..harness_rsi.promotion import formal_promote
+        return formal_promote(registry=self.registry, **kwargs)
+
     def layers(self) -> dict[str, list[dict[str, Any]]]:
         return {DOMAIN_MODEL_LAYER: self.registry.all(DOMAIN_MODEL_LAYER),
                 RESEARCH_HARNESS_LAYER: self.registry.all(RESEARCH_HARNESS_LAYER)}
