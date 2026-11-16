@@ -2,8 +2,15 @@
 
 **分支**：`feature/arr-0.1-domain-registry`（未 merge main，未建 PR）
 **阶段**：M4.3-02（Pilot + Confirmatory 框架 + 分析 + 报告 + CLI + 真实运行）
-**结论先行**：执行系统已完整交付并**真实跑通**（A/B/C 真实 SciNet++ 三链、真实 Gate、真实外部审批、真实 Report/Experience、可恢复 Registry）。
-正式实验（Confirmatory）**未启动**：Pilot 的人工盲评尚未由两名真实评审提交，样本量估计因此为 `evidence_insufficient`，协议冻结按设计被拒绝。这是规格要求的行为，不是缺陷。
+**结论先行**：执行系统已完整交付并**真实跑通**（3 个 Block × A/B/C = 9 条真实
+SciNet++ 链、真实 12-step Gate、真实外部审批、真实 Report/Experience、可恢复
+Registry、108 个真实引擎日志归档）。
+正式实验（Confirmatory）**未启动**：Pilot 的人工盲评尚未由两名真实评审提交，
+样本量估计因此为 `evidence_insufficient`，协议冻结按设计被拒绝。这是规格要求的
+行为，不是缺陷。
+
+真实数据一句话总结：**9 条完成的真实运行全部是 `negative_finding`（假设被拒/
+不确定），三组有效发现率均为 0，差异方差为 0；人工盲评缺失 → 证据不足。**
 
 ---
 
@@ -101,12 +108,63 @@ active 状态。
    无候选。修复：每个 block 的 Discovery 只用该 block 的真实证据子集，历史只提供
    context。
 
-### 5.3 真实运行结果
+### 5.3 真实运行结果（Final）
 
-> 数据来自 `M4_3_runs/pilot/pilot_analysis.json`（由 SQLite 重新计算）。
+命令：
 
-（本节数字在 Pilot 结束后填充：blocks / runs / gate 率 / 各 arm 结果 / 对比 /
-样本量建议 / 证据包。）
+```bash
+python -m research_runtime.m4_3.cli run --stage pilot --blocks 4 \
+    --seeds 42 43 --candidate-budget 3 --approver operator --max-campaigns 12
+```
+
+| 项目 | 真实值 |
+|---|---|
+| 注册 Block | 4（block 1-3 完整，block 4 因候选耗尽 + 预算停止而排除） |
+| 可配对 Block | **3** |
+| Runs | 12（9 完成 + 2 interrupted + 1 invalid） |
+| 结果分布 | `negative_finding` 9 / `invalid` 1 / `interrupted` 2 / `valid_finding` 0 |
+| Gate 完整率 | 0.75（9/12，= 完成 run 全部 12/12 步） |
+| 外部审批率 | 0.75，`approval_bypass_count` = 0 |
+| Report / Experience 完整率 | 0.75 / 0.75（与完成 run 一致） |
+| 真实 Campaign | 9 个互不相同（无跨 run 复用，`duplicate_campaign_count` = 0） |
+| 真实训练时间 | 2019.87 s（9 个 campaign，2 个 paired seed） |
+| 引擎日志 | 108 个作业日志已归档 |
+
+各 arm（4 个 run，其中 3 个完成）：
+
+| 指标 | A | B | C |
+|---|---|---|---|
+| valid_research_findings_per_compute_budget | 0.0 | 0.0 | 0.0 |
+| independently_reviewed_objective_quality | n/a（无人工评审） | n/a | n/a |
+| plan_validity_rate | 0.75 | 0.75 | 0.75 |
+| objective_acceptance_rate | 0.75 | 0.75 | 0.75 |
+| evidence_grounding_rate | 1.0 | 1.0 | 0.75 |
+| invalid_experiment_rate | 0.0 | 0.0 | 0.25 |
+
+Block 级配对（n=3，描述性，**不做显著性判断**）：
+
+| 对比 | 指标 | n | 均值差 | 标准差 | bootstrap 95% CI |
+|---|---|---|---|---|---|
+| B-A | valid_findings/compute | 3 | 0.0 | 0.0 | [0.0, 0.0] |
+| C-B | valid_findings/compute | 3 | 0.0 | 0.0 | [0.0, 0.0] |
+| C-A | valid_findings/compute | 3 | 0.0 | 0.0 | [0.0, 0.0] |
+| B-A / C-B / C-A | objective_quality | 0 | 缺失 | 缺失 | n/a（无人工盲评，不插补） |
+
+**解读（严格按数据）**：3 个 Block 上三组的有效发现率完全相同（都是 0），
+差异方差为 0；objective quality 因人工盲评 pending 完全缺失。因此
+
+* `pilot_analysis.conclusion.verdict = evidence_insufficient`
+* `sample_size.status = evidence_insufficient`（三个对比都缺方差）
+* `M4_3_PILOT_VALUE_REPORT.md` 结论 = `evidence insufficient`，
+  `significance_claimed = false`
+
+这就是 Pilot 的真实结论：**在单域 smoke 规模上，A/B/C 没有可观测差异，且人工
+评审缺失，无法给出任何价值判断**。报告不会把它包装成"C 胜出"或"无价值"。
+
+证据包：`M4_3_runs/pilot/evidence/`
+（`registry_export.json` + `controller_export.json` + `campaigns.json` +
+`engine_logs/` 108 个真实作业日志 + `evidence_bundle.json`；
+`registry_integrity = true`，`missing_artefacts = []`）。
 
 ## 6. 分析与样本量
 
@@ -141,7 +199,20 @@ active 状态。
 
 ## 8. 测试与回归
 
-（数字在最终测试后填充：M4.3 全量通过数；引擎无关 / opt-in 真引擎分离说明。）
+| 范围 | 结果 |
+|---|---|
+| `pytest research_runtime/tests/ -k m4_3` | **321 passed, 2 skipped** |
+| `pytest research_runtime/tests/`（全量回归） | **575 passed, 3 skipped, 37 subtests** |
+| 真实引擎 E2E | opt-in（`M4_3_RUN_REAL=1`），CI 中显式 skip，本次由真实运行替代 |
+
+引擎无关与真引擎结果严格分开报告：CI 通过**不**代表真实引擎通过；本报告第 5 节
+的真实数据来自本机真实执行（真实 SciNet++ 训练 + 真实 SQLite 记录）。
+
+新增测试文件：`test_m4_3_02_p0_gate_success.py`、
+`test_m4_3_02_state_machine.py`、`test_m4_3_02_review_queue.py`、
+`test_m4_3_02_analysis_report.py`、`test_m4_3_02_confirmatory.py`、
+`test_m4_3_02_pilot_units.py`、`test_m4_3_02_cli.py`、
+`test_m4_3_02_evidence_bundle.py`、`test_m4_3_02_real_engine.py`（opt-in）。
 
 ## 9. 未启动项与限制
 

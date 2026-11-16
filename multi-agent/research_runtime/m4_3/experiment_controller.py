@@ -316,11 +316,13 @@ class ExperimentController:
         self._persist_config()
         return self.state
 
-    def begin_execution(self, block_id: str, *,
+    def begin_execution(self, block_id: str, *, arms: list[str] | None = None,
                         detail: dict[str, Any] | None = None) -> str:
-        """AWAITING_APPROVAL -> EXECUTING, only when ALL THREE arms approved."""
+        """AWAITING_APPROVAL -> EXECUTING, only when every EXECUTING arm is
+        approved. An arm that was retained as INVALID does not need one."""
         block = self.blocks[block_id]
-        missing = [a for a in ("A", "B", "C") if not block.approval_ids.get(a)]
+        wanted = list(arms) if arms else ["A", "B", "C"]
+        missing = [a for a in wanted if not block.approval_ids.get(a)]
         if missing:
             raise IllegalTransition(E_EXECUTING, self.state,
                                     to_state=S_EXECUTING)

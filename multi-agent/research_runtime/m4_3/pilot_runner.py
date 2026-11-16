@@ -53,7 +53,7 @@ from ..research_director import ResearchDirector
 from ..research_store import from_research_objective
 from ..schemas import ResearchObjective
 from ..settings import DEFAULT_SCINET_DIR, resolve_engine
-from .blind_review import BlindingLedger, is_group_leaking
+from .blind_review import BlindingLedger, BlindingViolation, is_group_leaking
 from .evaluation_harness import EvaluationHarness, ProtocolViolation
 from .experiment_controller import BudgetExhausted, ExperimentController
 from .experiment_registry import ARMS, FrozenProtocol, RunRecord
@@ -559,6 +559,7 @@ class PilotRunner:
         objectives: dict[str, dict[str, Any]] = {}
         review_ids: dict[str, str] = {}
         discovery_info: dict[str, Any] = {}
+        selections: dict[str, Any] = {}
 
         def _resume_arm(arm: str) -> bool:
             existing = self.harness.registry.runs.get(f"{bid}_{arm}")
@@ -579,13 +580,16 @@ class PilotRunner:
         # lose that candidate from its (identical) opportunity.
         pool_a: list[ObjectiveCandidate] = []
         pool_b: list[ObjectiveCandidate] = []
+        invalid_arms: dict[str, str] = {}
         if self.harness.registry.runs.get(f"{bid}_A") is None:
             pool_a = self._candidate_pool(current_snap, critic)
         if self.harness.registry.runs.get(f"{bid}_B") is None:
             pool_b = self._candidate_pool(history_snap, critic)
 
         # ---- arm A: current evidence only
-        if not _resume_arm("A"):
+        if not _resume_arm("A") and not pool_a:
+            invalid_arms["A"] = "no approved candidate for this opportunity"
+        elif not _resume_arm("A"):
             cand_a, why_a = self._selector(pool_a, visible_ids=visible_a)
             sel_a = SelectionRecord(
                 block_id=bid, arm="A", selector_id=self.config.selector_id,
@@ -600,12 +604,15 @@ class PilotRunner:
                 ranker_version=self.protocol.ranker_version,
                 rank_score=cand_a.rank_score)
             self._write_selection(sel_a)
+            selections["A"] = sel_a.to_dict()
             objectives["A"] = self._subject_objective(
                 cand_a, objective_id=sel_a.selected_objective_id, arm="A",
                 selection=sel_a)
 
         # ---- arm B: SAME historical context as C, human-protocol selection
-        if not _resume_arm("B"):
+        if not _resume_arm("B") and not pool_b:
+            invalid_arms["B"] = "no approved candidate for this opportunity"
+        elif not _resume_arm("B"):
             cand_b, why_b = self._selector(pool_b, visible_ids=visible_bc)
             sel_b = SelectionRecord(
                 block_id=bid, arm="B", selector_id=self.config.selector_id,
@@ -620,65 +627,47 @@ class PilotRunner:
                 ranker_version=self.protocol.ranker_version,
                 rank_score=cand_b.rank_score)
             self._write_selection(sel_b)
+            selections["B"] = sel_b.to_dict()
             objectives["B"] = self._subject_objective(
                 cand_b, objective_id=sel_b.selected_objective_id, arm="B",
                 selection=sel_b)
 
         # ---- arm C: REAL Discovery (generator + critic + ranker)
         if not _resume_arm("C"):
-            discovery = ObjectiveDiscovery(
-                generator=ObjectiveCandidateGenerator(
-                    domain=self.config.domain),
-                critic=critic, ranker=ObjectiveRanker(),
-                domain=self.config.domain)
-            result_c = discovery.discover(
-                history_snap, objective_store=self.service.stores.objectives,
-                domain=self.config.domain)
-            if not result_c.proposed_objective_ids:
-                raise SelectionError(
-                    "real ObjectiveDiscovery approved no objective for arm C")
-            c_id = result_c.proposed_objective_ids[0]
-            c_ranked = next((r for r in result_c.ranked
-                             if r.get("objective_id") == c_id), {})
-            sel_c = SelectionRecord(
-                block_id=bid, arm="C", selector_id="objective_discovery",
-                protocol="real_discovery_generator_critic_ranker",
-                selected_at=_now(), order_index=3, duration_s=0.0,
-                visible_evidence_ids=sorted(visible_bc),
-                context_sha256=_hash({"arm": "C", "ids": sorted(visible_bc)}),
-                candidate_ids=[c["candidate_id"] for c in result_c.ranked],
-                selected_candidate_id=str(c_ranked.get("candidate_id", "")),
-                selected_objective_id=c_id,
-                rationale=(f"ranked #1 of {len(result_c.ranked)} approved "
-                           f"candidates (critic rejected "
-                           f"{len(result_c.rejected)})"),
-                generation_source=str(c_ranked.get("generation_source", "")),
-                ranker_version=result_c.ranker_version,
-                rank_score=c_ranked.get("rank_score"))
-            self._write_selection(sel_c)
-            stored_c = self.service.stores.objectives.get(c_id)
-            objectives["C"] = {
-                "objective_id": c_id,
-                "description": getattr(stored_c, "description", "") or "",
-                "evidence_refs": list(c_ranked.get("evidence_refs") or []),
-                "success_criteria": dict(
-                    getattr(stored_c, "success_criteria", {}) or {}),
-                "generation_source": sel_c.generation_source,
-                "rank_score": sel_c.rank_score}
-            discovery_info = result_c.to_dict()
+            try:
+                objectives["C"], discovery_info, sel_c_dict = self._select_c(
+                    bid, history_snap, visible_bc, critic)
+                selections["C"] = sel_c_dict
+            except SelectionError as exc:
+                # The real Discovery approved nothing for THIS opportunity
+                # (every candidate duplicates an existing objective). The arm
+                # is retained as INVALID -- never silently dropped.
+                invalid_arms["C"] = str(exc)
+
 
         # ---- register + queue the human blind review (only for NEW arms)
         newly_registered = 0
         for arm in ARMS:
             if arm in review_ids:            # resumed: already registered
                 continue
+            if arm in invalid_arms:
+                self._record_invalid_arm(bid, arm, invalid_arms[arm])
+                continue
             safe_refs, withheld = self._reviewer_safe_refs(
                 objectives[arm].get("evidence_refs") or [])
             review_objective = {**objectives[arm], "evidence_refs": safe_refs}
-            self.harness.select_objective(
-                bid, arm, objective=review_objective, defer_review=True,
-                notes={"selection_arm": arm, "block": bid,
-                       "withheld_evidence_refs": withheld})
+            try:
+                self.harness.select_objective(
+                    bid, arm, objective=review_objective, defer_review=True,
+                    notes={"selection_arm": arm, "block": bid,
+                           "withheld_evidence_refs": withheld})
+            except BlindingViolation as exc:
+                # A historical objective id inside the candidate text would
+                # de-anonymise the reviewer. The arm is retained as INVALID
+                # (never silently dropped, never forced through).
+                self._record_invalid_arm(bid, arm, f"blinding: {exc}")
+                invalid_arms[arm] = str(exc)
+                continue
             run = self.harness.registry.runs_for_block(bid)[arm]
             review_ids[arm] = run.review_id
             newly_registered += 1
@@ -728,6 +717,9 @@ class PilotRunner:
         exec_seconds = 0.0
         directors: dict[str, Any] = {}
         for arm in ARMS:
+            if arm in invalid_arms:
+                outcomes[arm] = "invalid"
+                continue
             prior = completed_runs.get(f"{bid}_{arm}")
             if prior is not None and prior.finalized:
                 outcomes[arm] = prior.outcome
@@ -744,7 +736,8 @@ class PilotRunner:
         if directors:
             # EXECUTING only once EVERY arm holds a REAL external approval.
             self.controller.begin_execution(
-                bid, detail={"arms": sorted(directors)})
+                bid, arms=sorted(directors),
+                detail={"arms": sorted(directors)})
         for arm, director in directors.items():
             t0 = time.time()
             outcome, ref, seconds = self._finish_arm(bid, arm, director)
@@ -765,8 +758,7 @@ class PilotRunner:
                  "n_current_evidence": len(current_ids),
                  "n_visible_BC": len(visible_bc),
                  "objective_ids": {a: objectives[a]["objective_id"] for a in ARMS},
-                 "selection": {"A": sel_a.to_dict(), "B": sel_b.to_dict(),
-                               "C": sel_c.to_dict()},
+                 "selection": selections,
                  "review_ids": review_ids,
                  "gate_refs": {a: refs[a].to_dict() for a in ARMS},
                  "outcomes": outcomes,
@@ -777,6 +769,63 @@ class PilotRunner:
         self.blocks.append(block)
         self._save_records()
         return block
+
+    def _select_c(self, block_id: str, history_snap: DiscoverySnapshot,
+                  visible_bc: set[str], critic: ObjectiveCritic
+                  ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Run the REAL Discovery and return (objective, provenance, record)."""
+        discovery = ObjectiveDiscovery(
+            generator=ObjectiveCandidateGenerator(domain=self.config.domain),
+            critic=critic, ranker=ObjectiveRanker(),
+            domain=self.config.domain)
+        result_c = discovery.discover(
+            history_snap, objective_store=self.service.stores.objectives,
+            domain=self.config.domain)
+        if not result_c.proposed_objective_ids:
+            raise SelectionError(
+                "real ObjectiveDiscovery approved no objective for arm C "
+                "(every candidate duplicates an existing objective)")
+        c_id = result_c.proposed_objective_ids[0]
+        c_ranked = next((r for r in result_c.ranked
+                         if r.get("objective_id") == c_id), {})
+        sel_c = SelectionRecord(
+            block_id=block_id, arm="C", selector_id="objective_discovery",
+            protocol="real_discovery_generator_critic_ranker",
+            selected_at=_now(), order_index=3, duration_s=0.0,
+            visible_evidence_ids=sorted(visible_bc),
+            context_sha256=_hash({"arm": "C", "ids": sorted(visible_bc)}),
+            candidate_ids=[c["candidate_id"] for c in result_c.ranked],
+            selected_candidate_id=str(c_ranked.get("candidate_id", "")),
+            selected_objective_id=c_id,
+            rationale=(f"ranked #1 of {len(result_c.ranked)} approved "
+                       f"candidates (critic rejected "
+                       f"{len(result_c.rejected)})"),
+            generation_source=str(c_ranked.get("generation_source", "")),
+            ranker_version=result_c.ranker_version,
+            rank_score=c_ranked.get("rank_score"))
+        self._write_selection(sel_c)
+        stored_c = self.service.stores.objectives.get(c_id)
+        objective = {
+            "objective_id": c_id,
+            "description": getattr(stored_c, "description", "") or "",
+            "evidence_refs": list(c_ranked.get("evidence_refs") or []),
+            "success_criteria": dict(
+                getattr(stored_c, "success_criteria", {}) or {}),
+            "generation_source": sel_c.generation_source,
+            "rank_score": sel_c.rank_score}
+        return objective, result_c.to_dict(), sel_c.to_dict()
+
+    def _record_invalid_arm(self, block_id: str, arm: str, reason: str) -> None:
+        """Retain an arm that could not be set up as INVALID (no success claim)."""
+        run_id = f"{block_id}_{arm}"
+        if run_id not in self.harness.registry.runs:
+            self.harness.registry.register_run(block_id=block_id, arm=arm,
+                                               outcome="invalid")
+        self.harness.registry.finalize(
+            run_id, outcome="invalid", invalid_reason=reason)
+        self.harness.registry.append_event(
+            scope=f"run:{run_id}", event_type="invalid",
+            payload={"reason": reason, "arm": arm})
 
     @staticmethod
     def _reviewer_safe_refs(refs: list[Any]) -> tuple[list[Any], list[Any]]:
