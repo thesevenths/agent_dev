@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from research_runtime.autonomous_research_loop import _ReusePriorObjectiveStore
 from research_runtime.autonomous_loop_state import (
     IllegalTransition, LoopEventStore, LoopRecord, S_AWAITING_APPROVAL,
     S_CREATED, S_DISCOVERING, S_EXECUTING, S_LOOP_COMPLETED, S_OBJECTIVE_READY,
@@ -14,7 +15,11 @@ from research_runtime.autonomous_loop_state import (
 from research_runtime.autonomous_loop_recovery import (
     apply_recovery, load_round_records, reconcile,
 )
+from research_runtime.research_store import (
+    ResearchStores, ResearchStoreConflict, from_research_objective,
+)
 from research_runtime.research_store.db import ResearchDatabase
+from research_runtime.schemas import ResearchObjective
 
 
 def _store(tmp_path):
@@ -100,3 +105,35 @@ def test_load_round_records_ignores_corrupt_files(tmp_path):
     (rounds / "round_01.json").write_text("{not json", encoding="utf-8")
     out = load_round_records(rounds)
     assert out and out[0].get("corrupt") is True
+
+
+# ------------------------------------------- later-round discovery persistence
+def _objective_record(oid: str, constraints: dict, provenance: dict):
+    return from_research_objective(
+        ResearchObjective(objective_id=oid, domain="scinet",
+                          description="test objective",
+                          constraints=constraints),
+        provenance=provenance)
+
+
+def test_later_round_reuses_same_candidate_without_overwriting_history(tmp_path):
+    store = ResearchStores(tmp_path / "objectives.sqlite").objectives
+    prov = {"candidate_id": "cand_1", "generation_source": "negative_evidence"}
+    store.save(_objective_record("o1", {"v": 1}, prov))
+
+    changed = _objective_record(
+        "o1", {"v": 2, "source_objective_ids": ["prior"]}, prov)
+    adapter = _ReusePriorObjectiveStore(store, {"o1"})
+    assert adapter.save(changed) == {"status": "reused_prior",
+                                     "objective_id": "o1"}
+    assert store.get("o1").constraints == {"v": 1}   # history untouched
+
+    # Not previously proposed by this loop -> still fail closed.
+    with pytest.raises(ResearchStoreConflict):
+        _ReusePriorObjectiveStore(store, set()).save(changed)
+
+    # Same id but a DIFFERENT candidate is never silently reused.
+    other = _objective_record("o1", {"v": 3},
+                              {**prov, "candidate_id": "cand_other"})
+    with pytest.raises(ResearchStoreConflict):
+        _ReusePriorObjectiveStore(store, {"o1"}).save(other)

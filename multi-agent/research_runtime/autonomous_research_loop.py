@@ -49,6 +49,7 @@ from .objective_discovery import ObjectiveDiscovery
 from .objective_ranker import ObjectiveRanker
 from .objective_candidate_generator import ObjectiveCandidateGenerator
 from .research_director import ResearchDirector
+from .research_store import ResearchStoreConflict
 
 
 class LoopBudgetExhausted(RuntimeError):
@@ -61,6 +62,44 @@ class LoopPreflightError(RuntimeError):
 
 class LoopApprovalRequired(RuntimeError):
     """No external approver supplied -- never auto-grant."""
+
+
+class _ReusePriorObjectiveStore:
+    """Loop-scoped ObjectiveStore adapter: reuse, never overwrite, history.
+
+    A later round builds a larger DiscoverySnapshot (it includes the prior
+    round's Experience). The unchanged generator therefore re-derives some
+    earlier candidate ids, but their contextual metadata (e.g.
+    ``source_objective_ids``) legitimately changes. The generic
+    ``ObjectiveStore`` correctly refuses to overwrite the earlier content.
+    This adapter ONLY downgrades that specific conflict to a reuse when BOTH
+    the candidate id and generation source are unchanged AND the objective was
+    already proposed by this loop/run. Every other conflict still raises.
+    It delegates all other store operations unchanged.
+    """
+
+    def __init__(self, store: Any, reusable_ids: Any):
+        self._store = store
+        self._reusable_ids = set(reusable_ids or ())
+
+    def save(self, record: Any) -> dict[str, Any]:
+        try:
+            return self._store.save(record)
+        except ResearchStoreConflict:
+            if record.objective_id in self._reusable_ids:
+                existing = self._store.get(record.objective_id)
+                old = (getattr(existing, "provenance", None) or {})
+                new = (getattr(record, "provenance", None) or {})
+                if (existing is not None
+                        and old.get("candidate_id") == new.get("candidate_id")
+                        and old.get("generation_source")
+                        == new.get("generation_source")):
+                    return {"status": "reused_prior",
+                            "objective_id": record.objective_id}
+            raise
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
 
 
 @dataclass
@@ -165,18 +204,41 @@ class AutonomousResearchLoop:
             self.store.save(self.record)
 
     # ------------------------------------------------------------- discovery
+    def _prior_objective_ids(self) -> list[str]:
+        """Objective ids established by EARLIER completed rounds (resume-safe)."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for rd in self.record.rounds:
+            oid = rd.get("objective_id")
+            if oid and oid not in seen:
+                seen.add(oid)
+                out.append(oid)
+        return out
+
+    def _reusable_objective_ids(self) -> set[str]:
+        """All objectives already proposed by this loop/run, incl. partial rounds."""
+        ids = set(self._prior_objective_ids())
+        for rd in self.record.rounds:
+            ids.update((rd.get("discovery_source") or {}).get(
+                "proposed_objective_ids", ()))
+        for rec in self.service.stores.objectives.all():
+            if ((rec.provenance or {}).get("discovery_run_id")
+                    == self.config.run_id):
+                ids.add(rec.objective_id)
+        return ids
+
     def _snapshot(self, round_no: int) -> Any:
         """Rebuild a DiscoverySnapshot from REAL persisted data.
 
-        Round 1 sees the original opportunity. Later rounds see the SAME real
-        evidence PLUS the prior rounds' persisted objectives / sessions /
-        Experience (via the real DiscoveryContextProvider objective_ids).
+        The evidence query key is the REAL run whose Evidence was recorded
+        (``config.run_id``). It is NOT renamed per round -- a fabricated run_id
+        would return no evidence. Round 1 sees the original opportunity; later
+        rounds see the SAME real evidence PLUS the prior rounds' persisted
+        objectives / sessions / Experience (via objective_ids).
         """
         provider = DiscoveryContextProvider(stores=self.service.stores)
-        prior = list(getattr(self, "_prior_objective_ids", []))
-        run_id = (f"{self.config.run_id}" if round_no == 1
-                  else f"{self.config.run_id}_round{round_no}")
-        return provider.build_snapshot(run_id, objective_ids=prior)
+        return provider.build_snapshot(self.config.run_id,
+                                       objective_ids=self._prior_objective_ids())
 
     def _discover(self, snapshot: Any, round_no: int) -> dict[str, Any]:
         """Run the REAL ObjectiveDiscovery; return a provenance dict."""
@@ -184,21 +246,22 @@ class AutonomousResearchLoop:
             generator=ObjectiveCandidateGenerator(domain=self.config.domain),
             critic=ObjectiveCritic(), ranker=ObjectiveRanker(),
             domain=self.config.domain)
-        result = discovery.discover(
-            snapshot, objective_store=self.service.stores.objectives,
-            domain=self.config.domain)
+        store = _ReusePriorObjectiveStore(
+            self.service.stores.objectives, self._reusable_objective_ids())
+        result = discovery.discover(snapshot, objective_store=store,
+                                   domain=self.config.domain)
         if not result.proposed_objective_ids:
             raise LoopPreflightError(
                 f"round {round_no}: real Discovery approved no objective")
         objective_id = result.proposed_objective_ids[0]
         ranked = next((r for r in result.ranked
                        if r.get("objective_id") == objective_id), {})
-        # Track the objective so round N+1's snapshot reads it as HISTORY.
-        self._prior_objective_ids = list(getattr(self, "_prior_objective_ids",
-                                                 [])) + [objective_id]
+        reused = [r["objective_id"] for r in result.ranked
+                  if r.get("persist_status") == "reused_prior"]
         return {"objective_id": objective_id,
                 "candidate_id": ranked.get("candidate_id", ""),
                 "generation_source": ranked.get("generation_source", ""),
+                "reused_prior_objective_ids": reused,
                 "discovery": result.to_dict()}
 
     # ---------------------------------------------------------------- approver
@@ -311,6 +374,7 @@ class AutonomousResearchLoop:
                               or getattr(ctx, "experience_id", "")),
             "director_state": final.get("state", ""),
             "discovery_source": disc["discovery"],
+            "reused_prior_objective_ids": disc["reused_prior_objective_ids"],
             "prior_experience_ref": prior_experience.get("experience_id", ""),
             "gate_passed": bool(final.get("state") == "COMPLETED"),
         }
