@@ -271,6 +271,13 @@ class RegistryStore:
             d["finalized"] = bool(r["finalized"])
             d["protocol_sha256"] = r["protocol_sha256"]
             d["snapshot_sha256"] = r["snapshot_sha256"]
+            # The INDEXED columns are the query authority (campaign reuse,
+            # finalization, trusted ids). Overlay them so a row whose JSON was
+            # out of sync with its columns can never mask a real conflict.
+            for key in ("block_id", "arm", "objective_id", "plan_id",
+                        "approval_id", "campaign_id", "report_id",
+                        "experience_id", "outcome", "review_id"):
+                d[key] = r[key]
             out.append(d)
         return out
 
