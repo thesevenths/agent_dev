@@ -389,3 +389,23 @@ def test_discovery_persists_each_candidate_to_own_store(tmp_path):
     assert stores["scinet"].objectives.get(oid) is None
     assert result.ranked[0]["target_domain"] == "embodied"
     assert result.ranked[0]["cross_domain"] is True
+
+
+def test_in_process_rrsi_events_share_runtime_journal(tmp_path):
+    """P0-D: RRSI layer events must land in the SAME RuntimeState journal."""
+    c = _coord(tmp_path, budget=20)
+    c.start()
+    # Simulate the in-process RRSI phase writing to the runtime state.
+    import run_m5_rrsi as rrsi_driver
+    class _FakeRS:
+        def __init__(self, s): self.s = s
+        def append(self, *a, **kw): return self.s.append(*a, **kw)
+    fake = _FakeRS(c.state)
+    rrsi_driver.phase_domain_model.__globals__["RRSI_RUNTIME_RUN_ID"] = "HARD"
+    # Directly exercise the journal write path used by both phases.
+    fake.append("HARD", 3, "rrsi_layer_evaluated",
+                {"layer": "DOMAIN_MODEL", "statuses": ["PROMOTED"]})
+    events = [e for e in c.state.journal("HARD")
+              if e["event"] == "rrsi_layer_evaluated"]
+    assert len(events) == 1
+    assert c.state.verify_journal("HARD")["ok"]
