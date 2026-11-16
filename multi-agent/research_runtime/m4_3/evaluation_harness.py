@@ -430,13 +430,32 @@ class EvaluationHarness:
         # (P0-01 #6/#7) Completed outcomes need the full real gate chain.
         if outcome in GATED_OUTCOMES and not evidence.gate_passed:
             missing = ", ".join(evidence.missing_artefacts) or "none"
-            detail = "; ".join(evidence.errors)
+            detail = "; ".join(evidence.errors + evidence.scope_conflicts)
             raise ProtocolViolation(
                 f"cannot record {outcome!r}: real gate evidence incomplete "
                 f"(missing: {missing}"
                 + (f"; read errors: {detail}" if detail else "") +
                 "). Gate status comes from persisted Approval/Campaign/"
                 "Report/Experience records, not a caller claim.")
+
+        # (M4.3-02 P0) A valid_finding needs MORE than a terminated campaign:
+        # the campaign must have SUCCEEDED and the report must carry a real
+        # scientific outcome. A failed/cancelled campaign, a campaign whose
+        # only trials failed, or a comparison that never produced an outcome
+        # can never support a valid finding. ``negative_finding`` stays legal
+        # because a genuinely completed experiment that found nothing IS a
+        # result -- it just needs ``gate_passed`` (checked above).
+        if outcome == "valid_finding" and not evidence.valid_finding_evidence:
+            raise ProtocolViolation(
+                "cannot record 'valid_finding': the persisted chain is not "
+                "evidence of a successful experiment "
+                f"(campaign_status={evidence.campaign_status!r}, "
+                f"successful={evidence.campaign_successful}, "
+                f"trial_evidence={evidence.trial_evidence!r}, "
+                f"report_outcome={evidence.report_outcome!r}). "
+                "A terminal-but-failed/cancelled campaign, a campaign with no "
+                "successful trial, or a report without a real scientific "
+                "outcome cannot produce a valid finding.")
 
         # Derived ONLY. Never from the caller.
         derived_steps = evidence.gate_steps_passed

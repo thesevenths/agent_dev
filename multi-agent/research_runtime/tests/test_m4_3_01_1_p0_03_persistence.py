@@ -102,18 +102,24 @@ def test_process_restart_recovers_blocks_and_runs(gate, tmp_path):
     assert store2.verify_integrity() is True
 
 
-def test_recovered_registry_can_finish_the_remaining_arms(gate, tmp_path):
+def test_recovered_registry_can_finish_the_remaining_arms(tmp_path):
+    # Each arm owns a DISTINCT real campaign (M4.3-02 P0 #7: no reuse).
+    from tests.rt_tests.m4_3_gate import build_chain_fixture
+    fx = build_chain_fixture(3)
     db = tmp_path / "registry.sqlite"
-    h1 = _harness(gate, db)
+    h1 = EvaluationHarness(
+        protocol=_protocol(), reviewer=_reviewer(),
+        gate_adapter=fx.adapter, default_gate_ref=fx.refs[0], db_path=db)
     _seed_one(h1)
     h1.record_outcome("block_1", "A", outcome="valid_finding")
 
     h2 = EvaluationHarness.recover(
         protocol=_protocol(), db_path=db,
-        gate_adapter=gate.adapter, default_gate_ref=gate.ref)
+        gate_adapter=fx.adapter, default_gate_ref=fx.refs[0])
     # B / C were registered before the crash but not finalized.
-    for arm in ("B", "C"):
-        r = h2.record_outcome("block_1", arm, outcome="valid_finding")
+    for idx, arm in enumerate(("B", "C"), start=1):
+        r = h2.record_outcome("block_1", arm, outcome="valid_finding",
+                              gate_ref=fx.refs[idx])
         assert r.finalized
     assert h2.registry.complete_blocks() == ["block_1"]
     assert h2.registry.unfinished_blocks() == []

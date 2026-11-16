@@ -19,6 +19,7 @@ from research_runtime.m4_3 import (
 )
 from research_runtime.m4_3.research_service_gate import GateEvidence, GateRunRef
 from research_runtime.m4_3.metrics import frozen_metric_contract as fmc
+from tests.rt_tests.m4_3_gate import complete_gate_evidence
 
 
 def _protocol() -> FrozenProtocol:
@@ -47,14 +48,12 @@ class _CompleteGate:
     """Read-only gate double returning a COMPLETE real evidence chain."""
 
     def inspect(self, ref):
-        return GateEvidence(
-            ref=ref, plan_found=True, plan_sha256="sha", approval_found=True,
-            approval_status="approved", approval_source="human",
-            approval_approved_by="alice", approval_hash_matches_plan=True,
-            approval_resource_sha256="sha", campaign_found=True,
-            campaign_status="completed", campaign_terminal=True,
-            report_found=True, report_experience_refs=("exp_1",),
-            experience_rows=1)
+        return complete_gate_evidence(
+            campaign_id=ref.campaign_id or "c1",
+            plan_id=ref.plan_id or "p1",
+            approval_id=ref.approval_id or "a1",
+            session_id=ref.session_id or "s1",
+            report_id=ref.report_id or "r1")
 
 
 def _harness() -> EvaluationHarness:
@@ -70,6 +69,14 @@ def _block(bid: str, snapshot: str = "snap_1", seed: int = 42) -> BlockSpec:
                      current_evidence={"n": 1})
 
 
+def _ref(bid: str, arm: str) -> GateRunRef:
+    """DISTINCT persisted scope per run (M4.3-02 P0 #7: no campaign reuse)."""
+    return GateRunRef(session_id=f"s_{bid}_{arm}", plan_id=f"p_{bid}_{arm}",
+                      approval_id=f"a_{bid}_{arm}",
+                      campaign_id=f"c_{bid}_{arm}",
+                      report_id=f"r_{bid}_{arm}")
+
+
 def _populate(h: EvaluationHarness, n_blocks: int = 2,
               outcomes: tuple[str, ...] = ("valid_finding",)):
     for i in range(n_blocks):
@@ -80,8 +87,15 @@ def _populate(h: EvaluationHarness, n_blocks: int = 2,
             h.select_objective(bid, arm,
                                objective=_objective(f"{bid}_{arm}"))
             oc = outcomes[(i * 3 + j) % len(outcomes)]
-            h.record_outcome(bid, arm, outcome=oc, compute_units=2.0,
-                             wall_time_s=5.0)
+            # M4.3-02 P0 #7: every run owns a DISTINCT campaign; a campaign is
+            # never reused as success evidence across runs.
+            ref = GateRunRef(session_id=f"s_{bid}_{arm}",
+                             plan_id=f"p_{bid}_{arm}",
+                             approval_id=f"a_{bid}_{arm}",
+                             campaign_id=f"c_{bid}_{arm}",
+                             report_id=f"r_{bid}_{arm}")
+            h.record_outcome(bid, arm, outcome=oc, gate_ref=ref,
+                             compute_units=2.0, wall_time_s=5.0)
 
 
 # ------------------------------------------------------- #1 all 16 per arm
@@ -137,6 +151,7 @@ def test_missing_values_and_failure_runs_are_not_dropped():
         h.select_objective("block_0", arm,
                            objective=_objective(f"o_{arm}"))
         h.record_outcome("block_0", arm, outcome="invalid",
+                         gate_ref=_ref("block_0", arm),
                          compute_units=0.0, wall_time_s=0.0)
     m = h.compute_metrics()
     assert m["time_to_valid_finding"] is None       # missing, not 0
@@ -183,14 +198,16 @@ def test_interrupted_block_is_excluded_even_when_all_arms_registered():
     for arm in ARMS:
         h.select_objective("block_0", arm, objective=_objective(f"o_{arm}"))
     for arm in ARMS:
-        h.record_outcome("block_0", arm, outcome="valid_finding")
+        h.record_outcome("block_0", arm, outcome="valid_finding",
+                         gate_ref=_ref("block_0", arm))
     # A new block where one arm never finalizes.
     h.add_block(_block("block_1"), candidate_budget=1,
                 human_time_budget_s=1.0)
     for arm in ARMS:
         h.select_objective("block_1", arm, objective=_objective(f"o1_{arm}"))
     for arm in ("A", "B"):
-        h.record_outcome("block_1", arm, outcome="valid_finding")
+        h.record_outcome("block_1", arm, outcome="valid_finding",
+                         gate_ref=_ref("block_1", arm))
     pm = h.paired_metrics()
     assert pm["n_eligible_blocks"] == 1
     ex = next(e for e in pm["excluded_blocks"]
@@ -208,6 +225,7 @@ def test_same_paired_seeds_required_within_a_block():
     for arm in ARMS:
         h.record_outcome(
             "block_0", arm, outcome="valid_finding",
+            gate_ref=_ref("block_0", arm),
             paired_seeds=[42, 43] if arm != "C" else [99, 100])
     with pytest.raises(ProtocolViolation) as exc:
         h.assert_paired_seeds_consistent()

@@ -274,6 +274,20 @@ class RegistryStore:
             out.append(d)
         return out
 
+    def runs_with_campaign(self, campaign_id: str) -> list[str]:
+        """Runs already bound to ``campaign_id`` (cross-run reuse detection).
+
+        One CampaignRecord belongs to exactly one research session, so ONE
+        campaign can never supply success evidence to two runs. This query is
+        the durable (cross-process) half of that check.
+        """
+        if not campaign_id:
+            return []
+        rows = self.db.rows(
+            "SELECT run_id FROM m4_3_runs WHERE campaign_id=? ORDER BY rowid",
+            (campaign_id,))
+        return [str(r["run_id"]) for r in rows]
+
     # ------------------------------------------------------------- reviews
     def save_review(self, review: dict[str, Any]) -> None:
         rid = review.get("review_id", "")

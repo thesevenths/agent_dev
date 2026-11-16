@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .metrics import ALL_METRICS, PRIMARY_METRICS
+from .research_service_gate import GATED_OUTCOMES
 
 ARMS: tuple[str, ...] = ("A", "B", "C")
 ARM_DESCRIPTIONS: dict[str, str] = {
@@ -278,6 +279,15 @@ class ExperimentRegistry:
             raise RegistryConflict(
                 f"run {run_id!r} already finalized; refusing a second outcome "
                 "(no duplicate campaign / no budget re-consumption)")
+        # (M4.3-02 P0 #7) ONE campaign = ONE run -- for CLAIMED SUCCESS.
+        # A gated outcome (valid/negative/inconclusive) claims this campaign as
+        # success evidence, so it may never be reused by another run. A real
+        # failure / interruption / invalid run may still *reference* the
+        # campaign for diagnostics: it claims no success, so no exclusivity is
+        # asserted (that also keeps the audit trail complete).
+        campaign_id = str(changes.get("campaign_id") or "")
+        if campaign_id and str(changes.get("outcome", "")) in GATED_OUTCOMES:
+            self.assert_campaign_unused(run_id, campaign_id)
         for key, value in changes.items():
             if not hasattr(rec, key):
                 raise ValueError(f"unknown RunRecord field {key!r}")
@@ -289,6 +299,20 @@ class ExperimentRegistry:
         if self.store is not None:
             self.store.finalize_run(rec, changes=changes)
         return rec
+
+    def assert_campaign_unused(self, run_id: str, campaign_id: str) -> None:
+        """Refuse to bind a campaign that already belongs to another run."""
+        from .registry_store import RegistryConflict
+        owners = {rid for rid, r in self.runs.items()
+                  if rid != run_id and getattr(r, "campaign_id", "") == campaign_id}
+        if self.store is not None:
+            owners |= {rid for rid in self.store.runs_with_campaign(campaign_id)
+                       if rid != run_id}
+        if owners:
+            raise RegistryConflict(
+                f"campaign {campaign_id!r} is already bound to run(s) "
+                f"{sorted(owners)}; one campaign can never be reused as "
+                "success evidence by another run / block / arm")
 
     def record_review(self, review: dict[str, Any]) -> None:
         """Persist an independent review (append-only, never overwritten)."""

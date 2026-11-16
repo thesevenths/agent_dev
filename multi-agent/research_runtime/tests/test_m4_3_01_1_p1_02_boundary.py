@@ -20,6 +20,7 @@ from research_runtime.m4_3.evidence_boundary import (
 )
 from research_runtime.m4_3.metrics import frozen_metric_contract
 from research_runtime.m4_3.research_service_gate import GateEvidence, GateRunRef
+from tests.rt_tests.m4_3_gate import complete_gate_evidence
 
 
 def _protocol() -> FrozenProtocol:
@@ -40,14 +41,12 @@ def _reviewer() -> IndependentReviewer:
 
 class _CompleteGate:
     def inspect(self, ref):
-        return GateEvidence(
-            ref=ref, plan_found=True, plan_sha256="sha", approval_found=True,
-            approval_status="approved", approval_source="human",
-            approval_approved_by="alice", approval_hash_matches_plan=True,
-            approval_resource_sha256="sha", campaign_found=True,
-            campaign_status="completed", campaign_terminal=True,
-            report_found=True, report_experience_refs=("exp_1",),
-            experience_rows=1)
+        return complete_gate_evidence(
+            campaign_id=ref.campaign_id or "c1",
+            plan_id=ref.plan_id or "p1",
+            approval_id=ref.approval_id or "a1",
+            session_id=ref.session_id or "s1",
+            report_id=ref.report_id or "r1")
 
 
 def _harness() -> EvaluationHarness:
@@ -297,5 +296,10 @@ def test_inconclusive_outcome_is_retained():
     for arm in ARMS:
         h.select_objective("block_1", arm, objective=_objective(f"o_{arm}"))
     for arm in ARMS:
-        h.record_outcome("block_1", arm, outcome="inconclusive")
+        # distinct campaign per run (M4.3-02 P0 #7: no cross-run reuse)
+        h.record_outcome("block_1", arm, outcome="inconclusive",
+                         gate_ref=GateRunRef(
+                             session_id=f"s_{arm}", plan_id=f"p_{arm}",
+                             approval_id=f"a_{arm}", campaign_id=f"c_{arm}",
+                             report_id=f"r_{arm}"))
     assert {r.outcome for r in h.registry.all_runs()} == {"inconclusive"}

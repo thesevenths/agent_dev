@@ -217,10 +217,16 @@ def test_primary_metric_cannot_be_changed_post_hoc():
 
 
 # --------------------------------------------------------------------- complete retention
-def test_all_outcomes_are_retained_and_gate_approval_recorded(gate):
-    h = _harness(gate)
+def test_all_outcomes_are_retained_and_gate_approval_recorded():
+    # 9 successful runs need 9 REAL campaigns: M4.3-02 P0 #7 forbids reusing
+    # one campaign's success evidence for a second run.
+    from tests.rt_tests.m4_3_gate import build_chain_fixture
+    fx = build_chain_fixture(9)
+    h = EvaluationHarness(protocol=_protocol(), reviewer=_reviewer(),
+                          gate_adapter=fx.adapter, db=fx.harness.stores.db)
     # Three blocks with different outcomes, all paired A/B/C.
     outcomes = ("valid_finding", "inconclusive", "failed")
+    n = 0
     for i, oc in enumerate(outcomes):
         bid = f"block_{i}"
         spec = _block(bid, "snap_1")
@@ -230,7 +236,9 @@ def test_all_outcomes_are_retained_and_gate_approval_recorded(gate):
             # P0-01: no caller-supplied gate verdict; derived from persisted
             # Approval/Campaign/Report/Experience via the real adapter.
             h.record_outcome(
-                bid, arm, outcome=oc, compute_units=2.0, wall_time_s=5.0)
+                bid, arm, outcome=oc, gate_ref=fx.refs[n],
+                compute_units=2.0, wall_time_s=5.0)
+            n += 1
     runs = h.registry.all_runs()
     assert len(runs) == 9
     # NOTHING was dropped: inconclusive + failed are present in the denominator.
@@ -315,13 +323,16 @@ def test_confirmatory_refuses_unfrozen_protocol():
     assert len(frozen.freeze_sha256()) == 64
 
 
-def test_registry_preserves_snapshot_seed_hierarchy(gate):
-    h = _harness(gate)
+def test_registry_preserves_snapshot_seed_hierarchy():
+    from tests.rt_tests.m4_3_gate import build_multi_arm_fixture
+    fx = build_multi_arm_fixture()
+    h = EvaluationHarness(protocol=_protocol(), reviewer=_reviewer(),
+                          gate_adapter=fx.adapter, db=fx.harness.stores.db)
     h.add_block(_block(), candidate_budget=1, human_time_budget_s=1.0)
     for arm in ARMS:
         h.select_objective("block_1", arm, objective=_objective(f"o_{arm}"))
         h.record_outcome("block_1", arm, outcome="valid_finding",
-                         compute_units=1.0)
+                         gate_ref=fx.refs[arm], compute_units=1.0)
     paired = h.registry.runs_for_block("block_1")
     assert set(paired) == {"A", "B", "C"}
     assert {r.snapshot_id for r in paired.values()} == {"snap_1"}

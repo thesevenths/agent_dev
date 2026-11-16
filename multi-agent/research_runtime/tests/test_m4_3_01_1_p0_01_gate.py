@@ -19,7 +19,7 @@ from research_runtime.m4_3.research_service_gate import (
     ResearchServiceGateAdapter,
 )
 from research_runtime.m4_3.metrics import frozen_metric_contract
-from tests.rt_tests.m4_3_gate import build_gate_fixture
+from tests.rt_tests.m4_3_gate import build_gate_fixture, build_multi_arm_fixture
 
 
 def _protocol() -> FrozenProtocol:
@@ -235,20 +235,53 @@ def test_negative_and_inconclusive_outcomes_also_need_real_gate(gate):
 
 
 # ------------------------------------------------------------------ P0-01 #8 same adapter / entry point
-def test_abc_use_the_same_real_gate_adapter(gate):
+def test_abc_use_the_same_real_gate_adapter():
+    """ONE adapter, ONE service, THREE genuinely distinct arm chains.
+
+    M4.3-02 P0 #7: a campaign's success evidence can never be reused by a
+    second run, so each arm owns its own persisted plan/approval/campaign/
+    session. Sharing the ADAPTER (hence the same ResearchService entry point)
+    is what proves the three arms went through the SAME gate.
+    """
+    fx = build_multi_arm_fixture()
+    try:
+        h = EvaluationHarness(
+            protocol=_protocol(), reviewer=_reviewer(),
+            gate_adapter=fx.adapter, db=fx.harness.stores.db)
+        h.add_block(_block("block_1"), candidate_budget=1, human_time_budget_s=1.0)
+        for arm in ARMS:
+            h.select_objective("block_1", arm, objective=_objective(f"o_{arm}"))
+        for arm in ARMS:
+            rec = h.record_outcome("block_1", arm, outcome="valid_finding",
+                                   gate_ref=fx.refs[arm], compute_units=1.0)
+            assert rec.gate_evidence["gate_passed"] is True
+            assert rec.campaign_id == fx.campaign_ids[arm]
+            assert rec.plan_id == fx.plan_ids[arm]
+        # ONE adapter instance, ONE underlying service, once per arm.
+        assert h.gate_adapter is fx.adapter
+        assert len(fx.adapter.inspect_calls) == 3
+        assert fx.adapter.service is fx.harness.service
+        assert len({r.campaign_id for r in h.registry.all_runs()}) == 3
+    finally:
+        fx.close()
+
+
+def test_one_campaign_cannot_supply_success_to_a_second_run(gate):
+    """M4.3-02 P0 #7: cross-run reuse of one campaign is refused."""
+    from research_runtime.m4_3.registry_store import RegistryConflict
+
     h = _harness(gate)
-    _seed(h)
-    assert h.gate_adapter is gate.adapter
-    for arm in ARMS:
-        rec = h.record_outcome("block_1", arm, outcome="valid_finding",
-                               compute_units=1.0)
-        assert rec.gate_evidence["gate_passed"] is True
-        assert rec.campaign_id == gate.campaign_id
-        assert rec.gate_evidence["ref"]["plan_id"] == gate.plan_id
-    # ONE adapter instance, ONE underlying service, executed once per arm.
-    assert len(gate.adapter.inspect_calls) == 3
-    assert gate.adapter.service is gate.harness.service
-    assert gate.adapter.inspect_calls == [gate.ref] * 3
+    h.add_block(_block("b1"), candidate_budget=1, human_time_budget_s=1.0)
+    h.add_block(_block("b2"), candidate_budget=1, human_time_budget_s=1.0)
+    h.select_objective("b1", "A", objective=_objective("o_b1"))
+    h.select_objective("b2", "A", objective=_objective("o_b2"))
+    rec = h.record_outcome("b1", "A", outcome="valid_finding")
+    assert rec.gate_evidence["gate_passed"] is True
+    with pytest.raises(RegistryConflict) as exc:
+        h.record_outcome("b2", "A", outcome="valid_finding")
+    assert "already bound" in str(exc.value)
+    assert h.registry.runs["b2_A"].finalized is False
+
 
 
 def test_gate_ref_points_at_records_not_verdicts(gate):

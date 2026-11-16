@@ -25,6 +25,7 @@ from research_runtime.m4_3.blind_review import (
 )
 from research_runtime.m4_3.metrics import frozen_metric_contract
 from research_runtime.m4_3.research_service_gate import GateRunRef
+from tests.rt_tests.m4_3_gate import complete_gate_evidence
 
 
 def _dims():
@@ -81,14 +82,12 @@ class _NullGate:
     def inspect(self, ref):
         from research_runtime.m4_3.research_service_gate import GateEvidence
         self.inspect_calls.append(ref)
-        return GateEvidence(
-            ref=ref, plan_found=True, plan_sha256="sha", approval_found=True,
-            approval_status="approved", approval_source="human",
-            approval_approved_by="alice", approval_hash_matches_plan=True,
-            approval_resource_sha256="sha", campaign_found=True,
-            campaign_status="completed", campaign_terminal=True,
-            report_found=True, report_experience_refs=("exp_1",),
-            experience_rows=1)
+        return complete_gate_evidence(
+            campaign_id=ref.campaign_id or "c1",
+            plan_id=ref.plan_id or "p1",
+            approval_id=ref.approval_id or "a1",
+            session_id=ref.session_id or "s1",
+            report_id=ref.report_id or "r1")
 
 
 def _harness(**kw) -> EvaluationHarness:
