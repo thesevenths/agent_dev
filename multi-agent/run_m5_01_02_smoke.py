@@ -105,7 +105,14 @@ def _services():
     return services, db_paths, holders
 
 
-def _make_approver(services, db_paths):
+def _make_smoke_approver(services, db_paths):
+    """DEMO-ONLY automated grant for smoke runs.
+
+    This is NOT human approval. Real/integrated Runtime MUST wait for an
+    external human operator via approval_cli and never call this. The grant is
+    bound to the current Plan SHA by approval_cli itself (current_resource_
+    sha256), and the artifact records approval_mode explicitly.
+    """
     def grant(approval_id: str, plan_id: str) -> None:
         domain = ""
         for name, svc in services.items():
@@ -117,8 +124,12 @@ def _make_approver(services, db_paths):
         r = subprocess.run(
             [sys.executable, "-m",
              "research_runtime.research_store.approval_cli",
+             # source must stay in policy.allowed_sources=("human",) for the
+             # Gate to pass. Honesty about demo mode is carried by approved_by
+             # and by the artifact's approval_mode field -- NOT by forging a
+             # human identity.
              "--db", str(db_paths[domain]), "grant", approval_id,
-             "--approved-by", "m5_01_02_smoke_operator", "--yes"],
+             "--approved-by", "smoke_demo_operator_NOT_human", "--yes"],
             cwd=str(ROOT), capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(
@@ -192,7 +203,7 @@ def main() -> int:
         run_id=RUN_ID, registry=registry,
         budgets=DomainBudgetManager(db=shared_db),
         records=DomainRunRecordStore(db=shared_db),
-        services=services, approver=_make_approver(services, db_paths),
+        services=services, approver=_make_smoke_approver(services, db_paths),
         out_dir=OUT / "directors", max_campaigns_per_domain=1)
 
     preflight = scheduler.preflight()
@@ -215,7 +226,23 @@ def main() -> int:
                             "objective_id": spec["objective_id"],
                             "ok": False,
                             "error": f"{type(exc).__name__}: {exc}"})
+    # M5-INTEGRATED: overall state is DERIVED from real per-domain outcomes.
+    # A failed/partial domain can never be reported as COMPLETED. Each result
+    # keeps its own error and evidence; nothing is silently dropped.
+    def _domain_ok(r: dict[str, Any]) -> bool:
+        return (bool(r.get("ok", True))
+                and r.get("director_state") == "COMPLETED"
+                and bool(r.get("campaign_id"))
+                and not r.get("error"))
+
+    domain_ok = {r.get("domain_id", r.get("objective_id", "?")):
+                 _domain_ok(r) for r in results}
+    all_ok = bool(results) and all(domain_ok.values())
+    overall_state = "COMPLETED" if all_ok else (
+        "PARTIAL" if any(domain_ok.values()) else "FAILED")
+
     summary = {"run_id": RUN_ID, "results": results,
+               "state": overall_state, "domain_ok": domain_ok,
                "budgets": {d: scheduler.budgets.snapshot(RUN_ID, d)
                            for d in services}}
     print("campaign summary:", json.dumps([
@@ -233,7 +260,12 @@ def main() -> int:
         domain="scinet")
 
     result = {
-        "run_id": RUN_ID, "state": "COMPLETED",
+        "run_id": RUN_ID, "state": overall_state,
+        "approval_mode": "automated_smoke_demo_NOT_human",
+        "approval_note": ("smoke driver invoked approval_cli grant automatically; "
+                          "this is NOT human approval. Integrated Runtime waits "
+                          "for an external human operator and binds the exact "
+                          "Plan SHA before campaign execution."),
         "elapsed_s": round(time.time() - t0, 2),
         "preflight": preflight, "summary": summary,
         "cross_domain_snapshot": {
@@ -254,7 +286,8 @@ def main() -> int:
         "domains": [r.get("domain_id") for r in summary["results"]],
         "next_round_proposals": len(next_round.proposed_objective_ids),
         "experience_rows": len(result["experience"])}, indent=2), flush=True)
-    return 0
+    # Non-zero exit on any failed/partial domain: no false-green smoke.
+    return 0 if overall_state == "COMPLETED" else 2
 
 
 if __name__ == "__main__":

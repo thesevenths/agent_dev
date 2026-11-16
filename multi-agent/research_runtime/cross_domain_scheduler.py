@@ -211,33 +211,134 @@ class CrossDomainScheduler:
     def build_cross_domain_snapshot(self, run_id: str,
                                     objective_ids: list[str] | None = None
                                     ) -> DiscoverySnapshot:
-        """Merge REAL per-domain snapshots with explicit source provenance."""
+        """Merge REAL per-domain snapshots with explicit source provenance.
+
+        M5-INTEGRATED fix: an empty ``objective_ids`` list previously collapsed
+        to ``()`` via ``or`` and silently produced a context-free snapshot. A
+        domain with no objectives in scope must instead report that fact as a
+        resolvable gap, while a domain WITH objectives is still fully read.
+        Every per-domain field (evidence_view / links / sessions /
+        sessions_by_objective / failures / provenance / unresolved_gaps) is
+        merged, and each row keeps ``source_domain`` + ``source_run_id`` plus
+        the domain artifact SHA so no conclusion loses its origin.
+        """
+        def _identity(value: Any) -> str:
+            import hashlib, json
+            return hashlib.sha256(json.dumps(
+                value, sort_keys=True, ensure_ascii=False,
+                default=str).encode("utf-8")).hexdigest()
+
+        # None -> caller wants ALL objectives actually persisted in each
+        # domain's ObjectiveStore (do NOT rely on the evidence view's run-id
+        # heuristic, which returns nothing for a freshly-created cross-domain
+        # run). An EXPLICIT empty list -> scope to zero, still report health.
+        requested = list(objective_ids) if objective_ids is not None else None
+
         merged: dict[str, Any] = {
-            "run_id": run_id, "objectives": [], "sessions": [],
-            "experience_available": False, "unresolved_gaps": []}
+            "objectives": [], "sessions": [], "links": {},
+            "sessions_by_objective": {},
+            "failures": {"session_failure_signals": [],
+                         "evidence_unresolved": [],
+                         "structured_diagnoses": [], "by_domain": {}},
+            # top-level keys stay Discovery-compatible (provenance.domains etc.)
+            "evidence_view": {"cross_domain": True, "provenance": {"domains": {}}},
+            "experience_available": False,
+            "unresolved_gaps": [], "source_domains": [],
+            "artifact_shas": {}, "domain_evidence": {},
+        }
         for domain_id, service in sorted(self.services.items()):
-            ids = [oid for oid in (objective_ids or ())
-                   if (service.stores.objectives.get(oid) is not None)]
+            ids: list[str] | None = None
+            if requested is not None:
+                ids = [oid for oid in requested
+                       if service.stores.objectives.get(oid) is not None]
+                # Empty scope for THIS domain is legitimate (no objective here)
+                # but must be visible, not silently drop the whole domain.
+                if not ids:
+                    merged["unresolved_gaps"].append({
+                        "source_domain": domain_id, "source_run_id": run_id,
+                        "kind": "no_objectives_in_scope",
+                        "requested": list(requested)})
+            else:
+                # Enumerate the REAL persisted objectives of this domain.
+                try:
+                    ids = [o.objective_id
+                           for o in service.stores.objectives.all()]
+                except Exception:  # noqa: BLE001
+                    ids = []
             try:
                 snap = self.registry.get(domain_id).build_snapshot(run_id, ids)
             except Exception as exc:  # noqa: BLE001 - never fabricate a snapshot
                 merged["unresolved_gaps"].append(
-                    {"domain_id": domain_id,
+                    {"source_domain": domain_id, "source_run_id": run_id,
+                     "kind": "snapshot_failed",
                      "reason": f"{type(exc).__name__}: {exc}"})
                 continue
+
+            merged["source_domains"].append(domain_id)
+            merged["artifact_shas"][domain_id] = _identity(snap.to_dict())
+            merged["domain_evidence"][domain_id] = {
+                "source_domain": domain_id, "source_run_id": run_id,
+                "evidence_view": snap.evidence_view,
+                "provenance": snap.provenance,
+                "failures": snap.failures,
+                "n_objectives": len(snap.objectives),
+                "n_sessions": len(snap.sessions),
+                "artifact_sha": merged["artifact_shas"][domain_id],
+            }
+            # Merge evidence_view: keep per-domain isolated copy AND flatten
+            # provenance.domains so the existing generator can still read it.
+            merged["evidence_view"][domain_id] = snap.evidence_view
+            dom_prov = (snap.evidence_view.get("provenance") or {})
+            merged["evidence_view"]["provenance"]["domains"].update(
+                dom_prov.get("domains") or {})
+            for k in ("reserved_final_splits", "dataset_version",
+                      "n_evidence", "n_carriers_read", "unresolved"):
+                if k in snap.evidence_view and k not in merged["evidence_view"]:
+                    merged["evidence_view"][k] = snap.evidence_view[k]
+
             for obj in snap.objectives:
-                merged["objectives"].append({**obj, "source_domain": domain_id})
+                merged["objectives"].append(
+                    {**obj, "source_domain": domain_id, "source_run_id": run_id})
             for session in snap.sessions:
-                merged["sessions"].append({**session, "source_domain": domain_id})
+                merged["sessions"].append(
+                    {**session, "source_domain": domain_id,
+                     "source_run_id": run_id})
+            for oid, group in snap.sessions_by_objective.items():
+                bucket = merged["sessions_by_objective"].setdefault(oid, [])
+                for s in group:
+                    bucket.append({**s, "source_domain": domain_id,
+                                   "source_run_id": run_id})
+            # links: nested by objective, namespaced per domain to avoid ID clash
+            merged["links"][domain_id] = snap.links
+            # failures: flatten signal lists (consumer reads the top-level key)
+            # while keeping a source-bound per-domain copy for provenance.
+            merged["failures"]["by_domain"][domain_id] = snap.failures
+            for fk in ("session_failure_signals", "evidence_unresolved",
+                       "structured_diagnoses"):
+                for item in (snap.failures.get(fk) or []):
+                    merged["failures"].setdefault(fk, []).append(
+                        {**item, "source_domain": domain_id}
+                        if isinstance(item, dict) else item)
+            for gap in snap.unresolved_gaps:
+                merged["unresolved_gaps"].append(
+                    {**gap, "source_domain": domain_id,
+                     "source_run_id": run_id})
             merged["experience_available"] = (
                 merged["experience_available"] or snap.experience_available)
+
         return DiscoverySnapshot(
             run_id=run_id, schema_version=DISCOVERY_SNAPSHOT_SCHEMA_VERSION,
-            generated_at="", evidence_view={"cross_domain": True},
-            objectives=merged["objectives"], links={}, sessions=merged["sessions"],
-            sessions_by_objective={},
+            generated_at="", evidence_view=merged["evidence_view"],
+            objectives=merged["objectives"], links=merged["links"],
+            sessions=merged["sessions"],
+            sessions_by_objective=merged["sessions_by_objective"],
             experience_available=merged["experience_available"],
-            failures={}, provenance={"source_domains": sorted(self.services)},
+            failures=merged["failures"],
+            provenance={"source_domains": merged["source_domains"],
+                        "source_run_id": run_id,
+                        "artifact_shas": merged["artifact_shas"],
+                        "domains": merged["domain_evidence"],
+                        "cross_domain": True},
             unresolved_gaps=merged["unresolved_gaps"])
 
 
