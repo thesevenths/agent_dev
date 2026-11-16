@@ -22,7 +22,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .experiment_registry import ARMS, RUN_OUTCOMES, RunRecord
+from .experiment_registry import (
+    ARMS, ARM_DESCRIPTIONS, RUN_OUTCOMES, RunRecord,
+)
 from .metrics import (
     ALL_METRICS, PRIMARY_METRICS, SAFETY_METRICS, SECONDARY_METRICS,
     compute_metric_set, frozen_metric_contract,
@@ -76,6 +78,10 @@ def _evidence_chain(rec: RunRecord) -> dict[str, Any]:
             "gate_passed": bool(rec.gate_evidence.get("gate_passed")),
             "gate_steps_passed": rec.gate_steps_passed,
             "external_approval": rec.external_approval,
+            "approval_source": str(
+                (rec.gate_evidence or {}).get("approval_source") or ""),
+            "approval_approved_by": str(
+                (rec.gate_evidence or {}).get("approval_approved_by") or ""),
             "evidence_refs": list(rec.evidence_refs),
             "finalized": rec.finalized}
 
@@ -107,6 +113,36 @@ def _contrast_differences(
                     not arms[hi].quality_review or not arms[lo].quality_review):
                 continue        # never impute a missing human review
             out[label].append(round(float(a) - float(b), 6))
+    return out
+
+
+def _quality_observation(by_arm: dict[str, list[RunRecord]]) -> dict[str, Any]:
+    """Report objective quality as MISSING (not 0) when no human review exists.
+
+    The frozen metric contract uses 0.0 as its missing-value sentinel, but a
+    value report must never render that sentinel as if a real score of zero had
+    been observed. This block makes the distinction explicit and auditable.
+    """
+    out: dict[str, Any] = {}
+    total_reviewed = 0
+    for arm in ARMS:
+        reviewed = [r for r in by_arm.get(arm, []) if r.quality_review]
+        total_reviewed += len(reviewed)
+        totals = [float(r.quality_review["total"]) for r in reviewed
+                  if r.quality_review.get("total") is not None]
+        out[arm] = {
+            "n_runs": len(by_arm.get(arm, [])),
+            "n_reviewed": len(reviewed),
+            "value": (round(sum(totals) / len(totals), 6) if totals else None),
+            "status": "observed" if totals else "missing_no_human_review",
+        }
+    out["n_reviewed_total"] = total_reviewed
+    out["observation_complete"] = all(
+        out[arm]["n_reviewed"] == out[arm]["n_runs"] and out[arm]["n_runs"] > 0
+        for arm in ARMS)
+    out["note"] = (
+        "objective quality is a HUMAN-BLIND metric; with no human review it is "
+        "reported as a missing value (None), not an observed score of 0")
     return out
 
 
@@ -174,6 +210,9 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
                      "contrasts stay in the correction family"),
         },
         "arms": {a: {"n_runs": len(v)} for a, v in by_arm.items()},
+        # P1-03: accurate, pre-registered group descriptions. A/B are delegated
+        # rule-based baselines, NOT independent human selection.
+        "arm_descriptions": dict(ARM_DESCRIPTIONS),
         "metric_contract_sha256": frozen_metric_contract()["contract_sha256"],
     }
 
@@ -197,6 +236,56 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
         if gaps:
             missing.append({"run_id": r.run_id, "arm": r.arm,
                             "missing": gaps, "outcome": r.outcome})
+    # ---- approval boundary (P1-03) -------------------------------------
+    # The gate checks that an approval RECORD exists, is approved and bound to
+    # the plan hash. It does NOT (and cannot) prove WHO pressed the key or that
+    # a distinct, authenticated human was present. Report BOTH facts honestly.
+    approval_sources: dict[str, int] = {}
+    approved_by_values: set[str] = set()
+    for r in runs:
+        ev = r.gate_evidence or {}
+        src = str(ev.get("approval_source") or "unknown")
+        approval_sources[src] = approval_sources.get(src, 0) + 1
+        if ev.get("approval_approved_by"):
+            approved_by_values.add(str(ev["approval_approved_by"]))
+    cfg_approver = str(protocol.get("approver_id", "") or "")
+    # The pilot runner self-grants via a CLI SUBPROCESS
+    # (``approval_cli grant --approved-by <config> --yes``). That is a real,
+    # out-of-band command-line authorisation bound to the plan SHA, but it is
+    # NOT an independent authenticated human approver.
+    cli_subprocess_grants = sum(
+        1 for r in runs
+        if r.gate_evidence.get("approval_approved_by")
+        and (bool(cfg_approver)
+             and str(r.gate_evidence["approval_approved_by"]) == cfg_approver))
+    approval_boundary = {
+        "record_level_check": (
+            "the 12-step gate verified an approval RECORD that is approved and "
+            "SHA-bound to the current plan (approval_source label, "
+            "approval_approved_by identity string)"),
+        "approval_sources_labelled": approval_sources,
+        "approved_by_identities": sorted(approved_by_values),
+        "cli_subprocess_grants_detected": cli_subprocess_grants,
+        "config_approver_id": cfg_approver,
+        "independent_human_approval_confirmed": False,
+        "identity_authentication_confirmed": False,
+        "distinction": {
+            "cli_subprocess_authorisation": (
+                "a separate command-line process (approval_cli grant --yes) "
+                "created the approved record; this is what the pilot performed"),
+            "real_human_approval": (
+                "a distinct human reviewing the plan and personally granting "
+                "it -- NOT established by a --yes subprocess with a configured "
+                "identity string"),
+            "identity_authentication": (
+                "verification that the approved_by string is an authenticated "
+                "person -- NOT established by the approval record alone"),
+        },
+        "claim": ("approval evidence proves a SHA-bound CLI subprocess grant "
+                  "under the identity label(s) listed above; it does NOT prove "
+                  "an independent, authenticated human approver"),
+    }
+
     integrity_section = {
         "n_runs": len(runs),
         "n_runs_per_arm": {a: len(v) for a, v in by_arm.items()},
@@ -204,6 +293,7 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
                            for o in RUN_OUTCOMES},
         "gate_completeness": _rate(lambda r: r.gate_steps_passed == 12),
         "approval_completeness": _rate(lambda r: r.external_approval),
+        "approval_boundary": approval_boundary,
         "report_completeness": _rate(lambda r: bool(r.report_id)),
         "experience_completeness": _rate(lambda r: bool(r.experience_id)),
         "registry_event_chain_valid": integrity,
@@ -243,6 +333,9 @@ def generate_value_report(*, db: Any, out_dir: str | Path,
         "metrics": list(PRIMARY_METRICS),
         "by_arm": {a: {m: compute_metric_set(v)[m] for m in PRIMARY_METRICS}
                    for a, v in by_arm.items()},
+        # P1-03: a MISSING human-blind metric is shown as a missing value with
+        # n_reviewed=0, NEVER as an actual score of 0.0.
+        "objective_quality_observation": _quality_observation(by_arm),
         "contrasts": contrast_runs,
         "primary_contrast": PRIMARY_CONTRAST_LABELS[0],
         "decision_primary_metric": DECISION_PRIMARY_METRIC,
@@ -452,7 +545,8 @@ def render_value_report(r: dict[str, Any]) -> str:
     lines.append("## A. Experiment design")
     lines.append("")
     lines.append(f"- blocks: {d['n_blocks']}; snapshots: {len(d['snapshot_ids'])}")
-    lines.append(f"- arms: A manual / B memory-assisted / C autonomous discovery")
+    for _arm in ARMS:
+        lines.append(f"- arm {_arm}: {d.get('arm_descriptions', {}).get(_arm, '')}")
     lines.append(f"- model / prompt / ranker / policy: `{d['model_version']}` / "
                  f"`{d['prompt_version']}` / `{d['ranker_version']}` / "
                  f"`{d['domain_policy_version']}`")
@@ -475,6 +569,21 @@ def render_value_report(r: dict[str, Any]) -> str:
                 "registry_event_chain_valid", "outcome_counts"):
         lines.append(f"| {key} | {b[key]} |")
     lines.append("")
+    ab = b.get("approval_boundary") or {}
+    if ab:
+        lines.append("### Approval boundary (authorisation vs human identity)")
+        lines.append("")
+        lines.append(f"- record-level check: {ab['record_level_check']}")
+        lines.append(f"- approval sources (labels): {ab['approval_sources_labelled']}")
+        lines.append(f"- approved_by identities: {ab['approved_by_identities']}")
+        lines.append(f"- CLI subprocess grants detected: "
+                     f"{ab['cli_subprocess_grants_detected']}")
+        lines.append(f"- independent human approval confirmed: "
+                     f"**{ab['independent_human_approval_confirmed']}**")
+        lines.append(f"- identity authentication confirmed: "
+                     f"**{ab['identity_authentication_confirmed']}**")
+        lines.append(f"- claim: {ab['claim']}")
+        lines.append("")
     if b["duplicate_campaign_ids"]:
         lines.append(f"**Duplicate campaign ids:** {b['duplicate_campaign_ids']}")
         lines.append("")
@@ -489,7 +598,21 @@ def render_value_report(r: dict[str, Any]) -> str:
     c = r["primary"]
     lines.append("## C. Primary metrics")
     lines.append("")
-    lines.append("| metric | " + " | ".join(ARMS) + " |")
+    qobs = c.get("objective_quality_observation") or {}
+    if qobs:
+        lines.append("Objective quality (HUMAN-BLIND; missing values shown as "
+                     "`missing`, never as a 0 score):")
+        lines.append("")
+        lines.append("| arm | n reviewed | value | status |")
+        lines.append("|---|---|---|---|")
+        for arm in ARMS:
+            info = qobs.get(arm, {})
+            val = info.get("value")
+            lines.append(f"| {arm} | {info.get('n_reviewed')} | "
+                         f"{'missing' if val is None else val} | "
+                         f"{info.get('status')} |")
+        lines.append("")
+    lines.append("| metric (raw contract values) | " + " | ".join(ARMS) + " |")
     lines.append("|---|" + "---|" * len(ARMS))
     for metric in c["metrics"]:
         lines.append(f"| {metric} | " + " | ".join(

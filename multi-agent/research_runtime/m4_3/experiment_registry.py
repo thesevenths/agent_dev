@@ -25,12 +25,16 @@ from .research_service_gate import GATED_OUTCOMES
 
 ARMS: tuple[str, ...] = ("A", "B", "C")
 ARM_DESCRIPTIONS: dict[str, str] = {
-    "A": ("Manual: human selects an Objective from current research evidence, "
-          "WITHOUT historical Experience assistance."),
-    "B": ("Memory-assisted Manual: human reads the SAME historical Evidence, "
-          "Experience and Failure context, then selects an Objective."),
-    "C": ("Autonomous Discovery: ObjectiveCandidateGenerator + Critic + Ranker "
-          "select the Objective automatically."),
+    "A": ("Current-evidence delegated baseline: the pre-registered "
+          "delegated-operator rule selects an Objective from CURRENT evidence "
+          "only, WITHOUT historical Experience. NOT an independent human "
+          "researcher (unless a real human selection record is supplied)."),
+    "B": ("History-assisted delegated baseline: the pre-registered "
+          "delegated-operator rule selects an Objective reading the SAME "
+          "historical Evidence / Experience / Failure context as C. NOT an "
+          "independent human researcher."),
+    "C": ("Autonomous Objective Discovery: ObjectiveCandidateGenerator + "
+          "Critic + Ranker select the Objective automatically."),
 }
 
 # A run's terminal classification. Every one of these is a RECORDED outcome;
