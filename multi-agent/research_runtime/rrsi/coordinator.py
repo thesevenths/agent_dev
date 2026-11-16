@@ -17,6 +17,7 @@ from .evolution_experiment import (
     assert_single_layer, gate_allows_promotion,
 )
 from .evolution_registry import EvolutionRegistry
+from .holdout_evidence import gate_allows_promotion_verified
 
 
 class RRSICoordinator:
@@ -43,7 +44,8 @@ class RRSICoordinator:
             evaluator: Callable[..., dict[str, Any]],
             layer: str | None = None,
             domain: str | None = None,
-            domain_candidate_available: bool = True) -> dict[str, Any]:
+            domain_candidate_available: bool = True,
+            require_structured_holdout: bool = False) -> dict[str, Any]:
         chosen = layer or self.select_layer(
             dominant_failure=dominant_failure, domain=domain,
             domain_candidate_available=domain_candidate_available)
@@ -71,14 +73,27 @@ class RRSICoordinator:
             holdout_ok = bool(result.get("holdout_confirmed"))
             frozen = bool(result.get("frozen_test_used"))
             training_only = bool(result.get("training_only"))
-            gate = gate_allows_promotion(
-                decision, holdout_confirmed=holdout_ok,
-                frozen_test_used=frozen, training_only=training_only)
+            sha = self._candidate_sha(candidate)
+            if require_structured_holdout:
+                # Real promotion: a bare boolean is NOT proof. Cross-check the
+                # structured holdout evidence against THIS candidate + parent.
+                gate, gate_reasons = gate_allows_promotion_verified(
+                    decision, holdout_confirmed=holdout_ok,
+                    frozen_test_used=frozen, training_only=training_only,
+                    holdout_evidence=result.get("holdout_evidence"),
+                    expected_candidate_sha=sha, expected_parent_sha=parent_sha)
+            else:
+                gate = gate_allows_promotion(
+                    decision, holdout_confirmed=holdout_ok,
+                    frozen_test_used=frozen, training_only=training_only)
+                gate_reasons = [] if gate else ["base_gate_denied"]
             exp.decision = decision
             exp.gate_passed = gate
             exp.evidence.update(result)
+            exp.evidence["promotion_gate"] = {
+                "structured_required": bool(require_structured_holdout),
+                "passed": bool(gate), "reasons": gate_reasons}
             status = "PROMOTED" if gate else decision
-            sha = self._candidate_sha(candidate)
             record = self.registry.record(
                 experiment_id=eid, layer=chosen,
                 candidate_id=str(candidate.get("candidate_id", "")),
