@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
-from research_runtime.autonomous_research_loop import _ReusePriorObjectiveStore
+from research_runtime.autonomous_research_loop import (
+    AutonomousResearchLoop, LoopConfig, _ReusePriorObjectiveStore,
+)
 from research_runtime.autonomous_loop_state import (
     IllegalTransition, LoopEventStore, LoopRecord, S_AWAITING_APPROVAL,
     S_CREATED, S_DISCOVERING, S_EXECUTING, S_LOOP_COMPLETED, S_OBJECTIVE_READY,
@@ -114,6 +117,19 @@ def _objective_record(oid: str, constraints: dict, provenance: dict):
                           description="test objective",
                           constraints=constraints),
         provenance=provenance)
+
+
+def test_events_are_tagged_with_the_executing_round(tmp_path):
+    svc = SimpleNamespace(stores=SimpleNamespace(
+        db=ResearchDatabase(tmp_path / "loop.sqlite")))
+    loop = AutonomousResearchLoop(
+        service=svc, config=LoopConfig(loop_id="L4"),
+        out_dir=tmp_path / "out")
+    loop._emit("before_round", {"a": 1})
+    loop._current_round = 2
+    loop._emit("during_round", {"a": 2})
+    assert [e["round_no"] for e in loop.store.history("L4")] == [0, 2]
+    assert loop.store.verify_integrity("L4") is True
 
 
 def test_later_round_reuses_same_candidate_without_overwriting_history(tmp_path):

@@ -134,6 +134,9 @@ class AutonomousResearchLoop:
         self.started_wall = time.time()
         self.campaigns_run = 0
         self._stop_requested = False
+        # Event round numbers must describe the round being executed, not the
+        # last COMPLETED round stored on LoopRecord (which lags by one).
+        self._current_round = 0
         self.record = self.store.load(config.loop_id)
 
     # -------------------------------------------------------------- lifecycle
@@ -170,7 +173,7 @@ class AutonomousResearchLoop:
     def request_stop(self, reason: str = "human stop") -> None:
         self._stop_requested = True
         self.store.append(loop_id=self.config.loop_id,
-                          round_no=self.record.round_no,
+                          round_no=self._current_round,
                           event="human_stop_requested", payload={"reason": reason})
 
     # --------------------------------------------------------------- budget
@@ -192,7 +195,7 @@ class AutonomousResearchLoop:
     # ------------------------------------------------------------ state helpers
     def _emit(self, event: str, payload: dict[str, Any]) -> str:
         return self.store.append(loop_id=self.config.loop_id,
-                                 round_no=self.record.round_no,
+                                 round_no=self._current_round,
                                  event=event, payload=payload)
 
     def _transition(self, event: str, to_state: str,
@@ -321,6 +324,7 @@ class AutonomousResearchLoop:
     def _run_round(self, round_no: int,
                    prior_experience: dict[str, Any]) -> dict[str, Any]:
         """One real round: Discovery -> Director -> Approval -> Campaign."""
+        self._current_round = round_no
         self._transition("begin_round", S_DISCOVERING,
                          {"round_no": round_no,
                           "prior_experience_refs":
