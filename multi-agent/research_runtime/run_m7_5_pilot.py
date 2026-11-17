@@ -50,7 +50,10 @@ def main() -> int:
     print(json.dumps({"verdict": result["verdict"],
                       "n_results": executed["n_results"],
                       "per_group": result["per_group"],
-                      "deltas": result["deltas_vs_base"]}, ensure_ascii=False))
+                      "n_unique_families": result["n_unique_families"],
+                      "paired_vs_base": result["paired_vs_base"],
+                      "verdict_reason": result.get("verdict_reason")},
+                     ensure_ascii=False))
     return 0
 
 

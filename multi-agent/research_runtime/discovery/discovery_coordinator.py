@@ -506,8 +506,12 @@ class DiscoveryCoordinator:
         novelty = self.state["artifacts"]["novelty"]["obj"]
         questions = [ResearchQuestion(**q) for q in self.state["questions"]]
         eig_model = self.evidence_map.get("eig")
-        eig_result = (expected_information_gain_from_model(**eig_model)
-                      if isinstance(eig_model, dict) else None)
+        # Only pass the EXPLICIT probability-model fields; extra descriptive
+        # keys from an operator evidence file must not crash the gate.
+        eig_keys = ("hypotheses", "priors", "likelihoods")
+        eig_result = (expected_information_gain_from_model(
+            **{k: eig_model[k] for k in eig_keys if k in eig_model})
+            if isinstance(eig_model, dict) else None)
         evidence_map = dict(self.evidence_map)
         evidence_map.setdefault("feasibility", {})["engine_capability_check"] = [
             {"dataset_version": self.dataset["dataset_version"],
