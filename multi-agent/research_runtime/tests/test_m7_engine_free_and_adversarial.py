@@ -103,27 +103,41 @@ def test_novelty_abstention_and_known_claim(tmp_path):
                      "providers": []}
     abstain = assess_novelty(claims, [], coverage=coverage_zero)
     assert abstain["literature_check"] == "not_performed"
-    assert all(v["status"] == "NOT_ASSESSED" for v in abstain["verdicts"])
+    assert all(v["status"] == "NOVELTY_UNCERTAIN" for v in abstain["verdicts"])
     papers = [paper("p1", title=claims[0].text,
                     abstract=claims[0].text)]
     cov = {"status": "OK", "n_unique_papers": 3, "providers": ["openalex"]}
     known = assess_novelty(claims, papers, coverage=cov)
-    assert any(v["status"] == "KNOWN" for v in known["verdicts"])
+    assert any(v["status"] == "NOT_NOVEL" for v in known["verdicts"])
     for verdict in known["verdicts"]:
         for rel in verdict["relations"]:
             assert rel["paper_id"] == "p1"  # never invented prior art
 
 
-def test_value_assessment_and_information_gain():
+def test_value_assessment_fails_closed_without_evidence():
     q = ResearchQuestion(question_id="q1", title="t", domain="embodied",
                          motivation="m", literature_gap="g",
                          falsifiability_requirements=["a", "b"],
                          evidence_refs=["paper:p1"])
-    novelty = {"verdicts": [{"status": "POTENTIALLY_NOVEL"}]}
-    v = assess_value(q, novelty=novelty, cost_units=2.0)
-    assert len(v.scores) == 7 and len(v.rationales) == 7
-    assert v.expected_information_gain > 0
+    novelty = {"verdicts": [{"status": "NOVELTY_UNCERTAIN"}],
+               "literature_check": "performed"}
+    v = assess_value(q, novelty=novelty)
+    assert v.priority is None and v.status == "NOT_ASSESSED"
+    assert v.expected_information_gain == "NOT_ASSESSED"
+    assert all(v.uncertainties[k] == "NOT_ASSESSED"
+               for k in v.uncertainties if v.scores[k] == "NOT_ASSESSED")
     assert expected_information_gain([0.5, 0.5], [0.5, 0.5]) == 0.0
+
+
+def test_eig_requires_explicit_observation_model():
+    from research_runtime.discovery.questions import expected_information_gain_from_model
+    bad = expected_information_gain_from_model(
+        hypotheses=["H0", "H1"], priors=[0.5, 0.5], likelihoods={})
+    assert bad["status"] == "NOT_ASSESSED"
+    good = expected_information_gain_from_model(
+        hypotheses=["H0", "H1"], priors=[0.5, 0.5],
+        likelihoods={"H0": [0.9, 0.1], "H1": [0.2, 0.8]})
+    assert good["status"] == "ASSESSED" and good["value"] > 0
 
 
 def test_competing_hypotheses_and_unfalsifiable_rejection():

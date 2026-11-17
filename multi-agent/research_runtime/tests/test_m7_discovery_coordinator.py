@@ -33,6 +33,9 @@ class FakeProvider:
 
 
 class FakeTrajectory:
+    trajectory_id = "fake_traj_m71"
+    prompt_sha256 = "a" * 64
+    model_id = "fake-model"
     ok = True
     content = json.dumps({
         "H1": {"mechanism": "action conditioned dynamics",
@@ -117,7 +120,9 @@ def make_coordinator(tmp_path, **overrides):
               agent=FakeAgent(), executor=fake_executor,
               approval=lambda protocol_sha: {
                   "protocol_sha": protocol_sha, "approver": "human-operator",
-                  "decision": "APPROVED"})
+                  "decision": "APPROVED"},
+              pilot_effects={"ep1": 0.12, "ep2": 0.10,
+                             "ep3": 0.14, "ep4": 0.11})
     kw.update(overrides)
     return DiscoveryCoordinator(**kw)
 
@@ -169,3 +174,52 @@ def test_resume_is_idempotent(tmp_path):
     assert second["status"] == "COMPLETED"
     assert c2.state["state_file_sha"] == sha1
     assert len(c2.runtime.reservations(c2.run_id)) == 2
+
+
+def test_missing_pilot_effects_force_inconclusive_verdict(tmp_path):
+    c = make_coordinator(tmp_path, pilot_effects=None)
+    result = c.run()
+    assert result["ok"] and result["status"] == "COMPLETED"
+    assert result["scientific_verdict"] == "INCONCLUSIVE"
+    assert c.state["power_gate"] == "NOT_ASSESSED"
+    reservations = c.runtime.reservations(c.run_id)
+    assert all(r["state"] == "consumed" for r in reservations)
+
+
+class FakeLoadedHarness:
+    harness_sha = "b" * 64
+    component_shas = {"hypothesis_critic": "c" * 64}
+    parent_sha = "d" * 64
+    activation_id = "act_m71"
+
+
+class FakeBindings:
+    def __init__(self):
+        self.bound = []
+
+    def bind(self, *, campaign_id, domain, loaded):
+        self.bound.append((campaign_id, domain, loaded.harness_sha))
+
+
+class FakeFormalLoader:
+    def __init__(self):
+        self.bindings = FakeBindings()
+        self.calls = []
+
+    def resolve_for_campaign(self, *, campaign_id, domain):
+        self.calls.append((campaign_id, domain))
+        return FakeLoadedHarness()
+
+
+def test_formal_loader_binding_and_reservations_are_consumed(tmp_path):
+    loader = FakeFormalLoader()
+    c = make_coordinator(tmp_path, formal_loader=loader)
+    result = c.run()
+    assert result["ok"] and result["status"] == "COMPLETED"
+    assert c.state["runtime_integration"] == "FORMAL_HARNESS_LOADER"
+    assert len(loader.calls) == 2
+    assert all(sha == "b" * 64 for _, _, sha in loader.bindings.bound)
+    reservations = c.runtime.reservations(c.run_id)
+    assert len(reservations) == 2
+    assert all(r["state"] == "consumed" and r["outcome"] == "succeeded"
+               for r in reservations)

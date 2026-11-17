@@ -1,23 +1,20 @@
-"""M7 -- claim decomposition, prior-art matching and HONEST novelty status.
+"""M7.1 -- prior-art assessment with evidence-limited novelty states.
 
-Novelty is NEVER claimed from semantic similarity alone. Each atomic claim is
-matched against retrieved papers; if literature coverage is insufficient, the
-status is NOT_ASSESSED / UNCERTAIN. LLM may supply hints but cannot assert
-global novelty (no literature index = cannot assert).
+Token similarity is a retrieval signal only. It is never treated as proof of
+novelty. Abstract-only coverage can downgrade a claim but cannot produce
+LIKELY_NOVEL; absence in a small corpus is not absence in the world.
 """
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-NOVELTY_STATUSES = ("KNOWN", "INCREMENTAL", "POTENTIALLY_NOVEL",
-                    "UNCERTAIN", "NOT_ASSESSED")
+NOVELTY_STATUSES = ("LIKELY_NOVEL", "POSSIBLE_PRIOR_ART", "NOT_NOVEL",
+                    "NOVELTY_UNCERTAIN")
 RELATIONS = ("SUPPORTS", "CONTRADICTS", "EXTENDS", "REPRODUCES",
              "USES", "SUPERSEDES", "UNRELATED")
-
 _CLAIM_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+|;\s*")
 
 
@@ -26,7 +23,7 @@ class AtomicClaim:
     claim_id: str
     text: str
     question_id: str
-    kind: str  # mechanism | observation | application | method | evaluation
+    kind: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -39,6 +36,7 @@ class PriorArtRelation:
     relation: str
     evidence: str
     confidence: float
+    method: str = "lexical_jaccard_screening"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -50,7 +48,9 @@ class NoveltyVerdict:
     status: str
     rationale: str
     relations: list[PriorArtRelation] = field(default_factory=list)
-    literature_check: str = "performed"
+    literature_check: str = "not_performed"
+    source_coverage: str = "ABSTRACT_ONLY"
+    limitations: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -65,7 +65,7 @@ def extract_claims(question_id: str, question: str,
     if not parts:
         parts = [text.strip()]
     out: list[AtomicClaim] = []
-    for i, p in enumerate(parts):
+    for p in parts:
         lower = p.lower()
         kind = ("mechanism" if any(k in lower for k in ("because", "mechanism",
                 "caused by", "due to")) else
@@ -89,7 +89,7 @@ def _tokens(text: str) -> set[str]:
 
 def match_prior_art(claim: AtomicClaim, papers: list[Any],
                     *, threshold: float = 0.28) -> list[PriorArtRelation]:
-    """Deterministic lexical prior-art match; always bound to a real Paper."""
+    """Lexical SCREENING only; every relation binds to a real retrieved paper."""
     ct = _tokens(claim.text)
     rels: list[PriorArtRelation] = []
     for p in papers:
@@ -115,40 +115,46 @@ def match_prior_art(claim: AtomicClaim, papers: list[Any],
 
 def assess_novelty(claims: list[AtomicClaim], papers: list[Any],
                    *, coverage: dict[str, Any],
-                   llm_hints: list[str] | None = None) -> dict[str, Any]:
-    """Return per-claim novelty. Abstain when coverage/providers insufficient."""
+                   llm_hints: list[str] | None = None,
+                   source_coverage: str = "ABSTRACT_ONLY") -> dict[str, Any]:
+    """Return evidence-limited novelty verdicts for each atomic claim."""
     cov_ok = bool(coverage.get("status") == "OK"
                   and coverage.get("n_unique_papers", 0) >= 3
                   and len(coverage.get("providers", [])) >= 1)
+    multi_source = len(coverage.get("providers", [])) >= 2
+    full_text = source_coverage.upper() == "FULL_TEXT"
     verdicts: list[NoveltyVerdict] = []
     for c in claims:
         rels = match_prior_art(c, papers)
+        limits = [f"source_coverage={source_coverage}",
+                  "lexical screening is not semantic or experimental review"]
         if not cov_ok:
-            status = "NOT_ASSESSED"
-            rationale = "literature coverage insufficient; cannot assess novelty"
+            status, rationale = ("NOVELTY_UNCERTAIN",
+                                 "literature coverage insufficient")
         elif rels and rels[0].confidence >= 0.45:
-            status = "KNOWN"
-            rationale = "strong prior-art overlap with retrieved papers"
+            status, rationale = ("NOT_NOVEL",
+                                 "strong lexical prior-art overlap screening hit")
         elif rels:
-            status = "INCREMENTAL"
-            rationale = "partial overlap; extension of known work"
-        elif len(papers) < 5:
-            status = "UNCERTAIN"
-            rationale = "too few retrieved papers to rule out prior art"
+            status, rationale = ("POSSIBLE_PRIOR_ART",
+                                 "partial prior-art screening hit")
+        elif full_text and multi_source and len(papers) >= 10:
+            status, rationale = ("LIKELY_NOVEL",
+                                 "no prior-art hit in full-text multi-source corpus")
         else:
-            status = "POTENTIALLY_NOVEL"
-            rationale = ("no prior-art match in retrieved corpus; "
-                         "NOT a claim of global novelty")
+            status, rationale = ("NOVELTY_UNCERTAIN",
+                                 "no screening hit but coverage cannot support novelty")
         verdicts.append(NoveltyVerdict(
             claim_id=c.claim_id, status=status, rationale=rationale,
             relations=rels,
-            literature_check="performed" if cov_ok else "not_performed"))
-    return {"version": "m7_novelty_v1",
+            literature_check="performed" if cov_ok else "not_performed",
+            source_coverage=source_coverage, limitations=limits))
+    return {"version": "m7_1_novelty_v1",
             "literature_check": "performed" if cov_ok else "not_performed",
+            "source_coverage": source_coverage,
             "claims": [c.to_dict() for c in claims],
             "verdicts": [v.to_dict() for v in verdicts],
             "llm_hints": list(llm_hints or []),
-            "note": "LLM hints are advisory only; never assert global novelty"}
+            "note": "Absence from a screened corpus is not global novelty."}
 
 
 __all__ = ["NOVELTY_STATUSES", "RELATIONS", "AtomicClaim",

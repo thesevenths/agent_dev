@@ -1,6 +1,6 @@
 # ARR M7 — Final Acceptance Report
 
-- Generated: 2026-11-17T15:02:19
+- Generated: 2026-11-17T16:47:18
 - Branch: `feature/arr-m7-scientific-discovery`
 - Repository HEAD: `4f647fcb7662f9bd736ca69f556f2ff1c2700a42` (dirty=True)
 - Harness SHA: `4f647fcb7662f9bd736ca69f556f2ff1c2700a42`
@@ -28,7 +28,7 @@
 | G8 | PASS | graph_sha=bb5b105bf206b82b...; claim=claim_227a5d9d8a385a29 |
 | G9 | PASS | holdout_chain=21dd5a2ce0fe9620...; replication_verdict=INCONCLUSIVE |
 | G10 | PASS | tier=candidate; memory_sha=334a9b2eeeaf8036...; unverified findings never promoted |
-| G11 | PASS | Reused M6 Research Harness RSI for shared Hypothesis Critic component (commit 4f647fcb); not re-implemented in M7 |
+| G11 | NOT_RUN | No M7 method-component promotion was executed in this E2E; M6 RSI evidence does not validate M7 components |
 
 ## 2. 真实证据链
 
@@ -49,11 +49,11 @@
 | Question Discovery | Novelty Precision | NOT_MEASURED | no external ground truth labels |
 | Question Discovery | Research Budget Efficiency | 0.6429 | from value artifact |
 | Scientific Judgment | Falsifiability Rate | 4/4 | independent critic accepted |
-| Scientific Judgment | Correct Hypothesis Rejection | 4/4 invalid LLM drafts rejected | validity only; scientific correctness NOT_MEASURED |
+| Scientific Judgment | Correct Hypothesis Rejection | NOT_MEASURED | validity only; scientific correctness NOT_MEASURED |
 | Scientific Judgment | Research Value Calibration | NOT_MEASURED | no ex-post utility labels |
 | Experiment Quality | Experiment Validity | PASS | paired arms, frozen config, guardrails ok |
 | Experiment Quality | Hypothesis Discrimination | INCONCLUSIVE | favorable direction but below MME |
-| Experiment Quality | Expected Information Gain | 0.531 | computed from competing hypotheses |
+| Experiment Quality | Expected Information Gain | 0.531 | baseline artifact value; M7.1 audit found it was a default constant |
 | Experiment Quality | Actual Information Gain | NOT_MEASURED | binary inconclusive verdict cannot quantify posterior shift |
 | Experiment Quality | Reproducibility | 12/12 SHA verified | replication executed |
 | Evidence Quality | Evidence Completeness | 12 results | all re-read from disk |

@@ -218,6 +218,14 @@ def analyse_family_confirmation(*, prereg: PreregistrationV2,
                              expected_sha_map=expected_sha_map)
     effects = agg["effects"]
     n_fam = agg["n_families"]
+    # Fail closed BEFORE any directional verdict: zero/too-few families is
+    # missing evidence, never evidence of rejection.
+    if n_fam < prereg.minimum_families or len(effects) < 2:
+        early = {"stat_version": STAT_VERSION, "verdict": "INCONCLUSIVE",
+                 "reason": "insufficient_independent_families",
+                 "n_families": n_fam,
+                 "minimum_families": prereg.minimum_families}
+        return early
     ci = _cluster_bootstrap_ci(effects, seed=prereg.seed,
                                n=prereg.n_bootstrap, alpha=prereg.alpha)
     perm = _sign_flip_p(effects)
@@ -228,10 +236,10 @@ def analyse_family_confirmation(*, prereg: PreregistrationV2,
     ci_ok = ci[0] is not None and ci[0] >= prereg.minimum_practical_effect
     sig = perm["p"] <= prereg.alpha
     n_ok = n_fam >= prereg.minimum_families
-    if power["ok"] and not power["sufficient"]:
+    if not power["ok"] or not power["sufficient"]:
         verdict = "INCONCLUSIVE"   # underpowered -> MUST stay inconclusive
     elif not (mme_ok and ci_ok and sig and n_ok):
-        verdict = "INCONCLUSIVE" if (not sig and mean_effect > 0) else "REJECTED"
+        verdict = ("INCONCLUSIVE" if mean_effect > 0 else "REJECTED")
     else:
         verdict = "ACCEPTED"
     wins = {"candidate": sum(1 for d in agg["details"]

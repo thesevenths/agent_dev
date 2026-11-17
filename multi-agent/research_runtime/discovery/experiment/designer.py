@@ -69,8 +69,12 @@ def design_experiment(*, question: Any, hypotheses: list[Any],
                       n_families_planned: int = 8,
                       seeds: list[int] | None = None) -> ExperimentProtocol:
     """Build a controlled protocol; power uses PILOT family variance, not guesses."""
+    pilot_provided = bool(pilot_effects)
     power = family_power_analysis(pilot_effects or {}, alpha=alpha,
                                   target_power=target_power)
+    power["status"] = "ASSESSED" if power.get("ok") else "NOT_ASSESSED"
+    power["blocks_confirmation"] = not power.get("ok") or not power.get(
+        "sufficient", False)
     eid = "exp_" + hashlib.sha256(
         f"{question.question_id}|{primary_metric}|{mme}".encode()).hexdigest()[:14]
     return ExperimentProtocol(
@@ -92,7 +96,11 @@ def design_experiment(*, question: Any, hypotheses: list[Any],
         minimum_meaningful_effect=mme,
         statistical_unit="task_family",
         power_analysis={"pilot": power,
-                        "planned_independent_families": n_families_planned,
+                        "pilot_effects_provided": pilot_provided,
+                        "planned_independent_families": (
+                            n_families_planned if pilot_provided else None),
+                        "declared_family_budget_without_pilot": (
+                            None if pilot_provided else n_families_planned),
                         "alpha": alpha, "target_power": target_power,
                         "seed_note": "seeds are NOT independent families"},
         random_seeds=list(seeds or [42, 43, 44, 45, 46]),

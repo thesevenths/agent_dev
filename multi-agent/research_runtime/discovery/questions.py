@@ -1,9 +1,9 @@
-"""M7 -- evidence-grounded research questions + multi-objective value assessment.
+"""M7.1 -- evidence-grounded questions and honest value assessment.
 
-Questions must cite literature/experience gaps and carry falsifiability
-requirements; value uses SEPARATE scored dimensions (no single opaque score)
-and an INFORMATION-GAIN term computed over competing hypotheses:
-    IG(E) = H(H) - E[H(H|E)]
+The M7 baseline scored value from field presence and used default EIG priors.
+That is not scientific judgment. This module makes missing evidence explicit:
+dimensions without independent support are ``NOT_ASSESSED``, and EIG requires
+an explicit hypothesis space, prior and observation model.
 """
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-VALUE_DIMENSIONS = ("scientific_significance", "novelty_gap",
-                    "falsifiability", "feasibility", "expected_impact",
-                    "reproducibility", "resource_cost")
+VALUE_DIMENSIONS = ("scientific_significance", "practical_impact", "novelty",
+                    "feasibility", "falsifiability", "expected_information_gain")
+NOT_ASSESSED = "NOT_ASSESSED"
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,9 @@ class ResearchQuestion:
     estimated_budget: dict[str, Any] = field(default_factory=dict)
     uncertainty: float = 0.5
     evidence_refs: list[str] = field(default_factory=list)
+    supporting_evidence: list[dict[str, Any]] = field(default_factory=list)
+    source_coverage: str = "UNKNOWN"
+    limitations: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -43,61 +46,98 @@ class ResearchQuestion:
         ).hexdigest()
 
 
+def _gap_text(gap: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    if isinstance(gap, str):
+        return gap, {"text": gap, "evidence_type": "unstructured_gap"}
+    text = str(gap.get("text") or gap.get("gap") or "")
+    return text, dict(gap)
+
+
 def generate_questions(*, domain: str,
                        novelty: dict[str, Any],
-                       literature_gaps: list[str],
+                       literature_gaps: list[str | dict[str, Any]],
                        failures: list[dict[str, Any]] | None = None,
-                       experiences: list[str] | None = None,
+                       experiences: list[dict[str, Any] | str] | None = None,
                        max_questions: int = 6) -> list[ResearchQuestion]:
-    """Generate questions grounded in REAL gaps/failures; no free-floating topics."""
-    out: list[ResearchQuestion] = []
-    sources: list[tuple[str, str]] = [("literature_gap", g)
-                                      for g in literature_gaps]
-    for f in failures or []:
-        sources.append(("experiment_failure", str(f.get("reason", ""))
-                        + ": " + str(f.get("detail", ""))))
-    for e in experiences or []:
-        sources.append(("verified_experience", str(e)))
-    for verdict in novelty.get("verdicts", []):
-        if verdict.get("status") in ("UNCERTAIN", "POTENTIALLY_NOVEL"):
-            sources.append(("novelty_gap", str(verdict.get("claim_id", ""))))
-    for i, (kind, text) in enumerate(sources[:max_questions]):
-        if len(text.strip()) < 8:
+    """Generate questions grounded in explicit evidence, never title strings."""
+    sources: list[dict[str, Any]] = []
+    for gap in literature_gaps:
+        text, meta = _gap_text(gap)
+        if len(text.strip()) < 12:
             continue
+        sources.append({"kind": "literature_gap", "text": text,
+                        "evidence": [meta]})
+    for f in failures or []:
+        text = f"{f.get('reason','')}: {f.get('detail','')}".strip(": ")
+        if len(text) >= 12:
+            sources.append({"kind": "experiment_failure", "text": text,
+                            "evidence": [dict(f)]})
+    for e in experiences or []:
+        text = e.get("claim", "") if isinstance(e, dict) else str(e)
+        if len(text.strip()) >= 12:
+            sources.append({"kind": "verified_experience", "text": text,
+                            "evidence": [e if isinstance(e, dict)
+                                         else {"text": e}]})
+    for verdict in novelty.get("verdicts", []):
+        if verdict.get("status") in ("POSSIBLE_PRIOR_ART", "NOVELTY_UNCERTAIN"):
+            sources.append({"kind": "novelty_gap",
+                            "text": str(verdict.get("rationale", "")),
+                            "evidence": [{"claim_id": verdict.get("claim_id")}]})
+
+    out: list[ResearchQuestion] = []
+    for i, src in enumerate(sources[:max_questions]):
+        text = src["text"]
+        digest = hashlib.sha256(text.encode()).hexdigest()[:16]
         qid = "rq_" + hashlib.sha256(
-            f"{domain}|{kind}|{text}".encode()).hexdigest()[:16]
+            f"{domain}|{src['kind']}|{text}".encode()).hexdigest()[:16]
+        coverage = ("ABSTRACT_ONLY" if novelty.get("source_coverage")
+                    == "ABSTRACT_ONLY" else novelty.get("literature_check",
+                                                        "UNKNOWN"))
+        limits = ["evidence is limited to retrieved metadata/abstracts"]
+        if src["kind"] == "verified_experience":
+            limits.append("memory applies only under its recorded conditions")
         out.append(ResearchQuestion(
             question_id=qid,
-            title=f"{domain}: {kind.replace('_',' ')} #{i+1}",
+            title=f"{domain}: {text.strip()[:100]}",
             domain=domain,
-            motivation=f"Derived from real {kind} evidence: {text[:180]}",
-            literature_gap=text if kind in ("literature_gap", "novelty_gap") else "",
+            motivation=f"Derived from real {src['kind']}: {text[:240]}",
+            literature_gap=text if src["kind"] in (
+                "literature_gap", "novelty_gap") else "",
             existing_claims=[v.get("claim_id", "") for v in
                              novelty.get("verdicts", [])
-                             if v.get("status") == "KNOWN"],
-            related_experiences=list(experiences or []),
-            expected_contribution=f"Resolve {kind} with a falsifiable experiment",
+                             if v.get("status") == "NOT_NOVEL"],
+            related_experiences=[e.get("memory_id", str(e)[:40])
+                                 for e in (experiences or [])
+                                 if src["kind"] == "verified_experience"],
+            expected_contribution=(
+                f"Resolve {src['kind']} with a falsifiable experiment"),
             falsifiability_requirements=[
-                "state observable prediction with metric and direction",
-                "state result that would refute the proposed mechanism"],
+                "state one observable metric and predicted direction",
+                "state an executable result that would refute the mechanism"],
             estimated_budget={"max_campaign_rounds": 1, "max_jobs": 8},
             uncertainty=0.5,
-            evidence_refs=[f"{kind}:{hashlib.sha256(text.encode()).hexdigest()[:16]}"]))
+            evidence_refs=[f"{src['kind']}:{digest}"],
+            supporting_evidence=src["evidence"],
+            source_coverage=coverage,
+            limitations=limits))
     return out
 
 
 @dataclass(frozen=True)
 class ValueAssessment:
     question_id: str
-    scores: dict[str, float]
-    uncertainties: dict[str, float]
+    scores: dict[str, Any]
+    uncertainties: dict[str, Any]
     rationales: dict[str, str]
     evidence_refs: list[str]
+    assessment_methods: dict[str, str]
+    limitations: list[str]
     evaluator_version: str
-    expected_information_gain: float
-    budget_efficiency: float
-    priority: float
+    expected_information_gain: Any
+    budget_efficiency: Any
+    priority: Any
     decision: str
+    status: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -109,57 +149,150 @@ def _entropy(probs: list[float]) -> float:
 
 def expected_information_gain(h_prior: list[float],
                               h_posterior: list[float]) -> float:
-    """IG(E)=H(H)-E[H(H|E)]. Inputs are normalised hypothesis probabilities."""
+    """Pure entropy reduction; callers must supply REAL distributions."""
     if not h_prior or len(h_prior) != len(h_posterior):
-        return 0.0
+        raise ValueError("prior/posterior must be non-empty and equal length")
     sp, sq = sum(h_prior), sum(h_posterior)
     if sp <= 0 or sq <= 0:
-        return 0.0
-    before = _entropy([p / sp for p in h_prior])
-    after = _entropy([q / sq for q in h_posterior])
-    return max(0.0, before - after)
+        raise ValueError("probabilities must sum to a positive value")
+    return max(0.0, _entropy([p / sp for p in h_prior])
+               - _entropy([q / sq for q in h_posterior]))
 
 
-EVALUATOR_VERSION = "m7_value_v1"
+def expected_information_gain_from_model(*, hypotheses: list[str],
+                                         priors: list[float],
+                                         likelihoods: dict[str, list[float]]
+                                         ) -> dict[str, Any]:
+    """EIG(a)=E_y[KL(p(H|D,y,a)||p(H|D))] with explicit observation model."""
+    if len(hypotheses) < 2 or len(priors) != len(hypotheses) or not likelihoods:
+        return {"status": NOT_ASSESSED, "reason": "incomplete_probability_model"}
+    if any(abs(sum(p) - 1.0) > 1e-6 for p in [priors]
+           + list(likelihoods.values())):
+        return {"status": NOT_ASSESSED, "reason": "probabilities_not_normalized"}
+    n_out = len(next(iter(likelihoods.values())))
+    if any(len(v) != n_out for v in likelihoods.values()):
+        return {"status": NOT_ASSESSED, "reason": "inconsistent_outcome_space"}
+    eig = 0.0
+    posterior_rows: list[dict[str, Any]] = []
+    for y in range(n_out):
+        p_y = sum(float(priors[h]) * float(likelihoods[hypotheses[h]][y])
+                  for h in range(len(hypotheses)))
+        if p_y <= 0:
+            continue
+        posterior = [float(priors[h]) * float(likelihoods[hypotheses[h]][y]) / p_y
+                     for h in range(len(hypotheses))]
+        kl = sum(posterior[h] * math.log2(max(posterior[h], 1e-12)
+                                          / max(float(priors[h]), 1e-12))
+                 for h in range(len(hypotheses)))
+        eig += p_y * kl
+        posterior_rows.append({"outcome_index": y, "p_y": p_y,
+                               "posterior": posterior})
+    return {"status": "ASSESSED", "value": round(eig, 6),
+            "hypotheses": list(hypotheses), "priors": list(priors),
+            "observation_model": {k: list(v) for k, v in likelihoods.items()},
+            "posteriors": posterior_rows,
+            "method": "explicit_observation_model_kl"}
+
+
+EVALUATOR_VERSION = "m7_1_evidence_value_v1"
+
+
+def _measured_dimensional_evidence(q: ResearchQuestion, dimension: str,
+                                   novelty: dict[str, Any],
+                                   evidence_map: dict[str, Any]
+                                   ) -> dict[str, Any]:
+    ev = evidence_map.get(dimension, {})
+    if dimension == "novelty":
+        if novelty.get("literature_check") != "performed":
+            return {"ok": False, "reason": "literature_check_not_performed"}
+        statuses = [v.get("status") for v in novelty.get("verdicts", [])]
+        return {"ok": bool(statuses),
+                "score": 0.7 if "POSSIBLE_PRIOR_ART" in statuses else 0.2,
+                "evidence": statuses}
+    if dimension == "falsifiability":
+        reqs = q.falsifiability_requirements
+        ok = (len(reqs) >= 2
+              and any(any(t in r.lower() for t in ("metric", "mse", "rate",
+                                                  "error", "increase",
+                                                  "decrease")) for r in reqs)
+              and any(any(t in r.lower() for t in ("refut", "reject", "fail"))
+                      for r in reqs))
+        return {"ok": ok, "score": 0.8 if ok else None, "evidence": list(reqs)}
+    if dimension == "feasibility":
+        ok = bool(q.estimated_budget) and bool(ev.get("engine_capability_check"))
+        return {"ok": ok, "score": 0.7 if ok else None,
+                "evidence": ev.get("engine_capability_check", [])}
+    if dimension in ("scientific_significance", "practical_impact"):
+        evidence = [e for e in q.supporting_evidence
+                    if str(e.get("evidence_type", "")).lower()
+                    not in ("unstructured_gap", "")]
+        ok = bool(evidence) and bool(ev.get("independent_review"))
+        return {"ok": ok, "score": 0.7 if ok else None,
+                "evidence": evidence + ev.get("independent_review", [])}
+    return {"ok": False, "reason": "no_assessment_method"}
 
 
 def assess_value(q: ResearchQuestion, *, novelty: dict[str, Any],
-                 cost_units: float = 1.0,
-                 h_prior: list[float] | None = None,
-                 h_posterior: list[float] | None = None) -> ValueAssessment:
-    """Deterministic multi-dimensional scoring with evidence refs and rationale."""
-    statuses = [v.get("status") for v in novelty.get("verdicts", [])]
-    novel_gap = 1.0 if "POTENTIALLY_NOVEL" in statuses else (
-        0.5 if "UNCERTAIN" in statuses else 0.1)
-    scores = {
-        "scientific_significance": 0.8 if q.expected_contribution else 0.3,
-        "novelty_gap": novel_gap,
-        "falsifiability": (1.0 if len(q.falsifiability_requirements) >= 2
-                           else 0.2),
-        "feasibility": 0.7 if q.estimated_budget else 0.3,
-        "expected_impact": 0.6 if q.related_experiences else 0.4,
-        "reproducibility": 0.6 if q.evidence_refs else 0.2,
-        "resource_cost": max(0.0, 1.0 - min(1.0, cost_units / 10.0)),
-    }
-    ig = expected_information_gain(h_prior or [0.5, 0.5],
-                                   h_posterior or [0.9, 0.1])
-    efficiency = (sum(v for k, v in scores.items() if k != "resource_cost")
-                  / len(scores)) / max(0.1, cost_units)
-    priority = 0.5 * ig + 0.3 * scores["novelty_gap"] + 0.2 * efficiency
-    decision = ("PROMISING" if priority >= 0.55 else "EXPLORATORY"
-                if priority >= 0.3 else "DEPRIORITIZED")
+                 evidence_map: dict[str, Any] | None = None,
+                 eig: dict[str, Any] | None = None) -> ValueAssessment:
+    """Score only dimensions with independent evidence; never invent priors."""
+    evidence_map = evidence_map or {}
+    scores: dict[str, Any] = {}
+    rationales: dict[str, str] = {}
+    methods: dict[str, str] = {}
+    refs = list(q.evidence_refs)
+    for dimension in VALUE_DIMENSIONS[:-1]:
+        result = _measured_dimensional_evidence(q, dimension, novelty,
+                                                evidence_map)
+        if result["ok"]:
+            scores[dimension] = result["score"]
+            rationales[dimension] = (f"assessed from {len(result['evidence'])} "
+                                     f"independent evidence item(s)")
+            methods[dimension] = "evidence_gate_v1"
+            refs.extend(str(x)[:120] for x in result["evidence"][:4])
+        else:
+            scores[dimension] = NOT_ASSESSED
+            rationales[dimension] = result.get("reason", "insufficient_evidence")
+            methods[dimension] = "fail_closed"
+    eig_result = eig or {"status": NOT_ASSESSED,
+                         "reason": "no_explicit_observation_model"}
+    if eig_result.get("status") == "ASSESSED":
+        scores["expected_information_gain"] = eig_result["value"]
+        rationales["expected_information_gain"] = eig_result["method"]
+        methods["expected_information_gain"] = "explicit_observation_model_kl"
+    else:
+        scores["expected_information_gain"] = NOT_ASSESSED
+        rationales["expected_information_gain"] = eig_result.get("reason", "")
+        methods["expected_information_gain"] = "fail_closed"
+
+    numeric = [v for v in scores.values() if isinstance(v, (int, float))
+               and not isinstance(v, bool)]
+    complete = all(v != NOT_ASSESSED for v in scores.values())
+    status = "ASSESSED" if complete else NOT_ASSESSED
+    priority = round(sum(numeric) / len(numeric), 6) if numeric and complete \
+        else None
+    efficiency = round(priority / max(1.0, float(
+        q.estimated_budget.get("max_jobs", 1))), 6) if priority is not None \
+        else None
+    decision = ("PROMISING" if priority is not None and priority >= 0.65 else
+                "EXPLORATORY" if priority is not None and priority >= 0.4 else
+                NOT_ASSESSED if priority is None else "DEPRIORITIZED")
     return ValueAssessment(
         question_id=q.question_id, scores=scores,
-        uncertainties={k: 0.2 for k in scores},
-        rationales={k: f"rule-based from {q.question_id} evidence"
-                    for k in scores},
-        evidence_refs=list(q.evidence_refs),
+        uncertainties={k: (0.2 if isinstance(v, (int, float))
+                           and not isinstance(v, bool) else NOT_ASSESSED)
+                       for k, v in scores.items()},
+        rationales=rationales, evidence_refs=refs,
+        assessment_methods=methods, limitations=list(q.limitations),
         evaluator_version=EVALUATOR_VERSION,
-        expected_information_gain=round(ig, 4),
-        budget_efficiency=round(efficiency, 4),
-        priority=round(priority, 4), decision=decision)
+        expected_information_gain=scores["expected_information_gain"],
+        budget_efficiency=efficiency, priority=priority,
+        decision=decision, status=status)
 
 
-__all__ = ["VALUE_DIMENSIONS", "EVALUATOR_VERSION", "ResearchQuestion",
-           "ValueAssessment", "generate_questions", "assess_value",
-           "expected_information_gain"]
+__all__ = [
+    "VALUE_DIMENSIONS", "NOT_ASSESSED", "EVALUATOR_VERSION",
+    "ResearchQuestion", "ValueAssessment", "generate_questions",
+    "expected_information_gain", "expected_information_gain_from_model",
+    "assess_value",
+]

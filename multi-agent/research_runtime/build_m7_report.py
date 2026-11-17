@@ -88,8 +88,8 @@ def build_report(run_dir: Path, repo: Path) -> tuple[str, dict[str, Any]]:
         ("G10", "PASS" if memory.get("memory_sha") else "FAIL",
          f"tier={memory['tier']}; memory_sha={memory['memory_sha'][:16]}...; "
          "unverified findings never promoted"),
-        ("G11", "PASS", "Reused M6 Research Harness RSI for shared Hypothesis "
-         "Critic component (commit 4f647fcb); not re-implemented in M7"),
+        ("G11", "NOT_RUN", "No M7 method-component promotion was executed in "
+         "this E2E; M6 RSI evidence does not validate M7 components"),
     ]
 
     qa = [
@@ -170,11 +170,14 @@ def build_report(run_dir: Path, repo: Path) -> tuple[str, dict[str, Any]]:
     lines.append("| Question Discovery | Novelty Precision | NOT_MEASURED | no external ground truth labels |")
     lines.append(f"| Question Discovery | Research Budget Efficiency | {_fmt(value['assessments'][0]['budget_efficiency'])} | from value artifact |")
     lines.append(f"| Scientific Judgment | Falsifiability Rate | {hyps_accepted}/{len(hyps['hypotheses'])} | independent critic accepted |")
-    lines.append("| Scientific Judgment | Correct Hypothesis Rejection | 4/4 invalid LLM drafts rejected | validity only; scientific correctness NOT_MEASURED |")
+    proposals = hyps.get("llm_proposals", [])
+    rejected = sum(1 for p in proposals if p.get("status") == "REJECTED")
+    rejection_value = f"{rejected}/{len(proposals)}" if proposals else "NOT_MEASURED"
+    lines.append(f"| Scientific Judgment | Correct Hypothesis Rejection | {rejection_value} | validity only; scientific correctness NOT_MEASURED |")
     lines.append("| Scientific Judgment | Research Value Calibration | NOT_MEASURED | no ex-post utility labels |")
     lines.append("| Experiment Quality | Experiment Validity | PASS | paired arms, frozen config, guardrails ok |")
     lines.append("| Experiment Quality | Hypothesis Discrimination | INCONCLUSIVE | favorable direction but below MME |")
-    lines.append(f"| Experiment Quality | Expected Information Gain | {_fmt(value['assessments'][0]['expected_information_gain'])} | computed from competing hypotheses |")
+    lines.append(f"| Experiment Quality | Expected Information Gain | {_fmt(value['assessments'][0]['expected_information_gain'])} | baseline artifact value; M7.1 audit found it was a default constant |")
     lines.append("| Experiment Quality | Actual Information Gain | NOT_MEASURED | binary inconclusive verdict cannot quantify posterior shift |")
     lines.append(f"| Experiment Quality | Reproducibility | {evidence['verification']['n_checked']}/{evidence['verification']['n_checked']} SHA verified | replication executed |")
     lines.append(f"| Evidence Quality | Evidence Completeness | {evidence['verification']['n_checked']} results | all re-read from disk |")

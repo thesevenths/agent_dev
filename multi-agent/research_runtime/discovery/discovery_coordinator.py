@@ -36,7 +36,9 @@ from .literature import (CrossrefProvider, LiteratureStore, OpenAlexProvider,
 from .literature.base import ResearchQuestionInput
 from .memory import ResearchMemoryRecord, VerifiedResearchMemory
 from .novelty.assessor import assess_novelty, extract_claims
-from .questions import ResearchQuestion, assess_value, generate_questions
+from .questions import (ResearchQuestion, assess_value,
+                        expected_information_gain_from_model,
+                        generate_questions)
 from .schema import install_m7_schema
 from .experiment.designer import (design_experiment, freeze_preregistration,
                                   verify_preregistration)
@@ -50,7 +52,7 @@ STAGES = (
     "EXPERIENCE_UPDATE", "DISCOVERY_COMPLETE",
 )
 TERMINAL = {"COMPLETED", "FAILED", "BLOCKED", "INCONCLUSIVE", "REFUTED"}
-PROTOCOL_VERSION = "m7_discovery_v1"
+PROTOCOL_VERSION = "m7_1_capability_validation_v1"
 
 
 class DiscoveryBlocked(RuntimeError):
@@ -89,6 +91,9 @@ class DiscoveryCoordinator:
                  replication_seeds: list[int] | None = None,
                  global_budget: int = 2,
                  harness_sha: str = "",
+                 formal_loader: Any | None = None,
+                 pilot_effects: dict[str, float] | None = None,
+                 evidence_map: dict[str, Any] | None = None,
                  max_requests: int = 12):
         self.run_id = run_id
         self.db = db
@@ -111,6 +116,9 @@ class DiscoveryCoordinator:
         self.replication_seeds = list(replication_seeds or [45, 46])
         self.global_budget = int(global_budget)
         self.harness_sha = harness_sha
+        self.formal_loader = formal_loader
+        self.pilot_effects = dict(pilot_effects or {})
+        self.evidence_map = dict(evidence_map or {})
         self.max_requests = int(max_requests)
         install_m7_schema(self.db)
         self.runtime = RuntimeState(db=db)
@@ -138,7 +146,9 @@ class DiscoveryCoordinator:
             "selection_seeds": self.selection_seeds,
             "replication_seeds": self.replication_seeds,
             "budget": self.global_budget, "harness_sha": self.harness_sha,
-            "dataset_shas": self.dataset_shas}
+            "dataset_shas": self.dataset_shas,
+            "formal_loader_present": self.formal_loader is not None,
+            "pilot_effects_present": bool(self.pilot_effects)}
         self.config_sha = config_sha(self.config)
 
     # --------------------------------------------------------------- helpers
@@ -231,6 +241,34 @@ class DiscoveryCoordinator:
             "reservation_id": rid, "campaign_id": campaign_id}
         return rid
 
+    def _resolve_formal_harness(self, campaign_id: str) -> dict[str, Any]:
+        """Resolve a campaign through M6 HarnessLoader when one is injected."""
+        if self.formal_loader is None:
+            return {"mode": "LOCAL_DIRECT_EXECUTOR", "ok": True,
+                    "note": "no formal loader injected; runtime integration is "
+                            "PARTIAL and must not be reported as full"}
+        loaded = self.formal_loader.resolve_for_campaign(
+            campaign_id=campaign_id, domain=self.domain)
+        binding = {"campaign_id": campaign_id,
+                   "harness_sha": loaded.harness_sha,
+                   "component_shas": dict(loaded.component_shas),
+                   "parent_sha": loaded.parent_sha,
+                   "activation_id": loaded.activation_id}
+        bindings = getattr(self.formal_loader, "bindings", None)
+        if bindings is not None and hasattr(bindings, "bind"):
+            bindings.bind(campaign_id=campaign_id, domain=self.domain,
+                          loaded=loaded)
+        self.state.setdefault("harness_bindings", {})[campaign_id] = binding
+        return {"mode": "FORMAL_HARNESS_LOADER", "ok": True, **binding}
+
+    def _consume_reservation(self, stage: str, outcome: str) -> None:
+        rec = self.state.get("reservations", {}).get(stage)
+        if not rec:
+            return
+        self.runtime.consume_reservation(self.run_id, rec["reservation_id"],
+                                         outcome=outcome)
+        rec["outcome"] = outcome
+
     # ---------------------------------------------------------------- stages
     def _start(self) -> dict[str, Any]:
         existing = self.runtime.run(self.run_id)
@@ -250,6 +288,9 @@ class DiscoveryCoordinator:
         journal = self.runtime.verify_journal(self.run_id)
         if not journal["ok"]:
             raise DiscoveryBlocked("runtime_journal_tampered")
+        self.state["runtime_integration"] = (
+            "FORMAL_HARNESS_LOADER" if self.formal_loader is not None
+            else "PARTIAL_LOCAL_DIRECT_EXECUTOR")
         return {"ok": True, "config_sha": self.config_sha,
                 "dataset": self.dataset, "journal": journal,
                 "protocol_version": PROTOCOL_VERSION}
@@ -306,9 +347,9 @@ class DiscoveryCoordinator:
                     traj.content).get("hints", [])]
             except (ValueError, TypeError):
                 hints = []
-        result = assess_novelty(claims, papers,
-                                coverage=literature["coverage"],
-                                llm_hints=hints)
+        result = assess_novelty(
+            claims, papers, coverage=literature["coverage"],
+            llm_hints=hints, source_coverage="ABSTRACT_ONLY")
         frozen = self._freeze("novelty", result)
         return {"ok": True, "novelty_sha": frozen["sha256"],
                 "literature_check": result["literature_check"],
@@ -317,33 +358,89 @@ class DiscoveryCoordinator:
     def _questions(self) -> dict[str, Any]:
         literature = self.state["artifacts"]["literature"]["obj"]
         novelty = self.state["artifacts"]["novelty"]["obj"]
-        gaps = [f"retrieved evidence: {p['title']}" for p in
-                literature["papers"][:5]] or ["insufficient literature coverage"]
+        gaps: list[dict[str, Any]] = []
+        for p in literature["papers"][:8]:
+            abstract = str(p.get("abstract") or "").strip()
+            if len(abstract) < 40:
+                continue
+            gaps.append({
+                "text": abstract[:500],
+                "paper_id": p.get("paper_id", ""),
+                "doi": p.get("doi", ""),
+                "title": p.get("title", ""),
+                "evidence_type": "ABSTRACT_SNIPPET",
+                "source": p.get("source", ""),
+                "query_id": p.get("query_id", ""),
+            })
+        if not gaps:
+            gaps = [{"text": "no usable abstract evidence was retrieved",
+                     "evidence_type": "MISSING_EVIDENCE"}]
+
+        # Memory must be actively queried and its use (or exclusion) recorded.
+        retrieved = self.memory.retrieve(
+            domain=self.domain,
+            problem=str(self.state.get("literature_input", {}).get("question", "")),
+            top=5)
+        experiences = [{"memory_id": r["memory_id"], "claim": r["rationale"],
+                        "confidence": r["confidence"],
+                        "conditions": r["applicability"]} for r in retrieved]
+        memory_trace = {
+            "retrieved_ids": [r["memory_id"] for r in retrieved],
+            "used_ids": [r["memory_id"] for r in experiences],
+            "excluded": [],
+            "reason": ("no verified memory passed the claim gate" if not retrieved
+                       else "retrieved records grounded question variants"),
+        }
+        self._freeze("question_memory_trace", memory_trace)
+
         questions = generate_questions(
             domain=self.domain, novelty=novelty, literature_gaps=gaps,
-            experiences=[], max_questions=4)
+            experiences=experiences, max_questions=4)
         if not questions:
             raise DiscoveryBlocked("no_evidence_grounded_questions")
         frozen = self._freeze("questions", [q.to_dict() for q in questions])
         self.state["questions"] = [q.to_dict() for q in questions]
+        self.state["question_memory_trace"] = memory_trace
         return {"ok": True, "questions_sha": frozen["sha256"],
-                "n_questions": len(questions), "ids": [q.question_id
-                                                      for q in questions]}
+                "n_questions": len(questions),
+                "source_coverage": questions[0].source_coverage,
+                "memory_used": len(experiences),
+                "ids": [q.question_id for q in questions]}
 
     def _value(self) -> dict[str, Any]:
         novelty = self.state["artifacts"]["novelty"]["obj"]
         questions = [ResearchQuestion(**q) for q in self.state["questions"]]
+        eig_model = self.evidence_map.get("eig")
+        eig_result = (expected_information_gain_from_model(**eig_model)
+                      if isinstance(eig_model, dict) else None)
+        evidence_map = dict(self.evidence_map)
+        evidence_map.setdefault("feasibility", {})["engine_capability_check"] = [
+            {"dataset_version": self.dataset["dataset_version"],
+             "family_isolation": self.dataset["family_isolation"]["ok"]}]
         assessments = [assess_value(q, novelty=novelty,
-                                    cost_units=1.0).to_dict() for q in questions]
-        ranked = sorted(zip(assessments, questions),
-                        key=lambda av: (-av[0]["priority"], av[1].question_id))
+                                    evidence_map=evidence_map,
+                                    eig=eig_result).to_dict()
+                       for q in questions]
+        def sort_key(item):
+            a, q = item
+            priority = a.get("priority")
+            return (0 if isinstance(priority, (int, float)) else 1,
+                    -(priority or 0.0), q.question_id)
+        ranked = sorted(zip(assessments, questions), key=sort_key)
         selected = ranked[0][1]
-        frozen = self._freeze("value", {"assessments": assessments,
-                                        "selected_question_id":
-                                        selected.question_id})
+        selection_basis = ("EVIDENCE_BASED_PRIORITY" if
+                           isinstance(ranked[0][0].get("priority"), (int, float))
+                           else "NO_VALUE_EVIDENCE_FALLBACK")
+        frozen = self._freeze("value", {
+            "assessments": assessments,
+            "selected_question_id": selected.question_id,
+            "selection_basis": selection_basis,
+            "eig_status": (eig_result or {}).get("status", "NOT_ASSESSED")})
         self.state["selected_question"] = selected.to_dict()
+        self.state["selection_basis"] = selection_basis
         return {"ok": True, "value_sha": frozen["sha256"],
                 "selected": selected.question_id,
+                "selection_basis": selection_basis,
                 "priorities": [a["priority"] for a in assessments]}
 
     def _hypotheses(self) -> dict[str, Any]:
@@ -354,13 +451,15 @@ class DiscoveryCoordinator:
         base = generate_competing_hypotheses(q, literature_refs=refs)
         original_hyps = base
         llm_hyps: list[ScientificHypothesis] | None = None
-        llm_used = False
+        llm_proposals: list[dict[str, Any]] = []
         if self.agent is not None:
             traj = self.agent.call(
                 prompt=("Propose competing mechanisms, observable predictions "
                         "and executable falsification conditions as JSON with "
-                        "keys H1,H2,H3,H0. Question: " + q.title + "\n"
-                        "Literature: " + json.dumps(refs)),
+                        "keys H1,H2,H3,H0. Research question: " + q.title
+                        + "\nMotivation: " + q.motivation
+                        + "\nGap: " + q.literature_gap
+                        + "\nLiterature: " + json.dumps(refs)),
                 system="You are a skeptical scientist. Every hypothesis must "
                        "be falsifiable and mechanism-distinct.",
                 toolset=["literature_store", "scientific_hypothesis_engine"],
@@ -385,21 +484,48 @@ class DiscoveryCoordinator:
                         if isinstance(fals, list) and fals:
                             hdata["falsifying_observations"] = [str(x) for x in fals]
                 candidate = [ScientificHypothesis(**hdata) for hdata in data]
-                candidate_reviewed = review_all(
-                    candidate, critic=IndependentCritic())
-                if all(h.status == "ACCEPTED" for h in candidate_reviewed):
+                candidate_reviewed = review_all(candidate)
+                adopted = all(h.status == "ACCEPTED"
+                              for h in candidate_reviewed)
+                llm_proposals = [{
+                    "proposal_id": f"llmprop_{traj.trajectory_id[:12]}_{h.kind}",
+                    "kind": h.kind,
+                    "trajectory_id": traj.trajectory_id,
+                    "prompt_sha256": traj.prompt_sha256,
+                    "model_id": traj.model_id,
+                    "status": reviewed.status,
+                    "critic_errors": reviewed.review_errors,
+                    "critic_model": reviewed.critique.get("critic_model", ""),
+                    "adopted": adopted,
+                } for h, reviewed in zip(candidate, candidate_reviewed)]
+                if adopted:
                     llm_hyps = candidate
-                    llm_used = traj.ok
             except (ValueError, TypeError):
-                llm_used = False
+                llm_proposals = [{
+                    "proposal_id": "llmprop_parse_failure",
+                    "kind": "*", "trajectory_id": traj.trajectory_id,
+                    "prompt_sha256": traj.prompt_sha256,
+                    "model_id": traj.model_id, "status": "REJECTED",
+                    "critic_errors": ["llm_output_parse_failed"],
+                    "adopted": False}]
         base = llm_hyps or original_hyps
-        reviewed = review_all(base, critic=IndependentCritic())
+        reviewed = review_all(base)
         accepted = [h for h in reviewed if h.status == "ACCEPTED"]
-        if len(accepted) < 4:
+        competition = IndependentCritic().review_competition(reviewed)
+        if len(accepted) < 4 or not competition["ok"]:
             raise DiscoveryBlocked("hypothesis_competition_incomplete")
+        llm_used = any(p["adopted"] for p in llm_proposals)
         frozen = self._freeze("hypotheses", {
-            "llm_used": llm_used, "hypotheses": [h.to_dict() for h in reviewed]})
+            "llm_proposed": bool(llm_proposals),
+            "llm_used": llm_used,
+            "llm_proposals": llm_proposals,
+            "proposal_acceptance_rate": (
+                sum(1 for p in llm_proposals if p["status"] == "ACCEPTED")
+                / len(llm_proposals) if llm_proposals else None),
+            "competition": competition,
+            "hypotheses": [h.to_dict() for h in reviewed]})
         self.state["hypotheses"] = [h.to_dict() for h in reviewed]
+        self.state["llm_decision_ledger"] = llm_proposals
         return {"ok": True, "hypotheses_sha": frozen["sha256"],
                 "llm_used": llm_used, "accepted": len(accepted),
                 "kinds": sorted(h.kind for h in accepted)}
@@ -413,15 +539,19 @@ class DiscoveryCoordinator:
             family_manifest_sha=fm["family_manifest_sha"],
             split_manifest_sha=self.dataset["dataset_manifest_sha"],
             dataset_manifest_sha=self.dataset["dataset_manifest_sha"],
-            primary_metric=self.config["dataset_shas"].get(
-                "primary_metric", "state_mse@1"),
-            mme=self.mme, seeds=self.seeds)
+            primary_metric="state_mse@1",
+            mme=self.mme, pilot_effects=self.pilot_effects or None,
+            seeds=self.seeds)
         frozen = self._freeze("experiment_protocol", protocol.to_dict())
         self.state["protocol"] = protocol.to_dict()
+        power = protocol.power_analysis
+        if power.get("pilot", {}).get("blocks_confirmation"):
+            self.state["power_gate"] = "NOT_ASSESSED"
         return {"ok": True, "experiment_id": protocol.experiment_id,
                 "experiment_sha": frozen["sha256"],
                 "primary_metric": protocol.primary_metric,
-                "mme": protocol.minimum_meaningful_effect}
+                "mme": protocol.minimum_meaningful_effect,
+                "power_status": power.get("pilot", {}).get("status")}
 
     def _preregistration(self) -> dict[str, Any]:
         protocol_data = self.state["protocol"]
@@ -448,15 +578,19 @@ class DiscoveryCoordinator:
     def _execute_selection(self) -> dict[str, Any]:
         protocol = self.state["protocol"]
         campaign_id = "m7sel_" + self.state["preregistration_sha"][:20]
+        harness_binding = self._resolve_formal_harness(campaign_id)
         reservation = self._reserve("EXPERIMENT_EXECUTION", campaign_id)
         arms = ["baseline", "action_conditioned", "capacity_control"]
         result = self.executor(
             experiment_id=protocol["experiment_id"] + "_selection",
             arms=arms, seeds=self.selection_seeds, splits=["validation"],
             out_dir=str(self.root / "experiments" / "selection"))
+        outcome = "succeeded" if result.get("ok") else "failed"
+        self._consume_reservation("EXPERIMENT_EXECUTION", outcome)
         self.state["selection_campaign"] = campaign_id
         return {"ok": True, "campaign_id": campaign_id,
-                "reservation_id": reservation,
+                "reservation_id": reservation, "reservation_outcome": outcome,
+                "harness_binding": harness_binding,
                 **{k: v for k, v in result.items() if k != "summary"}}
 
     def _evidence(self) -> dict[str, Any]:
@@ -530,12 +664,15 @@ class DiscoveryCoordinator:
         if not chain["ok"]:
             raise DiscoveryBlocked("holdout_ledger_broken")
         campaign_id = "m7rep_" + self.state["preregistration_sha"][:20]
+        harness_binding = self._resolve_formal_harness(campaign_id)
         reservation = self._reserve("REPLICATION", campaign_id)
         result = self.executor(
             experiment_id=protocol["experiment_id"] + "_replication",
             arms=["baseline", "action_conditioned"],
             seeds=self.replication_seeds, splits=["test", "ood"],
             out_dir=str(self.root / "experiments" / "replication"))
+        outcome = "succeeded" if result.get("ok") else "failed"
+        self._consume_reservation("REPLICATION", outcome)
         source = self.root / "experiments" / "replication" / "engine_results.json"
         raw = json.loads(source.read_text(encoding="utf-8"))
         from .domain_packs.embodied_world_model import evaluator
@@ -543,9 +680,11 @@ class DiscoveryCoordinator:
         evaluation = self.pack.evaluate(
             results=raw, primary_metric="state_mse@1", mme=self.mme)
         safety = self.pack.safety_check(results=raw)
-        evidence_sha = sha256_file(source)
         verdict = evaluation["per_arm"].get("action_conditioned", {}).get(
             "verdict", "INCONCLUSIVE")
+        if self.state.get("power_gate") == "NOT_ASSESSED":
+            verdict = "INCONCLUSIVE"
+        evidence_sha = sha256_file(source)
         frozen = self._freeze("replication", {
             "replication_sha": evidence_sha,
             "holdout_authorization": auth, "holdout_chain": chain,
@@ -557,7 +696,8 @@ class DiscoveryCoordinator:
             raise DiscoveryBlocked("replication_evidence_invalid")
         self.state["replication_verdict"] = verdict
         return {"ok": True, "campaign_id": campaign_id,
-                "reservation_id": reservation,
+                "reservation_id": reservation, "reservation_outcome": outcome,
+                "harness_binding": harness_binding,
                 "replication_sha": evidence_sha,
                 "artifact_sha": frozen["sha256"],
                 "holdout_chain_sha": chain["chain_sha"], "verdict": verdict,
