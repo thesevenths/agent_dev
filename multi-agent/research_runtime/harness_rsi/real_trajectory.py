@@ -99,7 +99,8 @@ def run_real_trajectory(*, benchmark_task: Any, harness: HarnessBundle,
                         arm: str, out_dir: str | Path,
                         component_config: dict[str, Any],
                         seed: int | None = None,
-                        domain_override: str = "") -> dict[str, Any]:
+                        domain_override: str = "",
+                        harness_loader: Any = None) -> dict[str, Any]:
     """Execute ONE real arm; return a SHA-bound trajectory + research result."""
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -169,7 +170,8 @@ def run_real_trajectory(*, benchmark_task: Any, harness: HarnessBundle,
     result = run_research_task(
         task, harness=None, run_root=str(arm_root),
         approved_by=f"m61_smoke_{arm}", experiences=None,
-        hypothesis_manager_factory=factory)
+        hypothesis_manager_factory=factory,
+        harness_loader=harness_loader)
     elapsed = time.time() - started
 
     # The research harness for the production planner is the M6 base harness
@@ -220,7 +222,19 @@ def run_real_trajectory(*, benchmark_task: Any, harness: HarnessBundle,
         "domain": domain, "campaign_id": campaign_id,
         "round_id": "m61_arm", "agent_id": "production_research_service",
         "agent_model": AGENT_MODEL, "agent_model_version": "v1",
-        "harness_sha": harness.sha256,
+        # M6.1-fix-C: when a formal loader is wired, the authority is the REAL
+        # SHA pinned into the campaign by the Dispatcher (read back from the
+        # persisted campaign record), NOT the caller's bundle object.
+        "harness_sha": (str(result.provenance.get("harness_sha256", ""))
+                        if harness_loader is not None
+                        and result.provenance.get("harness_sha256")
+                        else harness.sha256),
+        "harness_sha_source": ("formal_dispatcher"
+                               if harness_loader is not None
+                               and result.provenance.get("harness_sha256")
+                               else "caller_bundle"),
+        "harness_activation_id": str(
+            result.provenance.get("harness_activation_id", "")),
         "component_name": "hypothesis_critic",
         "component_sha": harness.component("hypothesis_critic").sha256,
         "parent_component_sha": "",

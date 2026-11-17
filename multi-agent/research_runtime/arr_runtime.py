@@ -496,6 +496,7 @@ def run_research_task(task: ResearchTask, *,
                       approved_by: str = "arr-1.0-operator",
                       experiences: list[str] | None = None,
                       hypothesis_manager_factory=None,
+                      harness_loader=None,
                       ) -> TaskResult:
     """Execute ONE ResearchTask end-to-end through the generic ResearchService."""
     harness = harness or BASE_HARNESS
@@ -574,7 +575,8 @@ def run_research_task(task: ResearchTask, *,
             task.domain, llm_generate=generate,
             db_path=data_dir / "research.sqlite", data_dir=data_dir,
             evidence_provider=evidence_provider, domain_policy=task_policy,
-            hypothesis_manager_factory=hypothesis_manager_factory)
+            hypothesis_manager_factory=hypothesis_manager_factory,
+            harness_loader=harness_loader)
 
         baseline_id = f"baseline_{task.task_id}"
         baseline = run_real_baseline(
@@ -642,6 +644,14 @@ def run_research_task(task: ResearchTask, *,
                 f"campaign submission rejected: "
                 f"{run.get('error_code', 'unknown')}: {run.get('error', run)}")
         campaign_id = run["campaign_id"]
+        # M6.1-fix-C: record the harness SHA that the FORMAL Dispatcher pinned
+        # into this campaign (from the real campaign record, not requested id).
+        _camp_rec = svc.deps.campaign_store.load_campaign(campaign_id)
+        result.provenance["harness_sha256"] = str(
+            getattr(_camp_rec, "harness_sha256", "") or "")
+        result.provenance["harness_activation_id"] = str(
+            (_camp_rec.run_spec.get("harness_activation_id", "")
+             if _camp_rec and isinstance(_camp_rec.run_spec, dict) else ""))
         cmp = svc.compare_research_campaign(campaign_id=campaign_id,
                                              session_id=sid)
         result.comparisons = cmp.get("comparisons", [])

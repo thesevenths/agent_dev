@@ -62,4 +62,8 @@ from .harness_loader import (
 )
 from .rollback_v2 import ROLLBACK_V2_VERSION, real_rollback
 
+from .confirmatory import (
+    CONFIRM_VERSION, ConfirmationError, freeze_candidate_for_selection,
+    run_confirmatory_holdout,
+)
 __all__ = [name for name in dir() if not name.startswith("_")]
