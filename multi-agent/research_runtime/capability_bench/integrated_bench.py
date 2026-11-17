@@ -28,14 +28,58 @@ def _parse(text: str) -> dict[str, Any]:
     return obj
 
 
-def select_tasks(cases: list[dict[str, Any]], n: int = 8
-                 ) -> list[dict[str, Any]]:
+def select_tasks(cases: list[dict[str, Any]], n: int = 8, *,
+                 seed: int = 20261117) -> list[dict[str, Any]]:
+    """Deterministically select EXACTLY n distinct cases, or fail explicitly.
+
+    M7.6 P1-D: the old quota rule could return fewer than n when the category
+    count did not divide n (e.g. 8 from 7 categories -> 7). This version keeps
+    category balance first, then tops up deterministically from the remaining
+    eligible cases, never duplicating a case and preserving the recorded seed.
+    """
+    import random
     buckets: dict[str, list[dict]] = {}
     for c in cases:
-        buckets.setdefault(c["category"], []).append(c)
-    out = []
-    for cat in sorted(buckets):
-        out.extend(buckets[cat][:max(1, n // len(buckets))])
+        buckets.setdefault(str(c.get("category", "unknown")), []).append(c)
+    # Stable order within each bucket by case_id for reproducibility.
+    for cat in buckets:
+        buckets[cat] = sorted(buckets[cat], key=lambda c: str(c.get("case_id", "")))
+    n = min(int(n), len(cases))
+    if n < 0:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(case):
+        cid = str(case.get("case_id", id(case)))
+        if cid not in seen:
+            seen.add(cid)
+            out.append(case)
+
+    cats = sorted(buckets)
+    # Round-robin across categories for balance until n is reached.
+    idx = {cat: 0 for cat in cats}
+    while len(out) < n and cats:
+        progressed = False
+        for cat in cats:
+            if len(out) >= n:
+                break
+            if idx[cat] < len(buckets[cat]):
+                _add(buckets[cat][idx[cat]])
+                idx[cat] += 1
+                progressed = True
+        if not progressed:
+            break
+    # Deterministic top-up from any remainder (should be unnecessary when
+    # len(cases) >= n, but keeps the EXACT-n guarantee explicit).
+    if len(out) < n:
+        rng = random.Random(seed)
+        rest = [c for c in cases if str(c.get("case_id", id(c))) not in seen]
+        rng.shuffle(rest)
+        for c in rest:
+            if len(out) >= n:
+                break
+            _add(c)
     return out[:n]
 
 
@@ -92,6 +136,16 @@ def run(*, cases: list[dict], ground_truth: dict[str, dict],
                 "falsifiability": int(bool(pred) and pred.get(
                     "falsifiability") == gt["falsifiability"])}
             row = {"case_id": case["case_id"], "category": case["category"],
+                   # M7.6 P1-D: family/domain/split/contamination are FIRST-CLASS
+                   # identity fields. Statistical independence is measured at
+                   # family level, never at raw-case level.
+                   "family_id": str(case.get("family_id")
+                                    or case.get("category")
+                                    or "unknown"),
+                   "domain_id": str(case.get("domain", "unknown")),
+                   "split": str(case.get("split", "development")),
+                   "contamination_group": str(
+                       case.get("contamination_group", "unknown")),
                    "group": group, "parse_ok": ok, "prediction": pred,
                    "scores": scores,
                    "prompt_tokens": traj.prompt_tokens,
@@ -108,15 +162,34 @@ def run(*, cases: list[dict], ground_truth: dict[str, dict],
     return {"n_results": len(rows), "raw_sha256": frozen["sha256"]}
 
 
-def metrics(*, results_dir: str | Path, mme: float, min_families: int
-            ) -> dict[str, Any]:
+def metrics(*, results_dir: str | Path, mme: float, min_families: int,
+            seed: int = 20261117) -> dict[str, Any]:
+    """Family-level paired analysis with cluster-aware CIs (M7.6 P1-D).
+
+    Cases from one research family are CORRELATED and are never treated as
+    independent samples. Each candidate arm is compared to A_BASE on the same
+    case_id; per-case paired differences are aggregated within family, and the
+    CI is computed by resampling WHOLE families.
+    """
+    from research_runtime.harness_rsi.evaluation import _clustered_bootstrap
+
     rows = [json.loads(p.read_text(encoding="utf-8"))
             for p in sorted((Path(results_dir) / "raw_results").glob("*.json"))]
+    by_key = {(r["case_id"], r["group"]): r for r in rows if r.get("parse_ok")}
+    base_rows = {r["case_id"]: r for r in rows
+                 if r["group"] == "A_BASE" and r.get("parse_ok")}
+    unique_families = sorted({r.get("family_id", r.get("category", "unknown"))
+                              for r in rows})
+
     per_group: dict[str, Any] = {}
     for group in GROUPS:
-        gr = [r for r in rows if r["group"] == group and r["parse_ok"]]
+        gr = [r for r in rows if r["group"] == group and r.get("parse_ok")]
+        fams = sorted({r.get("family_id", r.get("category", "unknown"))
+                       for r in gr})
         per_group[group] = {
-            "n": len(gr),
+            "n_cases": len(gr),
+            "n_families": len(fams),
+            "families": fams,
             "evidence_accuracy": sum(r["scores"]["evidence"] for r in gr)
                                  / len(gr) if gr else None,
             "novelty_accuracy": sum(r["scores"]["novelty"] for r in gr)
@@ -127,12 +200,59 @@ def metrics(*, results_dir: str | Path, mme: float, min_families: int
                                 for r in gr),
             "mean_context_chars": sum(r["context_chars"] for r in gr) / len(gr)
                                   if gr else None}
-    base = per_group["A_BASE"]["evidence_accuracy"] or 0.0
-    deltas = {g: (v["evidence_accuracy"] or 0.0) - base
-              for g, v in per_group.items() if g != "A_BASE"}
-    sufficient = all(d >= mme for d in deltas.values()) \
-        and per_group["A_BASE"]["n"] >= min_families
-    return {"version": "m7_5_metrics_v1", "n_results": len(rows),
-            "per_group": per_group, "deltas_vs_base": deltas,
-            "mme": mme, "min_families": min_families,
-            "verdict": "INCONCLUSIVE" if not sufficient else "PASS"}
+
+    # Paired per-case deltas vs A_BASE; robust to missing pairs.
+    paired: dict[str, Any] = {}
+    for group in GROUPS:
+        if group == "A_BASE":
+            continue
+        diffs: list[float] = []
+        fams: list[str] = []
+        per_family: dict[str, list[float]] = {}
+        for cid, base_r in base_rows.items():
+            cand = by_key.get((cid, group))
+            if not cand:
+                continue
+            d = float(cand["scores"]["evidence"]) - float(base_r["scores"]["evidence"])
+            fam = str(base_r.get("family_id", base_r.get("category", "unknown")))
+            diffs.append(d)
+            fams.append(fam)
+            per_family.setdefault(fam, []).append(d)
+        family_means = {f: sum(v) / len(v) for f, v in per_family.items()}
+        mean_delta = sum(diffs) / len(diffs) if diffs else None
+        ci = _clustered_bootstrap(diffs, fams, seed=seed) if diffs else [None, None]
+        paired[group] = {
+            "n_pairs": len(diffs), "n_families": len(family_means),
+            "per_family_mean_delta": family_means,
+            "mean_paired_delta": mean_delta,
+            "cluster_bootstrap_ci95": ci,
+            "ci_lower": ci[0], "ci_upper": ci[1],
+            "met_mme": (mean_delta is not None and ci[0] is not None
+                        and ci[0] >= mme),
+        }
+
+    n_families_ok = len(unique_families) >= min_families
+    all_met = n_families_ok and all(p["met_mme"] for p in paired.values()) \
+        and bool(paired)
+    result = {
+        "version": "m7_5_metrics_v2_family_clustered", "n_results": len(rows),
+        "n_unique_families": len(unique_families),
+        "families": unique_families,
+        "per_group": per_group, "paired_vs_base": paired,
+        "mme": mme, "min_families": min_families,
+        "seed": seed,
+        "n_families_ok": n_families_ok,
+    }
+    if not paired or any(p["mean_paired_delta"] is None for p in paired.values()):
+        result["verdict"] = "INCONCLUSIVE"
+        result["verdict_reason"] = "missing_paired_data"
+    elif all_met:
+        result["verdict"] = "PASS"
+        result["verdict_reason"] = "all_arms_ci_lower_above_mme"
+    elif n_families_ok:
+        result["verdict"] = "FAIL"
+        result["verdict_reason"] = "some_arms_below_mme"
+    else:
+        result["verdict"] = "INCONCLUSIVE"
+        result["verdict_reason"] = "too_few_independent_families"
+    return result

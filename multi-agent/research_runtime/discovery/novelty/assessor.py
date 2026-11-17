@@ -51,6 +51,10 @@ class NoveltyVerdict:
     literature_check: str = "not_performed"
     source_coverage: str = "ABSTRACT_ONLY"
     limitations: list[str] = field(default_factory=list)
+    # M7.6 P1-F: a lexical screen can only ever be a SCREENING signal. Global
+    # novelty is never CONFIRMED from metadata/abstracts alone.
+    evidence_grade: str = "SCREENING_ONLY"
+    confirmed_novelty: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -132,8 +136,12 @@ def assess_novelty(claims: list[AtomicClaim], papers: list[Any],
             status, rationale = ("NOVELTY_UNCERTAIN",
                                  "literature coverage insufficient")
         elif rels and rels[0].confidence >= 0.45:
-            status, rationale = ("NOT_NOVEL",
-                                 "strong lexical prior-art overlap screening hit")
+            # P1-F: lexical overlap is a prior-art SCREENING HIT, never proof
+            # of NOT_NOVEL. Downgraded from NOT_NOVEL to POSSIBLE_PRIOR_ART,
+            # which honestly signals "needs semantic/experimental review".
+            status, rationale = ("POSSIBLE_PRIOR_ART",
+                                 "strong lexical prior-art overlap (screening only; "
+                                 "NOT a confirmed non-novelty verdict)")
         elif rels:
             status, rationale = ("POSSIBLE_PRIOR_ART",
                                  "partial prior-art screening hit")
@@ -147,7 +155,9 @@ def assess_novelty(claims: list[AtomicClaim], papers: list[Any],
             claim_id=c.claim_id, status=status, rationale=rationale,
             relations=rels,
             literature_check="performed" if cov_ok else "not_performed",
-            source_coverage=source_coverage, limitations=limits))
+            source_coverage=source_coverage, limitations=limits,
+            evidence_grade="SCREENING_ONLY",
+            confirmed_novelty=False))
     return {"version": "m7_1_novelty_v1",
             "literature_check": "performed" if cov_ok else "not_performed",
             "source_coverage": source_coverage,

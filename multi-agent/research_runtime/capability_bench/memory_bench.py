@@ -96,37 +96,98 @@ def compute_metrics(*, root: str | Path, results_dir: str | Path,
           for p in sorted((root / "ground_truth").glob("*.json"))}
     rows = [json.loads(p.read_text(encoding="utf-8"))
             for p in sorted((out / "raw_results").glob("*.json"))]
+    def _truth(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        v = str(value or "").strip().upper()
+        if v in ("YES", "TRUE", "1"):
+            return True
+        if v in ("NO", "FALSE", "0"):
+            return False
+        return None
+
     per_arm: dict[str, Any] = {}
     for arm in ARMS:
         arm_rows = [r for r in rows if r["arm"] == arm and r.get("prediction")]
-        repeated = sum(1 for r in arm_rows
-                       if r["prediction"]["repeat_failure"])
+        predicted_repeats = 0
+        tp = fp = fn = tn = 0
         used_relevant = 0
         harmful = 0
+        confounders_avoided = 0
+        confounder_total = 0
         for r in arm_rows:
             truth = gt.get(r["scenario_id"], {})
+            truth_repeat = _truth(truth.get("expected_repeat_failure"))
+            pred_repeat = bool(r["prediction"]["repeat_failure"])
+            predicted_repeats += int(pred_repeat)
+            # Ground-truth-based confusion (NOT the model's own prediction).
+            if truth_repeat is not None:
+                if pred_repeat and truth_repeat:
+                    tp += 1
+                elif pred_repeat and not truth_repeat:
+                    fp += 1
+                elif not pred_repeat and truth_repeat:
+                    fn += 1
+                else:
+                    tn += 1
             used = set(r["prediction"]["used_memory_ids"])
             if arm in ("ON", "SHUFFLED"):
                 relevant = set(truth.get("relevant_memory_ids", []))
                 shuffled = set(truth.get("shuffled_memory_ids", []))
                 used_relevant += int(bool(used & relevant))
                 harmful += int(bool(used & shuffled))
+                # confounder avoidance: a scenario with a known confounder was
+                # NOT repeated and no irrelevant/shuffled memory was applied.
+                known_confounders = truth.get("relevant_memory_ids", [])
+                if known_confounders:
+                    confounder_total += 1
+                    confounders_avoided += int(
+                        (not pred_repeat) and not bool(used & shuffled))
+        n_arm = len(arm_rows)
+        repeat_correct = tp + tn
         per_arm[arm] = {
-            "n": len(arm_rows),
-            "repeated_failure_rate": round(repeated / len(arm_rows), 4)
-                                     if arm_rows else None,
-            "memory_usage_rate": round(used_relevant / len(arm_rows), 4)
-                                 if arm_rows and arm in ("ON", "SHUFFLED") else None,
-            "harmful_memory_rate": round(harmful / len(arm_rows), 4)
-                                   if arm_rows and arm in ("ON", "SHUFFLED") else None,
+            "n": n_arm,
+            # Descriptive ONLY -- this is the model's PREDICTION rate, not proof
+            # that a historical failure was actually repeated.
+            "predicted_repeat_failure_rate": round(predicted_repeats / n_arm, 4)
+                                             if n_arm else None,
+            # Ground-truth-based metrics (M7.6 P1-C fix).
+            "repeat_failure_accuracy": round(repeat_correct / n_arm, 4)
+                                       if n_arm else None,
+            "repeat_failure_confusion": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+            "confounder_avoidance_rate": round(
+                confounders_avoided / confounder_total, 4)
+                                         if confounder_total else None,
+            "memory_usage_rate": round(used_relevant / n_arm, 4)
+                                 if n_arm and arm in ("ON", "SHUFFLED") else None,
+            "harmful_memory_rate": round(harmful / n_arm, 4)
+                                   if n_arm and arm in ("ON", "SHUFFLED") else None,
             "mean_context_chars": round(sum(r["context_chars"]
-                                            for r in arm_rows) / len(arm_rows), 2)
-                                   if arm_rows else None}
-    result = {"version": "m7_3_metrics_v1", "n_results": len(rows),
+                                            for r in arm_rows) / n_arm, 2)
+                                   if n_arm else None}
+    result = {"version": "m7_3_metrics_v2_grounded", "n_results": len(rows),
               "per_arm": per_arm, "expert_review": manifest.get(
                   "expert_review", "NOT_PERFORMED")}
-    result["verdict"] = ("INCONCLUSIVE" if len(rows) < 40 or
-                         result["expert_review"] != "PERFORMED" else
-                         "PASS" if per_arm["ON"]["repeated_failure_rate"] <
-                         per_arm["OFF"]["repeated_failure_rate"] else "FAIL")
+    n_min = int(manifest.get("min_results", 40))
+    seen = {r["scenario_id"] for r in rows}
+    if len(rows) < n_min or result["expert_review"] != "PERFORMED":
+        result["verdict"] = "INCONCLUSIVE"
+        result["verdict_reason"] = "insufficient_or_unreviewed_evidence"
+    else:
+        on = per_arm["ON"]
+        off = per_arm["OFF"]
+        shuf = per_arm["SHUFFLED"]
+        # Memory is useful only if GROUNDED accuracy improves AND it beats the
+        # shuffled control; harmful usage must not exceed the shuffled arm.
+        improved = ((on["repeat_failure_accuracy"] or 0)
+                    > (off["repeat_failure_accuracy"] or 0))
+        beats_shuffle = ((on["repeat_failure_accuracy"] or 0)
+                         >= (shuf["repeat_failure_accuracy"] or 0))
+        low_harm = (on["harmful_memory_rate"] or 0) <= (shuf["harmful_memory_rate"] or 1)
+        result["verdict"] = ("PASS" if improved and beats_shuffle and low_harm
+                             else "FAIL")
+        result["verdict_reason"] = {
+            "grounded_accuracy_improved": improved,
+            "beats_shuffled_control": beats_shuffle,
+            "harm_not_increased": low_harm}
     return result

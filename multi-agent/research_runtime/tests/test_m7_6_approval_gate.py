@@ -30,6 +30,13 @@ def _fixture_coordinator(tmp_path, **overrides):
               db=ResearchDatabase(tmp_path / "approval.sqlite"),
               out_dir=tmp_path / "discovery", providers=[FakeProvider()],
               agent=FakeAgent(), executor=fake_executor,
+              evidence_map={
+                  "eig": {"hypotheses": ["H0", "H1"], "priors": [0.5, 0.5],
+                          "likelihoods": {"H0": [0.9, 0.1], "H1": [0.2, 0.8]}},
+                  "scientific_significance": {"independent_review": [
+                      {"reviewer": "test-fixture", "verdict": "RELEVANT"}]},
+                  "practical_impact": {"independent_review": [
+                      {"reviewer": "test-fixture", "verdict": "RELEVANT"}]}},
               pilot_effects={"e1": 0.1, "e2": 0.12, "e3": 0.11, "e4": 0.13})
     kw.update(overrides)
     return DiscoveryCoordinator(**kw)

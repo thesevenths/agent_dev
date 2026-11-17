@@ -35,6 +35,15 @@ class ResearchQuestion:
     supporting_evidence: list[dict[str, Any]] = field(default_factory=list)
     source_coverage: str = "UNKNOWN"
     limitations: list[str] = field(default_factory=list)
+    # M7.6 P1-A: explicit multi-paper synthesis fields. All optional to keep
+    # on-disk schema and constructor compatibility with M7.1/M7.5 artifacts.
+    prior_art_summary: str = ""
+    contradictory_evidence: list[str] = field(default_factory=list)
+    unresolved_assumptions: list[str] = field(default_factory=list)
+    alternative_explanations: list[str] = field(default_factory=list)
+    applicability_conditions: list[str] = field(default_factory=list)
+    n_supporting_papers: int = 0
+    synthesis_method: str = "SINGLE_SOURCE"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -61,12 +70,62 @@ def generate_questions(*, domain: str,
                        max_questions: int = 6) -> list[ResearchQuestion]:
     """Generate questions grounded in explicit evidence, never title strings."""
     sources: list[dict[str, Any]] = []
+    # ---- multi-paper synthesis (M7.6 P1-A) -------------------------------
+    # The M7.1 generator treated each abstract as an independent gap. Here we
+    # first group evidence snippets by shared salient tokens (a deterministic,
+    # auditable approximation of thematic synthesis -- NOT a claim of semantic
+    # understanding), then build ONE evidence-backed gap per theme that cites
+    # every supporting paper and flags cross-paper disagreement explicitly.
+    lit_sources: list[dict[str, Any]] = []
     for gap in literature_gaps:
         text, meta = _gap_text(gap)
         if len(text.strip()) < 12:
             continue
-        sources.append({"kind": "literature_gap", "text": text,
-                        "evidence": [meta]})
+        lit_sources.append({"text": text, "meta": meta})
+    themes: list[dict[str, Any]] = []
+    for item in lit_sources:
+        toks = {t for t in __import__("re").findall(
+            r"[a-z][a-z0-9]{3,}", item["text"].lower())
+            if t not in {"this", "that", "with", "from", "than", "have",
+                         "across", "using", "study", "results", "based"}}
+        best = None
+        best_overlap = 0.0
+        for th in themes:
+            if not th["tokens"] or not toks:
+                continue
+            overlap = len(th["tokens"] & toks) / len(th["tokens"] | toks)
+            if overlap > best_overlap:
+                best, best_overlap = th, overlap
+        if best is not None and best_overlap >= 0.20:
+            best["items"].append(item)
+            best["tokens"] |= toks
+        else:
+            themes.append({"tokens": set(toks), "items": [item]})
+    for th in themes:
+        items = th["items"]
+        # Representative text is the longest snippet; evidence aggregates ALL
+        # source papers, so the resulting gap is multi-paper grounded.
+        representative = max(items, key=lambda x: len(x["text"]))["text"]
+        meta_all = [it["meta"] for it in items]
+        paper_ids = [str(m.get("paper_id", "")) for m in meta_all
+                     if m.get("paper_id")]
+        # Cross-paper contradiction signal: opposing outcome words on the same
+        # theme are surfaced as uncertainty, never silently averaged away.
+        corpus = " ".join(it["text"].lower() for it in items)
+        contradicts = []
+        if ("improve" in corpus and
+                any(w in corpus for w in ("fail", "no effect", "does not"))):
+            contradicts.append(
+                "papers report opposing outcome directions on this theme")
+        sources.append({
+            "kind": "literature_gap", "text": representative,
+            "evidence": meta_all,
+            "paper_ids": paper_ids,
+            "contradictory_evidence": contradicts,
+            "n_papers": len(paper_ids),
+            "synthesis_method": "MULTI_PAPER_THEMATIC_TOKEN_SYNTHESIS",
+            "unresolved_assumptions": [
+                "abstract-level evidence cannot confirm experimental details"]})
     for f in failures or []:
         text = f"{f.get('reason','')}: {f.get('detail','')}".strip(": ")
         if len(text) >= 12:
@@ -116,10 +175,22 @@ def generate_questions(*, domain: str,
                 "state an executable result that would refute the mechanism"],
             estimated_budget={"max_campaign_rounds": 1, "max_jobs": 8},
             uncertainty=0.5,
-            evidence_refs=[f"{src['kind']}:{digest}"],
+            evidence_refs=[f"{src['kind']}:{digest}"]
+                          + [f"paper:{pid}" for pid in src.get("paper_ids", [])],
             supporting_evidence=src["evidence"],
             source_coverage=coverage,
-            limitations=limits))
+            limitations=limits,
+            prior_art_summary=("; ".join(src.get("paper_ids", []))
+                               if src.get("paper_ids") else
+                               "no prior-art IDs retrievable from evidence"),
+            contradictory_evidence=list(src.get("contradictory_evidence", [])),
+            unresolved_assumptions=list(src.get("unresolved_assumptions", [])),
+            alternative_explanations=[
+                "apparent effect is an artifact of the shared experimental setup"],
+            applicability_conditions=[
+                "conclusions apply only to the retrieved domain and conditions"],
+            n_supporting_papers=int(src.get("n_papers", 0)),
+            synthesis_method=src.get("synthesis_method", "SINGLE_SOURCE")))
     return out
 
 

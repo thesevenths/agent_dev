@@ -55,6 +55,13 @@ def _coord(tmp_path, *, production_runtime=None, loader=None, harness_sha="a" * 
               out_dir=tmp_path / "discovery", providers=[FakeProvider()],
               agent=FakeAgent(), executor=fake_executor,
               pilot_effects={"e1": .1, "e2": .12, "e3": .11, "e4": .13},
+              evidence_map={
+                  "eig": {"hypotheses": ["H0", "H1"], "priors": [0.5, 0.5],
+                          "likelihoods": {"H0": [0.9, 0.1], "H1": [0.2, 0.8]}},
+                  "scientific_significance": {"independent_review": [
+                      {"reviewer": "test-fixture", "verdict": "RELEVANT"}]},
+                  "practical_impact": {"independent_review": [
+                      {"reviewer": "test-fixture", "verdict": "RELEVANT"}]}},
               production_mode=production_mode,
               harness_sha=harness_sha, formal_loader=loader,
               production_runtime=production_runtime,

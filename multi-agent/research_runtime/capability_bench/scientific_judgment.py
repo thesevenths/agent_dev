@@ -182,21 +182,68 @@ def compute_metrics(*, results_dir: str | Path, ground_truth: dict[str, dict],
         cat["correct_evidence"] += int(
             pred.get("evidence_sufficiency") == gt["evidence_sufficiency"])
     n = counts["ok"]
+
+    def _accuracy(key: str) -> float | None:
+        cm = confusion.get(key, {})
+        hit = sum(v for k, v in cm.items()
+                  if k.split("->")[0] == k.split("->")[1])
+        return hit / n if n else None
+
+    # Novelty PRECISION: of the cases predicted genuinely novel, how many the
+    # independent ground truth also marks novel. Distinct from overall accuracy.
+    nov_cm = confusion.get("novelty", {})
+    novel_predicted = sum(v for k, v in nov_cm.items()
+                          if k.split("->")[1] == "LIKELY_NOVEL")
+    novel_correct = nov_cm.get("LIKELY_NOVEL->LIKELY_NOVEL", 0)
+    novelty_precision = (novel_correct / novel_predicted
+                         if novel_predicted else None)
+
+    abst = _binary_metrics(abst_tp, abst_fp, abst_fn, abst_tn)
     metrics = {
-        "version": "m7_2_metrics_v1",
+        "version": "m7_2_metrics_v2_multiple_primary",
         "n_total": len(rows), "n_scored": n, "counts": counts,
         "confusion": confusion,
-        "abstention": _binary_metrics(abst_tp, abst_fp, abst_fn, abst_tn),
+        "abstention": abst,
         "abstention_accuracy_ci95": wilson_interval(abst_tp + abst_tn, n),
         "by_category": by_category,
-        "novelty_accuracy": sum(v for k, v in confusion.get("novelty", {}).items()
-                                if k.split("->")[0] == k.split("->")[1]) / n
-                             if n else None,
+        "novelty_accuracy": _accuracy("novelty"),
+        "novelty_precision": novelty_precision,
+        "falsifiability_accuracy": _accuracy("falsifiability"),
+        "evidence_sufficiency_accuracy": _accuracy("evidence_sufficiency"),
         "expert_blind_review": benchmark_manifest.get(
             "expert_blind_review", "NOT_PERFORMED"),
+        # Pre-registered BEFORE evaluation. Novelty is secondary only and can
+        # NEVER carry a PASS by itself (M7.6 P1-B fix).
+        "preregistered_outcomes": {
+            "primary": ["evidence_sufficiency_accuracy",
+                        "falsifiability_accuracy"],
+            "co_primary": ["novelty_precision", "abstention_f1"],
+            "secondary": ["novelty_accuracy"],
+            "min_cases": int(benchmark_manifest.get("min_cases", 30)),
+            "thresholds": {
+                "evidence_sufficiency_accuracy": 0.75,
+                "falsifiability_accuracy": 0.75,
+                "novelty_precision": 0.70,
+                "abstention_f1": 0.60,
+            },
+        },
     }
-    metrics["verdict"] = ("INCONCLUSIVE" if n < 30 or
-                          metrics["expert_blind_review"] != "PERFORMED"
-                          else "PASS" if metrics["novelty_accuracy"] >= 0.8
-                          else "FAIL")
+    po = metrics["preregistered_outcomes"]
+    observed = {
+        "evidence_sufficiency_accuracy": metrics["evidence_sufficiency_accuracy"],
+        "falsifiability_accuracy": metrics["falsifiability_accuracy"],
+        "novelty_precision": novelty_precision,
+        "abstention_f1": abst.get("f1"),
+    }
+    # Insufficient labels / unavailable expert review => never a capability PASS.
+    if (n < po["min_cases"]
+            or metrics["expert_blind_review"] != "PERFORMED"
+            or any(v is None for v in observed.values())):
+        metrics["verdict"] = "INCONCLUSIVE"
+        metrics["verdict_reason"] = "insufficient_or_unverified_evidence"
+    else:
+        failed = [k for k, v in observed.items() if v < po["thresholds"][k]]
+        metrics["verdict"] = "PASS" if not failed else "FAIL"
+        metrics["verdict_reason"] = ("all_preregistered_outcomes_met"
+                                     if not failed else "below:" + ",".join(failed))
     return metrics

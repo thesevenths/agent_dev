@@ -108,7 +108,12 @@ def test_novelty_abstention_and_known_claim(tmp_path):
                     abstract=claims[0].text)]
     cov = {"status": "OK", "n_unique_papers": 3, "providers": ["openalex"]}
     known = assess_novelty(claims, papers, coverage=cov)
-    assert any(v["status"] == "NOT_NOVEL" for v in known["verdicts"])
+    # M7.6 P1-F: a lexical screen can only flag POSSIBLE_PRIOR_ART; it is never
+    # a confirmed NOT_NOVEL nor a confirmed novelty claim.
+    assert any(v["status"] == "POSSIBLE_PRIOR_ART" for v in known["verdicts"])
+    assert all(v.get("confirmed_novelty") is False
+               and v.get("evidence_grade") == "SCREENING_ONLY"
+               for v in known["verdicts"])
     for verdict in known["verdicts"]:
         for rel in verdict["relations"]:
             assert rel["paper_id"] == "p1"  # never invented prior art

@@ -526,6 +526,11 @@ class DiscoveryCoordinator:
         selection_basis = ("EVIDENCE_BASED_PRIORITY" if
                            isinstance(ranked[0][0].get("priority"), (int, float))
                            else "NO_VALUE_EVIDENCE_FALLBACK")
+        # M7.6 P1-A: production must NOT silently turn NOT_ASSESSED value into
+        # a high-value decision by taking the first candidate. Fail closed.
+        if self.production_mode and selection_basis == "NO_VALUE_EVIDENCE_FALLBACK":
+            raise DiscoveryBlocked(
+                "value_evidence_insufficient:NOT_ASSESSED_cannot_be_ranked_in_production")
         frozen = self._freeze("value", {
             "assessments": assessments,
             "selected_question_id": selected.question_id,

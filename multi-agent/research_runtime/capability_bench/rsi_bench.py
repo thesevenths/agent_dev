@@ -45,6 +45,48 @@ def _parse(text: str) -> dict[str, Any]:
     return obj
 
 
+def diagnose_bottleneck_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Diagnose the dominant methodological bottleneck from REAL base failures.
+
+    M7.6 P1-E: the Candidate must be generated from actual evidence, not a
+    pre-written "correct answer". This reads the base arm's per-case scores and
+    selects the component whose failures dominate. It never assumes a
+    bottleneck is present -- zero failures yields NO_CLEAR_BOTTLENECK.
+    """
+    base = [r for r in rows if r.get("method") == "base"]
+    if not base:
+        return {"category": "NO_DATA", "component": None, "counts": {},
+                "candidate": None, "n_failures": 0,
+                "method": "evidence_driven_v1"}
+    counts = {
+        "parse_failure": sum(1 for r in base if not r.get("parse_ok")),
+        "evidence_sufficiency_error": sum(
+            1 for r in base if r.get("parse_ok") and not r["scores"]["evidence"]),
+        "falsifiability_error": sum(
+            1 for r in base if r.get("parse_ok") and not r["scores"]["falsifiability"]),
+        "novelty_error": sum(
+            1 for r in base if r.get("parse_ok") and not r["scores"]["novelty"]),
+    }
+    # Map the dominant failure to the method change that targets it.
+    mapping = {
+        "evidence_sufficiency_error": "candidate_evidence_gate",
+        "parse_failure": "candidate_evidence_gate",
+        "falsifiability_error": "candidate_adversarial",
+        "novelty_error": "candidate_adversarial",
+    }
+    substantive = {k: v for k, v in counts.items() if k != "parse_failure"}
+    dominant = max(substantive, key=lambda k: substantive[k]) if substantive else None
+    n_fail = sum(counts.values())
+    if not dominant or substantive[dominant] == 0:
+        return {"category": "NO_CLEAR_BOTTLENECK", "component": None,
+                "counts": counts, "candidate": None, "n_failures": n_fail,
+                "method": "evidence_driven_v1"}
+    return {"category": dominant.upper(), "component": METHODS[mapping[dominant]]["component"],
+            "counts": counts, "candidate": mapping[dominant],
+            "n_failures": n_fail, "method": "evidence_driven_v1",
+            "rationale": f"dominant real failure={dominant} ({substantive[dominant]} cases)"}
+
+
 def split_tasks(cases: list[dict[str, Any]]) -> dict[str, list[dict]]:
     dev_cats = {"KNOWN", "PRIOR_ART", "UNFALSIFIABLE"}
     hold_cats = {"OPEN", "COMPETING"}
