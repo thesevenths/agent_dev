@@ -97,6 +97,17 @@
   **4 passed**；
 - AST 门禁、CI YAML 校验通过；M6 测试模块已加入根 CI（engine-free 与 opt-in real 分离）。
 
-## 8. Commit 列表
+## 8. Commit 列表与 CI
 
-见最终交付消息中精确 SHAs；全部在 `feature/arr-m6-harness-rsi`，未 merge、未 PR。
+全部在 `feature/arr-m6-harness-rsi`，未 merge、未 PR：
+
+```
+b4399a32 M6 CI: trigger ARR Research Runtime gate on the M6 branch so added tests actually run
+78ca9f7c M6: full design/metrics/acceptance docs and verifiable real-run evidence packages
+c59d0293 M6: preregistration dedup, SHA-bound human approval, real-engine provenance, opt-in test + CI
+595ee7c3 M6: unified Research Harness RSI subsystem (13 modules + driver + 29 adversarial tests)
+```
+
+CI：Pre-commit checks run `43996142963` = success；ARR Research Runtime run `43996143000`
+已因分支触发修正而启动（查询时 in_progress，以该 run 最终结论为准）。
+本地最终代码全量回归已 green（729 passed / 12 skipped / 37 subtests）。
