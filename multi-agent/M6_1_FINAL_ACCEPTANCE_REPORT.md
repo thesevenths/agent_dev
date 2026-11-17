@@ -14,7 +14,7 @@ INCONCLUSIVE。
 ## 1. Repository State
 
 - 起点 HEAD：`c078a4e237316676232a04287eb771d020785917`（feature/arr-m6-harness-rsi）
-- 终点 HEAD：见最终交付消息（分支 `feature/arr-m6-acceptance-closure`）
+- 终点 HEAD：`c7ee14bd550cfba5a9259ca1827a1e1d26e70b46`（分支 `feature/arr-m6-acceptance-closure`）
 - SciNet++：固定 `95e65d0a187db33a98ff3b278b53c22d2a432d1d`（未修改）
 - 工作树：源码干净（证据目录为 untracked/随 commit 纳入）
 - 未 merge main、未建 PR、未 force push
