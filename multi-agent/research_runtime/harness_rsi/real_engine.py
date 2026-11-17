@@ -30,9 +30,16 @@ _PROJECTS = {
 }
 
 
-def build_real_runner(root: Path, *, timeout_s: float = 900.0) -> Any:
-    """Build the real-engine M6 runner. Fail closed on engine faults."""
+def build_real_runner(root: Path, *, evidence_root: Path | None = None,
+                      timeout_s: float = 900.0) -> Any:
+    """Build the real-engine M6 runner. Fail closed on engine faults.
+
+    ``root`` is the REPOSITORY root (engine configs / project dirs).
+    ``evidence_root`` is the run output dir for engine job artifacts only.
+    Conflating the two makes the engine read missing configs -> NaN.
+    """
     root = Path(root)
+    evidence_root = Path(evidence_root) if evidence_root else root
     cache: dict[str, Any] = {}
 
     def runner(harness_artifact: dict[str, Any], task: Any) -> dict[str, Any]:
@@ -55,8 +62,8 @@ def build_real_runner(root: Path, *, timeout_s: float = 900.0) -> Any:
         else:
             cfg_path = root / _PROJECTS[domain] / "config.yaml"
             art = {"config_path": str(cfg_path)}
-        job_dir = (root / "M6_EVIDENCE" / "real_engine_jobs" /
-                   f"{getattr(harness_artifact, 'get', lambda *_: '')('harness_sha', 'x')[:12]}" /
+        job_dir = (evidence_root / "real_engine_jobs" /
+                   f"{str(harness_artifact.get('harness_sha', 'x'))[:12]}" /
                    f"{getattr(task, 'task_id', 'task')}")
         art["directory"] = str(job_dir)
         q = cache[domain](art)

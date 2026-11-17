@@ -65,6 +65,13 @@ class PreRegistration:
     secondary_metrics: tuple[str, ...] = tuple(
         m for m in METRICS if m != "objective_quality")
 
+    def __post_init__(self) -> None:
+        # A primary metric must NEVER also appear in the secondary family:
+        # that would double-count it in the pre-registered comparison family.
+        if self.primary_metric in self.secondary_metrics:
+            object.__setattr__(self, "secondary_metrics", tuple(
+                m for m in self.secondary_metrics if m != self.primary_metric))
+
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["secondary_metrics"] = list(self.secondary_metrics)

@@ -94,12 +94,16 @@ def _run_task_set(*, tasks: list[Any], runner: Any, harness: Any,
         raw = runner({"harness": harness.to_dict() if hasattr(harness, "to_dict")
                       else harness, "harness_sha": harness_sha,
                       "experiment_id": experiment_id}, task)
-        frozen = freeze_json({
+        result_obj = {
             "task_id": task.task_id, "family": task.family_id,
             "harness_sha": harness_sha, "arm": arm,
             "metrics": raw.get("metrics", {}), "ok": raw.get("ok", True),
             "judgment": raw.get("judgment", {}),
-        }, out_dir / f"{arm}_{task.task_id}.json")
+        }
+        # Persist REAL engine provenance when present (config, job dir, Q).
+        if "real_engine" in raw:
+            result_obj["real_engine"] = raw["real_engine"]
+        frozen = freeze_json(result_obj, out_dir / f"{arm}_{task.task_id}.json")
         files.append(frozen["path"])
         shas.append(frozen["sha256"])
         results.append(TaskResult(
@@ -181,7 +185,8 @@ def run(cfg: dict[str, Any], out_dir: Path, mode: str,
     if str(cfg.get("engine", "deterministic")) == "real":
         from research_runtime.harness_rsi.real_engine import build_real_runner
         method_runner = build_real_runner(
-            ROOT, timeout_s=float(cfg.get("real_engine", {}).get(
+            ROOT, evidence_root=out_dir,
+            timeout_s=float(cfg.get("real_engine", {}).get(
                 "timeout_s", 900)))
         _log("engine mode: REAL (SciNet++/Embodied/Quant adapters)")
     else:
@@ -325,16 +330,50 @@ def run(cfg: dict[str, Any], out_dir: Path, mode: str,
     approval_path = ROOT / str(cfg["approval"]["source_file"])
     approval = (json.loads(approval_path.read_text(encoding="utf-8"))
                 if approval_path.is_file() else {"approved": False})
-    verdict = formal_promote(
-        registry=registry, experiment_id=f"{rid}_formal_promotion",
-        candidate=cand, parent_sha=base_sha,
-        holdout_evidence=holdout_evidence, manifest_path=bench.manifest_path,
-        artifact_reader=reader,
-        preregistration_sha=prec["preregistration_sha256"],
-        statistical_gate=_statistical_gate(
-            hold_analysis, prec["preregistration_sha256"]),
-        promotable_view=bcheck,
-        human_approval=approval)
+    verdict_path = out_dir / "promotion_verdict.json"
+    prior = (json.loads(verdict_path.read_text(encoding="utf-8"))
+             if verdict_path.is_file() else None)
+    # Approval must bind to the EXACT candidate SHA; a generic "approved" flag
+    # for a different candidate is not consent to adopt this one.
+    approval_binds = (approval.get("approved") is True
+                      and str(approval.get("reviewed_candidate_sha", ""))
+                      == cand_sha)
+    resuming = bool(prior and prior.get("verification", {}).get("verified")
+                    and prior.get("candidate_sha") == cand_sha
+                    and approval_binds)
+    if resuming:
+        # Reuse the ALREADY-VERIFIED holdout evidence. Never re-verify by
+        # rewriting it, and never fabricate a new evaluation: only the human
+        # approval transition is new. It is recorded under a distinct id.
+        verdict = {**prior, "status": "PROMOTED",
+                   "human_approval": approval,
+                   "approval_transition_experiment": f"{rid}_approval_recorded",
+                   "resumed_from_verified_verdict": True}
+        registry.record(
+            experiment_id=f"{rid}_approval_recorded", layer="research_harness",
+            candidate_id=cand.harness_id, candidate_sha=cand_sha,
+            parent_sha=base_sha, status="PROMOTED", gate_passed=True,
+            evidence={"transition": "human_approval_after_verified_promotion",
+                      "prior_verdict_sha": sha256_json(prior),
+                      "human_approval": approval,
+                      "candidate_sha": cand_sha})
+        _stage(state, rid, 3, "human_approval_recorded", {
+            "candidate_sha": cand_sha,
+            "approved_by": approval.get("approved_by", "")})
+        _log("resumed from VERIFIED promotion; explicit human approval recorded")
+    else:
+        verdict = formal_promote(
+            registry=registry, experiment_id=f"{rid}_formal_promotion",
+            candidate=cand, parent_sha=base_sha,
+            holdout_evidence=holdout_evidence, manifest_path=bench.manifest_path,
+            artifact_reader=reader,
+            preregistration_sha=prec["preregistration_sha256"],
+            statistical_gate=_statistical_gate(
+                hold_analysis, prec["preregistration_sha256"]),
+            promotable_view=bcheck,
+            human_approval=(approval if approval_binds
+                        else {"approved": False,
+                              "reason": "approval_not_bound_to_candidate_sha"}))
     freeze_json(verdict, out_dir / "promotion_verdict.json")
     _stage(state, rid, 3, "promotion_recorded", {
         "status": verdict["status"],
