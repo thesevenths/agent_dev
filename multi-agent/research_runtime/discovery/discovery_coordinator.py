@@ -27,6 +27,7 @@ from ..harness_rsi.benchmark_v2 import (BenchmarkSpecV2, BenchmarkTask,
                                         HoldoutAccessVerifier)
 from ..runtime_state import (RuntimeBudgetExhausted, RuntimeState,
                              RuntimeStateError, config_sha)
+from .approval_gate import verify_external_approval
 from .domain_packs import load_pack
 from .hypotheses.engine import (IndependentCritic, ScientificHypothesis,
                                 generate_competing_hypotheses, review_all)
@@ -85,6 +86,10 @@ class DiscoveryCoordinator:
                  providers: list[Any] | None = None,
                  executor: Callable[..., dict[str, Any]] | None = None,
                  approval: Any | None = None,
+                 approval_store: Any | None = None,
+                 approval_id: str = "",
+                 production_mode: bool = False,
+                 fixture_approval: bool = False,
                  mme: float = 0.01,
                  seeds: list[int] | None = None,
                  selection_seeds: list[int] | None = None,
@@ -92,6 +97,8 @@ class DiscoveryCoordinator:
                  global_budget: int = 2,
                  harness_sha: str = "",
                  formal_loader: Any | None = None,
+                 production_runtime: Any | None = None,
+                 git_commit_sha: str = "",
                  pilot_effects: dict[str, float] | None = None,
                  evidence_map: dict[str, Any] | None = None,
                  max_requests: int = 12):
@@ -110,6 +117,21 @@ class DiscoveryCoordinator:
             SemanticScholarProvider(cache_dir=self.root / "cache" / "s2")]
         self.executor = executor or self.pack.run_experiment
         self.approval = approval
+        self.approval_store = approval_store
+        self.approval_id = str(approval_id or "")
+        self.production_mode = bool(production_mode)
+        self.fixture_approval = bool(fixture_approval)
+        # A fixture stamp is REQUIRED whenever an in-process approval source is
+        # supplied outside production. Without it, auto-approval fails closed.
+        self._fixture_approved = self.fixture_approval and not self.production_mode
+        self._fixture_decision: dict[str, Any] | None = None
+        if self._fixture_approved and callable(self.approval):
+            # Evaluated lazily at the gate (needs protocol_sha); marker here only.
+            self._fixture_callable = self.approval
+        else:
+            self._fixture_callable = None
+            if self._fixture_approved and isinstance(self.approval, dict):
+                self._fixture_decision = dict(self.approval)
         self.mme = float(mme)
         self.seeds = list(seeds or [42, 43, 44])
         self.selection_seeds = list(selection_seeds or self.seeds[:2])
@@ -117,6 +139,8 @@ class DiscoveryCoordinator:
         self.global_budget = int(global_budget)
         self.harness_sha = harness_sha
         self.formal_loader = formal_loader
+        self.production_runtime = production_runtime
+        self.git_commit_sha = str(git_commit_sha or "")  # distinct from harness SHA
         self.pilot_effects = dict(pilot_effects or {})
         self.evidence_map = dict(evidence_map or {})
         self.max_requests = int(max_requests)
@@ -199,30 +223,78 @@ class DiscoveryCoordinator:
 
     # ---------------------------------------------------------------- gates
     def _check_approval(self, protocol_sha: str) -> dict[str, Any]:
+        """M7.6 P0-A: re-read an OUT-OF-BAND approval from the trusted store.
+
+        Production path
+        ---------------
+        ONLY source of truth is the M4.3 ``ApprovalStore``. The approval_id must
+        reference a durable decision recorded by ``approval_cli.py`` in a
+        separate process, bound to THIS preregistration SHA. In-process
+        callables/dicts are auto-approvals and are rejected outright.
+
+        Engine-free test path
+        ---------------------
+        A caller-supplied decision is accepted ONLY if explicitly stamped
+        ``fixture=True`` AND ``trust="TEST_FIXTURE"``; it can never satisfy a
+        production-mode run. Fixtures are recorded verbatim in state for audit.
+        """
         prior = self.state.get("approval")
         if prior and prior.get("protocol_sha") == protocol_sha \
-                and prior.get("decision") == "APPROVED":
-            return {"ok": True, "duplicate": True}
-        source = self.approval
-        if callable(source):
-            decision = source(protocol_sha)
-        else:
-            decision = source or {}
-        if not isinstance(decision, dict):
-            raise DiscoveryBlocked("approval gate requires structured decision")
+                and prior.get("verified_ok") is True:
+            if self.production_mode and prior.get("trust") != "EXTERNAL_STORE":
+                raise DiscoveryBlocked("approval_gate:cached_fixture_in_production")
+            if self.production_mode:
+                # Re-verify against the store on every resume: a revoked/expired
+                # approval must invalidate a previously verified run.
+                pass
+            else:
+                return {"ok": True, "duplicate": True,
+                        "trust": prior.get("trust", "TEST_FIXTURE")}
+
+        if self.production_mode:
+            verdict = verify_external_approval(
+                approval_store=self.approval_store, approval_id=self.approval_id,
+                protocol_sha=protocol_sha)
+            if not verdict.get("ok"):
+                raise DiscoveryBlocked(
+                    "approval_gate:" + str(verdict.get("reason", "external_verification_failed")))
+            self.state["approval"] = {
+                **verdict, "protocol_sha": protocol_sha, "at": _now(),
+                "trust": "EXTERNAL_STORE", "verified_ok": True,
+                "production_mode": True}
+            return {"ok": True, "trust": "EXTERNAL_STORE",
+                    "approval_sha": sha256_json(self.state["approval"]),
+                    "approved_by": verdict.get("approved_by", ""),
+                    "approval_id": self.approval_id}
+
+        # ---- engine-free fixture path (never valid in production) ----
+        auto = self.approval is not None or self.approval_store is not None
+        if auto and not self._fixture_approved:
+            raise DiscoveryBlocked(
+                "approval_gate:test_fixture_requires_explicit_stamp")
+        if self._fixture_callable is not None:
+            produced = self._fixture_callable(protocol_sha)
+            if not isinstance(produced, dict):
+                raise DiscoveryBlocked("approval gate requires structured decision")
+            self._fixture_decision = dict(produced)
+        decision = dict(self._fixture_decision or {})
         reasons: list[str] = []
         if str(decision.get("protocol_sha", "")) != protocol_sha:
             reasons.append("approval_not_bound_to_protocol")
-        if str(decision.get("approver", "")).lower() in ("", "agent", "llm",
-                                                         "research_agent"):
-            reasons.append("approval_requires_human")
+        if str(decision.get("approver", "")).lower() in (
+                "", "agent", "llm", "research_agent", "system"):
+            reasons.append("approval_requires_human_identity")
         if str(decision.get("decision", "")).upper() != "APPROVED":
             reasons.append("not_approved")
         if reasons:
             raise DiscoveryBlocked("approval_gate:" + "|".join(reasons))
-        self.state["approval"] = {**decision, "at": _now(),
-                                  "protocol_sha": protocol_sha}
-        return {"ok": True, "approval_sha": sha256_json(self.state["approval"])}
+        self.state["approval"] = {
+            **decision, "at": _now(), "protocol_sha": protocol_sha,
+            "trust": "TEST_FIXTURE", "fixture": True, "verified_ok": True,
+            "production_mode": False,
+            "warning": "engine-free test fixture; NOT a human approval"}
+        return {"ok": True, "trust": "TEST_FIXTURE", "fixture": True,
+                "approval_sha": sha256_json(self.state["approval"])}
 
     def _reserve(self, stage: str, campaign_id: str) -> str:
         rid = RuntimeState.reservation_id(
@@ -249,15 +321,14 @@ class DiscoveryCoordinator:
                             "PARTIAL and must not be reported as full"}
         loaded = self.formal_loader.resolve_for_campaign(
             campaign_id=campaign_id, domain=self.domain)
+        # M6 HarnessLoader.resolve_for_campaign ALREADY binds the campaign
+        # (bindings.bind + adoption.bind_campaign). Re-binding here was a
+        # redundant, semantically confusing duplicate; removed in M7.6 P0-B.
         binding = {"campaign_id": campaign_id,
                    "harness_sha": loaded.harness_sha,
                    "component_shas": dict(loaded.component_shas),
                    "parent_sha": loaded.parent_sha,
                    "activation_id": loaded.activation_id}
-        bindings = getattr(self.formal_loader, "bindings", None)
-        if bindings is not None and hasattr(bindings, "bind"):
-            bindings.bind(campaign_id=campaign_id, domain=self.domain,
-                          loaded=loaded)
         self.state.setdefault("harness_bindings", {})[campaign_id] = binding
         return {"mode": "FORMAL_HARNESS_LOADER", "ok": True, **binding}
 
@@ -288,9 +359,33 @@ class DiscoveryCoordinator:
         journal = self.runtime.verify_journal(self.run_id)
         if not journal["ok"]:
             raise DiscoveryBlocked("runtime_journal_tampered")
-        self.state["runtime_integration"] = (
-            "FORMAL_HARNESS_LOADER" if self.formal_loader is not None
-            else "PARTIAL_LOCAL_DIRECT_EXECUTOR")
+        if self.production_mode:
+            # P0-B: production requires ALL formal contracts. No silent direct
+            # executor fallback; no git HEAD standing in for a harness SHA.
+            missing = []
+            if self.formal_loader is None:
+                missing.append("formal_harness_loader")
+            if self.production_runtime is None:
+                missing.append("formal_runtime_adapter")
+            if not self.harness_sha:
+                missing.append("harness_sha")
+            if missing:
+                raise DiscoveryBlocked(
+                    "production_runtime_missing:" + ",".join(missing))
+            # M7.6: the formal adapter MUST reuse THIS run's M5 RuntimeState
+            # (same journal/budget/config), never a second runtime instance.
+            self.production_runtime.runtime = self.runtime
+            if hasattr(self.production_runtime, "run_id"):
+                self.production_runtime.run_id = self.run_id
+            self.state["runtime_integration"] = "FORMAL_PRODUCTION_RUNTIME"
+            self.state["identity_separation"] = {
+                "harness_sha": self.harness_sha,
+                "git_commit_sha": self.git_commit_sha,
+                "note": "harness identity is resolved by M6 loader, NOT git HEAD"}
+        else:
+            self.state["runtime_integration"] = (
+                "FORMAL_HARNESS_LOADER" if self.formal_loader is not None
+                else "PARTIAL_LOCAL_DIRECT_EXECUTOR")
         return {"ok": True, "config_sha": self.config_sha,
                 "dataset": self.dataset, "journal": journal,
                 "protocol_version": PROTOCOL_VERSION}
@@ -575,23 +670,53 @@ class DiscoveryCoordinator:
         approval = self._check_approval(protocol_sha)
         return {"ok": True, "protocol_sha": protocol_sha, **approval}
 
-    def _execute_selection(self) -> dict[str, Any]:
-        protocol = self.state["protocol"]
-        campaign_id = "m7sel_" + self.state["preregistration_sha"][:20]
+    def _run_experiment(self, *, experiment_id: str, stage: str,
+                        arms: list[str], seeds: list[int], splits: list[str],
+                        out_dir: str, round_no: int) -> dict[str, Any]:
+        """Single execution funnel: formal adapter in production, engine in tests."""
+        prereg = self.state["preregistration_sha"]
+        if self.production_mode:
+            if self.production_runtime is None:
+                raise DiscoveryBlocked("production_runtime_missing")
+            return self.production_runtime.dispatch(
+                experiment_id=experiment_id, preregistration_sha=prereg,
+                arms=arms, seeds=seeds, splits=splits, out_dir=out_dir,
+                stage=stage, expected_harness_sha=self.harness_sha,
+                config_sha=self.config_sha, round_no=round_no)
+        # engine-free / development: explicit direct executor, recorded as such
+        campaign_id = ("m7sel_" if stage == "EXPERIMENT_EXECUTION" else "m7rep_") \
+            + prereg[:20]
         harness_binding = self._resolve_formal_harness(campaign_id)
-        reservation = self._reserve("EXPERIMENT_EXECUTION", campaign_id)
-        arms = ["baseline", "action_conditioned", "capacity_control"]
-        result = self.executor(
-            experiment_id=protocol["experiment_id"] + "_selection",
-            arms=arms, seeds=self.selection_seeds, splits=["validation"],
-            out_dir=str(self.root / "experiments" / "selection"))
+        reservation = self._reserve(stage, campaign_id)
+        try:
+            result = self.executor(
+                experiment_id=experiment_id, arms=arms, seeds=seeds,
+                splits=splits, out_dir=out_dir)
+        except Exception:
+            # P0-B-4: settle the reservation on ANY execution failure.
+            self.runtime.consume_reservation(self.run_id,
+                self.state["reservations"][stage]["reservation_id"],
+                outcome="failed")
+            raise
         outcome = "succeeded" if result.get("ok") else "failed"
-        self._consume_reservation("EXPERIMENT_EXECUTION", outcome)
-        self.state["selection_campaign"] = campaign_id
+        self._consume_reservation(stage, outcome)
         return {"ok": True, "campaign_id": campaign_id,
                 "reservation_id": reservation, "reservation_outcome": outcome,
                 "harness_binding": harness_binding,
+                "runtime_integration": self.state["runtime_integration"],
                 **{k: v for k, v in result.items() if k != "summary"}}
+
+    def _execute_selection(self) -> dict[str, Any]:
+        protocol = self.state["protocol"]
+        result = self._run_experiment(
+            experiment_id=protocol["experiment_id"] + "_selection",
+            stage="EXPERIMENT_EXECUTION",
+            arms=["baseline", "action_conditioned", "capacity_control"],
+            seeds=self.selection_seeds, splits=["validation"],
+            out_dir=str(self.root / "experiments" / "selection"),
+            round_no=int(self.state["stage_index"]))
+        self.state["selection_campaign"] = result["campaign_id"]
+        return {"ok": True, **result}
 
     def _evidence(self) -> dict[str, Any]:
         source = self.root / "experiments" / "selection" / "engine_results.json"
@@ -663,16 +788,14 @@ class DiscoveryCoordinator:
         chain = verifier.verify_chain()
         if not chain["ok"]:
             raise DiscoveryBlocked("holdout_ledger_broken")
-        campaign_id = "m7rep_" + self.state["preregistration_sha"][:20]
-        harness_binding = self._resolve_formal_harness(campaign_id)
-        reservation = self._reserve("REPLICATION", campaign_id)
-        result = self.executor(
+        result = self._run_experiment(
             experiment_id=protocol["experiment_id"] + "_replication",
+            stage="REPLICATION",
             arms=["baseline", "action_conditioned"],
             seeds=self.replication_seeds, splits=["test", "ood"],
-            out_dir=str(self.root / "experiments" / "replication"))
-        outcome = "succeeded" if result.get("ok") else "failed"
-        self._consume_reservation("REPLICATION", outcome)
+            out_dir=str(self.root / "experiments" / "replication"),
+            round_no=int(self.state["stage_index"]))
+        self.state["replication_campaign"] = result["campaign_id"]
         source = self.root / "experiments" / "replication" / "engine_results.json"
         raw = json.loads(source.read_text(encoding="utf-8"))
         from .domain_packs.embodied_world_model import evaluator
@@ -695,10 +818,7 @@ class DiscoveryCoordinator:
         if not integrity["ok"] or not evaluation["ok"] or not safety["ok"]:
             raise DiscoveryBlocked("replication_evidence_invalid")
         self.state["replication_verdict"] = verdict
-        return {"ok": True, "campaign_id": campaign_id,
-                "reservation_id": reservation, "reservation_outcome": outcome,
-                "harness_binding": harness_binding,
-                "replication_sha": evidence_sha,
+        return {"ok": True, "replication_sha": evidence_sha,
                 "artifact_sha": frozen["sha256"],
                 "holdout_chain_sha": chain["chain_sha"], "verdict": verdict,
                 **{k: v for k, v in result.items() if k != "summary"}}
@@ -832,9 +952,26 @@ class DiscoveryCoordinator:
     # ------------------------------------------------------------------ run
     def run(self) -> dict[str, Any]:
         if self.state.get("status") in TERMINAL:
-            return {"ok": True, "resumed": True,
-                    "status": self.state["status"],
-                    "scientific_verdict": self.state.get("scientific_verdict")}
+            # M7.6 P0-A/P0-B: a run that stopped at HUMAN_APPROVAL is a
+            # two-phase out-of-band flow, not a failure. Phase 1 freezes the
+            # preregistration and emits the approval request; a human grants it
+            # out-of-band; phase 2 resumes. Only a PRODUCTION run that is still
+            # blocked at the approval gate may be resumed, and only if the
+            # trusted store now holds a matching approved record.
+            if not (self.production_mode
+                    and self.state.get("status") == "BLOCKED"
+                    and (self.state.get("failure") or {}).get("stage")
+                    == "HUMAN_APPROVAL"):
+                return {"ok": True, "resumed": True,
+                        "status": self.state["status"],
+                        "scientific_verdict": self.state.get("scientific_verdict")}
+            self.state["status"] = "RUNNING"
+            self.state.pop("failure", None)
+        # Bind the formal adapter to THIS run's M5 RuntimeState on EVERY run,
+        # including resumes where DISCOVERY_START is already DONE and skipped.
+        if self.production_mode and self.production_runtime is not None:
+            self.production_runtime.runtime = self.runtime
+            self.production_runtime.run_id = self.run_id
         handlers = {
             "DISCOVERY_START": self._start,
             "LITERATURE_RETRIEVAL": self._literature,

@@ -822,8 +822,12 @@ class ResearchService:
                         domain=self.domain.name
                         if hasattr(self.domain, "name") else "")
                 else:
+                    # P0-B-5: recovery path must use the EXISTING campaign's
+                    # id. Referencing `campaign_id` here was a NameError because
+                    # it is only assigned later (:847 new / :858 existing).
+                    prior_campaign_id = existing.campaign_id
                     _prior_rec = self.deps.campaign_store.load_campaign(
-                        campaign_id)
+                        prior_campaign_id)
                     prior = _prior_rec.run_spec if _prior_rec else {}
                     pinned = str(prior.get("harness_sha256", ""))
                     if not pinned:

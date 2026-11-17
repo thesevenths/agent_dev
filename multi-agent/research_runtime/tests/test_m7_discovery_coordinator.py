@@ -119,8 +119,9 @@ def make_coordinator(tmp_path, **overrides):
               out_dir=tmp_path / "discovery", providers=[FakeProvider()],
               agent=FakeAgent(), executor=fake_executor,
               approval=lambda protocol_sha: {
-                  "protocol_sha": protocol_sha, "approver": "human-operator",
+                  "protocol_sha": protocol_sha, "approver": "engineer-A",
                   "decision": "APPROVED"},
+              fixture_approval=True,
               pilot_effects={"ep1": 0.12, "ep2": 0.10,
                              "ep3": 0.14, "ep4": 0.11})
     kw.update(overrides)
