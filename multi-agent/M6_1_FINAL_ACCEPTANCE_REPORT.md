@@ -3,7 +3,7 @@
 ## 0. 判定（结论先行）
 
 本阶段交付 **ENGINEERING_COMPLETE / SCIENTIFIC_CONFIRMATION_INCONCLUSIVE**（以
-`M6_1_EVIDENCE/run_final4/final_result.json` 为准，evidence manifest SHA `71b6a53cf4f5eb2c…`）。
+`M6_1_EVIDENCE/run_final4/final_result.json` 为准，evidence manifest SHA `48cdfa156a4f6d6f…`（深层 trajectory 已打包为 tar.gz 以通过 Windows checkout））。
 
 含义：所有工程控制链已修复并真实接线（Benchmark V2 三路隔离、真实 Critic 进入生产
 Agent 链、正式 Loader 绑定 Campaign、在途版本固定、真实回滚）；但在当前真实配对
@@ -14,7 +14,7 @@ INCONCLUSIVE。
 ## 1. Repository State
 
 - 起点 HEAD：`c078a4e237316676232a04287eb771d020785917`（feature/arr-m6-harness-rsi）
-- 终点 HEAD：`c7ee14bd550cfba5a9259ca1827a1e1d26e70b46`（分支 `feature/arr-m6-acceptance-closure`）
+- 终点 HEAD：`3ec2604944950fe16f6593824c1f12f7ebd257d1`（分支 `feature/arr-m6-acceptance-closure`）
 - SciNet++：固定 `95e65d0a187db33a98ff3b278b53c22d2a432d1d`（未修改）
 - 工作树：源码干净（证据目录为 untracked/随 commit 纳入）
 - 未 merge main、未建 PR、未 force push
@@ -130,7 +130,7 @@ power 不足（所需 family 数为 ∞/不可达），verdict=INCONCLUSIVE。�
   trajectory SHA `f5e93b34…`）到 parent `9d8bae03…`，ROLLBACK_COMPLETED；
 - Experience ablation（真实 runner ON/OFF）：on=1.0/off=1.0，delta=0 →
   INCONCLUSIVE；
-- Evidence manifest：125 文件，SHA `71b6a53cf4f5eb2c…`；
+- Evidence manifest：40 文件（含 2 个打包 tar.gz），SHA `48cdfa156a4f6d6f…`；
 - CI：M6.1 测试模块已加入 workflow（engine-free），real-engine opt-in 分离。
 
 
