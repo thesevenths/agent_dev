@@ -495,6 +495,7 @@ def run_research_task(task: ResearchTask, *,
                       run_root: str | Path | None = None,
                       approved_by: str = "arr-1.0-operator",
                       experiences: list[str] | None = None,
+                      hypothesis_manager_factory=None,
                       ) -> TaskResult:
     """Execute ONE ResearchTask end-to-end through the generic ResearchService."""
     harness = harness or BASE_HARNESS
@@ -572,7 +573,8 @@ def run_research_task(task: ResearchTask, *,
         svc = build_default_research_service(
             task.domain, llm_generate=generate,
             db_path=data_dir / "research.sqlite", data_dir=data_dir,
-            evidence_provider=evidence_provider, domain_policy=task_policy)
+            evidence_provider=evidence_provider, domain_policy=task_policy,
+            hypothesis_manager_factory=hypothesis_manager_factory)
 
         baseline_id = f"baseline_{task.task_id}"
         baseline = run_real_baseline(
@@ -592,12 +594,30 @@ def run_research_task(task: ResearchTask, *,
             raise RuntimeError(f"propose failed: {proposed}")
         hids = [h["hypothesis_id"] for h in proposed.get("hypotheses", [])]
         result.hypotheses = proposed.get("hypotheses", [])
+        # M6.1: carry the FULL real hypothesis content (predicted effects,
+        # falsification criteria) so trajectories can be independently graded
+        # from recorded output rather than a re-derived probe.
+        _full = []
+        for _h in hids:
+            _stored = svc.stores.hypotheses.get(_h)
+            if _stored is not None:
+                _payload = dict(_stored.hypothesis)
+                _payload.setdefault("hypothesis_id", _h)
+                _full.append(_payload)
+        if _full:
+            result.hypotheses = _full
         if not hids:
             raise RuntimeError(
                 f"autonomous planner produced no hypotheses: "
                 f"{proposed.get('skip_reasons')}")
         reviewed = svc.review_research_hypotheses(
             hypothesis_ids_json=json.dumps(hids), session_id=sid)
+        # M6.1: persist the REAL deterministic-Critic decisions (passed/errors)
+        # into the TaskResult provenance so a trajectory can be independently
+        # graded. This is recorded output, NOT a candidate-supplied score.
+        result.provenance["critic_reviews"] = reviewed.get("reviews", [])
+        result.provenance["critic_strategy_factory"] = (
+            "injected" if hypothesis_manager_factory is not None else "default")
         approved = reviewed.get("approved_ids", [])
         if not approved:
             raise RuntimeError(

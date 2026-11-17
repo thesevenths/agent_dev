@@ -40,4 +40,26 @@ from .rollback import RollbackError, rollback
 from .experience import (EXPERIENCE_KINDS, ExperienceBank, ExperienceError,
                          ResearchExperience, run_retrieval_ablation)
 
+# M6.1 Acceptance Closure -- Benchmark V2, real trajectories, family stats,
+# formal loader/dispatcher binding and runtime-safe rollback.
+from . import benchmark_v2, critic_strategies, real_trajectory, statistics_v2
+from . import harness_loader, rollback_v2
+from .benchmark_v2 import (
+    BENCHMARK_VERSION as BENCHMARK_V2_VERSION, BenchmarkIsolationError,
+    HoldoutAccessVerifier, build_benchmark_v2, validate_benchmark_v2,
+    assert_no_holdout_in_generator_view,
+)
+from .critic_strategies import (
+    CRITIC_VERSION, build_critic_manager_factory, strategy_from_bundle,
+)
+from .statistics_v2 import (
+    STAT_VERSION, FamilyResult, PreregistrationV2,
+    analyse_family_confirmation, freeze_preregistration_v2,
+)
+from .harness_loader import (
+    LOADER_VERSION, CampaignVersionBinding, HarnessLoader, LoaderError,
+    LoadedHarness,
+)
+from .rollback_v2 import ROLLBACK_V2_VERSION, real_rollback
+
 __all__ = [name for name in dir() if not name.startswith("_")]

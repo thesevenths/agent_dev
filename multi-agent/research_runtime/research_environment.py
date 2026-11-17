@@ -163,7 +163,8 @@ def build_default_research_service(domain_name: str = "scinet", *,
                                    db_path: str | Path | None = None,
                                    data_dir: str | Path | None = None,
                                    evidence_provider=None,
-                                   domain_policy=None):
+                                   domain_policy=None,
+                                   hypothesis_manager_factory=None):
     """Build the generic ``ResearchService`` for a registered domain.
 
     ``domain_name`` selects a ``DomainBundle`` from the process-wide registry.
@@ -204,6 +205,7 @@ def build_default_research_service(domain_name: str = "scinet", *,
         adapter=bundle.adapter_factory(),
         llm_generate=llm_generate,
         evidence_provider=evidence_provider,
+        hypothesis_manager_factory=hypothesis_manager_factory,
     ))
 
 
