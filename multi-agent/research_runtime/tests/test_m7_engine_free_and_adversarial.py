@@ -158,7 +158,7 @@ def test_preregistration_is_immutable_and_metric_change_fails(tmp_path):
     assert frozen["preregistration_sha"] == protocol.sha256
 
 
-def test_seeds_are_not_families_and_holdout_quarantine_is_enforced():
+def test_seeds_are_not_families_and_holdout_quarantine_is_enforced(tmp_path):
     pack = load_pack("embodied_world_model")
     ident = pack.dataset_identity()
     fam = ident["family_manifest"]
@@ -171,7 +171,7 @@ def test_seeds_are_not_families_and_holdout_quarantine_is_enforced():
         source={}, budget={}, seed=42, primary_metric="state_mse@1",
         direction="minimize")]
     spec = BenchmarkSpecV2(version="v1", tasks=tasks)
-    verifier = HoldoutAccessVerifier(spec, "/tmp/m7_adversarial_holdout.json")
+    verifier = HoldoutAccessVerifier(spec, tmp_path / "holdout_access.json")
     denied = verifier.authorize(purpose="candidate_tuning",
                                 experiment_id="e",
                                 requested_task_ids=["m7_test_ep1"],
