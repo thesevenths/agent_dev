@@ -47,10 +47,28 @@ def _git_head() -> str:
         return ""
 
 
+def _load_evidence_map(args) -> dict:
+    """Load REAL value-assessment evidence from an operator-supplied file.
+
+    M7.6 P1-A/P1-D: independent review and an explicit EIG observation model are
+    required for a production value ranking. The driver NEVER fabricates them;
+    without this file the run fails closed at VALUE_ASSESSMENT.
+    """
+    if not args.evidence_map:
+        return {}
+    p = Path(args.evidence_map).resolve()
+    if not p.is_file():
+        raise SystemExit(f"EVIDENCE_MAP_NOT_FOUND: {p}")
+    obj = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(obj, dict):
+        raise SystemExit("EVIDENCE_MAP_INVALID: expected a JSON object")
+    return obj
+
+
 def _build_coordinator(*, args, root: Path, db, providers, stores,
-                       approval_id: str) -> tuple[DiscoveryCoordinator, dict]:
+                       approval_id: str, evidence_map: dict) -> tuple[DiscoveryCoordinator, dict]:
     assembly = build_production_runtime(
-        repo_root=Path(__file__).resolve().parents[2], run_id=args.run_id,
+        repo_root=Path(__file__).resolve().parents[1], run_id=args.run_id,
         domain="embodied_world_model",
         backend=_domain_backend(root), out_dir=root / "production")
     return DiscoveryCoordinator(
@@ -64,6 +82,7 @@ def _build_coordinator(*, args, root: Path, db, providers, stores,
         formal_loader=assembly["loader"],
         production_runtime=assembly["adapter"],
         approval_store=stores.approvals, approval_id=approval_id,
+        evidence_map=evidence_map,
         production_mode=True, max_requests=args.max_requests), assembly
 
 
@@ -87,7 +106,8 @@ def _prepare(args, root: Path) -> int:
     stores = ResearchStores(root / "store" / "trusted.sqlite")
     coordinator, assembly = _build_coordinator(
         args=args, root=root, db=db, providers=_providers(root, args),
-        stores=stores, approval_id="")
+        stores=stores, approval_id="",
+        evidence_map=_load_evidence_map(args))
     result = coordinator.run()
     state = coordinator.state
     if result.get("stage") != "HUMAN_APPROVAL" or result.get("status") != "BLOCKED":
@@ -135,7 +155,8 @@ def _resume(args, root: Path) -> int:
     stores = ResearchStores(root / "store" / "trusted.sqlite")
     coordinator, assembly = _build_coordinator(
         args=args, root=root, db=db, providers=_providers(root, args),
-        stores=stores, approval_id=args.approval_id)
+        stores=stores, approval_id=args.approval_id,
+        evidence_map=_load_evidence_map(args))
     result = coordinator.run()
     payload = {
         "version": "m7_6_real_e2e_v1", "phase": "resume",
@@ -174,6 +195,9 @@ def main() -> int:
     ap.add_argument("--run-id", default="arr_m76_real")
     ap.add_argument("--max-requests", type=int, default=6)
     ap.add_argument("--approval-id", default="")
+    ap.add_argument("--evidence-map", default="",
+                    help="JSON with real independent_review + EIG observation "
+                         "model; required for a production value ranking")
     ap.add_argument("--include-s2", action="store_true")
     args = ap.parse_args()
     if not is_available():
