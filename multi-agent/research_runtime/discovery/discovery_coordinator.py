@@ -677,7 +677,35 @@ class DiscoveryCoordinator:
     def _approval(self) -> dict[str, Any]:
         protocol_sha = self.state["preregistration_sha"]
         approval = self._check_approval(protocol_sha)
-        return {"ok": True, "protocol_sha": protocol_sha, **approval}
+        # ARR v1.0 WP-01: explicit COMPOSITE binding. The trusted ApprovalStore
+        # record binds the protocol SHA; a changed dataset/harness/method is
+        # additionally caught by RuntimeState config_sha drift. We record a
+        # composite digest so evidence consumers can verify ALL identities at
+        # once and so any future schema migration has an authoritative value.
+        method_sha = sha256_json({
+            "mme": self.mme, "seeds": self.seeds,
+            "selection_seeds": self.selection_seeds,
+            "replication_seeds": self.replication_seeds,
+            "domain_pack": self.domain})
+        composite = sha256_json({
+            "protocol_sha": protocol_sha,
+            "harness_sha": self.harness_sha,
+            "dataset_shas": self.dataset_shas,
+            "method_sha": method_sha,
+            "git_commit_sha": self.git_commit_sha})
+        self.state["approval_composite_sha"] = composite
+        self._stage("APPROVAL_BINDING", **{
+            "protocol_sha": protocol_sha,
+            "harness_sha": self.harness_sha,
+            "dataset_shas": self.dataset_shas,
+            "method_sha": method_sha,
+            "git_commit_sha": self.git_commit_sha,
+            "composite_sha": composite,
+            "note": "approval_cli binds protocol_sha; composite records the "
+                    "full identity set for downstream verification"})
+        return {"ok": True, "protocol_sha": protocol_sha,
+                "composite_binding_sha": composite, "method_sha": method_sha,
+                **approval}
 
     def _run_experiment(self, *, experiment_id: str, stage: str,
                         arms: list[str], seeds: list[int], splits: list[str],
@@ -864,12 +892,29 @@ class DiscoveryCoordinator:
             claim_id, "ScientificClaim",
             {"text": q.expected_contribution, "question_id": q.question_id},
             source_sha))
+        # ARR v1.0 ADR-003: EXPLICIT three-state mapping. INCONCLUSIVE must
+        # NEVER be written as REFUTES -- uncertainty is not refutation, and a
+        # false REFUTES edge poisons the VerifiedMemory promotion gate.
+        def _selection_edge(v: str) -> str:
+            return {"SUPPORTS": "SUPPORTS", "REFUTES": "REFUTES"}.get(
+                v, "INCONCLUSIVE_EVIDENCE")
+
+        def _replication_edge(v: str) -> str:
+            return {"SUPPORTS": "REPLICATES", "REFUTES": "REFUTES"}.get(
+                v, "INCONCLUSIVE_EVIDENCE")
+
         self.graph.add_edge(source_id="ev_selection", target_id=claim_id,
-                            relation="SUPPORTS" if selection == "SUPPORTS"
-                            else "REFUTES", evidence_sha=source_sha)
+                            relation=_selection_edge(selection),
+                            evidence_sha=source_sha,
+                            rationale=f"selection_verdict={selection}")
         self.graph.add_edge(source_id="ev_replication", target_id=claim_id,
-                            relation="REPLICATES" if replication == "SUPPORTS"
-                            else "REFUTES", evidence_sha=rep_sha)
+                            relation=_replication_edge(replication),
+                            evidence_sha=rep_sha,
+                            rationale=f"replication_verdict={replication}")
+        self.state["claim_edge_mapping"] = {
+            "selection": {"verdict": selection, "edge": _selection_edge(selection)},
+            "replication": {"verdict": replication,
+                            "edge": _replication_edge(replication)}}
         chain = ["LITERATURE_CHECKED", "HYPOTHESIS_REGISTERED",
                  "PREREGISTERED", "EXPERIMENTED", "EVIDENCE_REVIEWED"]
         for state in chain:

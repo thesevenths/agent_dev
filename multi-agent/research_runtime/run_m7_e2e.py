@@ -157,9 +157,14 @@ def _resume(args, root: Path) -> int:
         args=args, root=root, db=db, providers=_providers(root, args),
         stores=stores, approval_id=args.approval_id,
         evidence_map=_load_evidence_map(args))
+    # WP-01: reconcile any campaign claimed by a previous process that died.
+    # Never blindly retry; mark RECOVERY_REQUIRED for explicit verification.
+    recovered = assembly["adapter"].runtime.recover_interrupted_campaigns(
+        args.run_id, executor_id=assembly["adapter"].executor_id)
     result = coordinator.run()
     payload = {
         "version": "m7_6_real_e2e_v1", "phase": "resume",
+        "campaign_recovery": {"interrupted_marked": recovered},
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "repository": git_fingerprint(Path(__file__).resolve().parents[1]),
         "harness_sha": coordinator.harness_sha,

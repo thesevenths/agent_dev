@@ -32,7 +32,12 @@ NODE_TYPES = ("ResearchQuestion", "Paper", "ScientificClaim", "Hypothesis",
               "ResearchExperience")
 EDGE_TYPES = ("SUPPORTS", "REFUTES", "CONTRADICTS", "DERIVED_FROM",
               "TESTED_BY", "REPLICATES", "USES_DATASET", "USES_METHOD",
-              "EXTENDS", "SUPERSEDES")
+              "EXTENDS", "SUPERSEDES",
+              # ARR v1.0 ADR-003: an INCONCLUSIVE verdict is a NEUTRAL evidence
+              # link -- it must NEVER become a REFUTES/REPLICATES edge (that
+              # would turn uncertainty into a contradiction and poison the
+              # memory promotion gate). The Evidence node is still preserved.
+              "INCONCLUSIVE_EVIDENCE")
 LIFECYCLE = ("PROPOSED", "LITERATURE_CHECKED", "HYPOTHESIS_REGISTERED",
              "PREREGISTERED", "EXPERIMENTED", "EVIDENCE_REVIEWED",
              "SUPPORTED", "REPLICATED", "ACCEPTED", "REFUTED",
