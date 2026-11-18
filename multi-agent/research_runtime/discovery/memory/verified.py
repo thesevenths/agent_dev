@@ -28,6 +28,13 @@ from ...harness_rsi.identity import freeze_json, is_sha256, sha256_json
 VERIFIED_STATUSES = ("VERIFIED", "REPLICATED", "FAILED_WITH_CAUSE",
                      "BOUNDED_METHOD")
 CANDIDATE_STATUSES = ("PROPOSED", "UNVERIFIED", "AWAITING_REPLICATION")
+# ARR v1.0 WP-05: six memory CLASSES (orthogonal to candidate/verified tier),
+# and the full lifecycle. Old records default to CANDIDATE-like classes so the
+# append-only hash chain and stored artifacts stay compatible.
+MEMORY_CLASSES = ("CANDIDATE", "VERIFIED", "FAILED_EXPERIMENT",
+                  "METHODOLOGY", "LIMITATION", "CONTRADICTION")
+MEMORY_LIFECYCLE = ("CANDIDATE", "EVIDENCE_ATTACHED", "UNDER_VERIFICATION",
+                    "VERIFIED", "CONTRADICTED", "DEPRECATED", "REVOKED")
 MemoryResolver = Callable[[str], Path | None]
 
 
@@ -55,6 +62,26 @@ class ResearchMemoryRecord:
     confidence: float = 0.0
     rationale: str = ""
     created_at: str = field(default_factory=_now)
+    # ---- ARR v1.0 WP-05/§12.3 additional fields (defaulted for compatibility)
+    memory_class: str = "CANDIDATE"
+    lifecycle: str = "CANDIDATE"
+    evidence_shas: list[str] = field(default_factory=list)
+    source_round: str = ""
+    method_sha: str = ""
+    contradictions: list[str] = field(default_factory=list)
+    supersedes: str = ""
+    last_verified_at: str = ""
+
+    def __post_init__(self) -> None:
+        # Backward compatibility: derive class from verification_status for
+        # legacy records constructed without an explicit memory_class.
+        if self.memory_class == "CANDIDATE" and self.verification_status in (
+                "VERIFIED", "REPLICATED", "FAILED_WITH_CAUSE", "BOUNDED_METHOD"):
+            self.memory_class = (
+                "FAILED_EXPERIMENT" if self.verification_status == "FAILED_WITH_CAUSE"
+                else "METHODOLOGY" if self.verification_status == "BOUNDED_METHOD"
+                else "VERIFIED")
+            self.lifecycle = "VERIFIED"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -301,5 +328,6 @@ class VerifiedResearchMemory:
                 "n_candidate": len(self.candidate.records)}
 
 
-__all__ = ["VERIFIED_STATUSES", "CANDIDATE_STATUSES", "MemoryError",
+__all__ = ["VERIFIED_STATUSES", "CANDIDATE_STATUSES", "MEMORY_CLASSES",
+           "MEMORY_LIFECYCLE", "MemoryError",
            "ResearchMemoryRecord", "VerifiedResearchMemory"]

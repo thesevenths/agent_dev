@@ -46,6 +46,8 @@ class ExperimentProtocol:
     falsification_rules: list[str]
     preregistration_sha: str = ""
     stages: list[str] = field(default_factory=lambda: list(STAGES))
+    # ARR v1.0 WP-04: quantified experiment x hypothesis discrimination.
+    discrimination: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -55,6 +57,50 @@ class ExperimentProtocol:
     @property
     def sha256(self) -> str:
         return sha256_json({**self.to_dict(), "preregistration_sha": ""})
+
+
+def discrimination_matrix(*, hypotheses: list[Any],
+                          arms: list[str]) -> dict[str, Any]:
+    """Quantify whether the designed arms can DISTINGUISH competing hypotheses.
+
+    For each hypothesis we derive a predicted-direction vector over the arms
+    from its observable predictions (coarse but auditable: improve / degrade /
+    unchanged). Two hypotheses are distinguishable if their vectors differ on
+    at least one arm. If any pair is identical, the experiment does NOT
+    discriminate them and must say so (never pretend it does).
+    """
+    arms = list(arms)
+
+    def _direction(h: Any) -> str:
+        text = " ".join(str(p) for p in getattr(h, "predictions", []) or []).lower()
+        has_imp = any(w in text for w in ("improve", "increase", "better",
+                                          "lower mse", "reduces"))
+        has_deg = any(w in text for w in ("degrad", "worse", "no improvement",
+                                          "vanish", "fails"))
+        if has_imp and not has_deg:
+            return "improve"
+        if has_deg and not has_imp:
+            return "degrade"
+        if has_imp and has_deg:
+            return "mixed"
+        return "unchanged"
+
+    vec = {str(getattr(h, "hypothesis_id", getattr(h, "kind", f"H{i}"))):
+           {arm: _direction(h) for arm in arms}
+           for i, h in enumerate(hypotheses)}
+    pairs = {}
+    ids = list(vec)
+    for i, a in enumerate(ids):
+        for b in ids[i + 1:]:
+            differing = [arm for arm in arms if vec[a][arm] != vec[b][arm]]
+            pairs[f"{a}|{b}"] = {"distinguishable": bool(differing),
+                                 "differing_arms": differing}
+    all_distinct = all(p["distinguishable"] for p in pairs.values())
+    return {"arms": arms, "vectors": vec, "pairs": pairs,
+            "all_pairs_distinguishable": all_distinct,
+            "status": "ASSESSED" if len(ids) >= 2 else "NOT_ASSESSED",
+            "limitation": "coarse direction extraction from prediction text; "
+                          "not a statistical power calculation"}
 
 
 def design_experiment(*, question: Any, hypotheses: list[Any],
@@ -77,6 +123,9 @@ def design_experiment(*, question: Any, hypotheses: list[Any],
         "sufficient", False)
     eid = "exp_" + hashlib.sha256(
         f"{question.question_id}|{primary_metric}|{mme}".encode()).hexdigest()[:14]
+    arms_for_disc = ["baseline", "action_conditioned", "capacity_control"]
+    discrimination = discrimination_matrix(
+        hypotheses=hypotheses, arms=arms_for_disc)
     return ExperimentProtocol(
         experiment_id=eid, question_id=question.question_id,
         hypothesis_ids=[h.hypothesis_id for h in hypotheses],
@@ -111,7 +160,8 @@ def design_experiment(*, question: Any, hypotheses: list[Any],
                         "never stop early for favorable result"],
         falsification_rules=["holdout improvement below MME -> refuted",
                              "opposite direction on >50% families -> refuted",
-                             "counter-evidence is append-only, never deleted"])
+                             "counter-evidence is append-only, never deleted"],
+        discrimination=discrimination)
 
 
 def freeze_preregistration(protocol: ExperimentProtocol,
