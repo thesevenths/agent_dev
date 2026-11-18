@@ -95,10 +95,15 @@ class ResearchProgramState:
     def _save(self) -> str:
         import json
         self.obj["updated_at"] = _now()
-        persisted = {k: v for k, v in self.obj.items() if k != "program_manifest_sha"}
-        meta = freeze_json(persisted, self.path)
-        self.obj["program_manifest_sha"] = meta["sha256"]
-        return meta["sha256"]
+        # Compute the manifest digest over the content WITHOUT the digest itself
+        # (self-referential field), then persist the COMPLETE object including
+        # that digest so a restarted process can re-verify it (WP-10).
+        content = {k: v for k, v in self.obj.items()
+                   if k != "program_manifest_sha"}
+        digest = sha256_json(content)
+        self.obj["program_manifest_sha"] = digest
+        freeze_json(self.obj, self.path)
+        return digest
 
     @property
     def status(self) -> str:
