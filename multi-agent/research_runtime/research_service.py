@@ -193,6 +193,10 @@ class ResearchDependencies:
     campaign_root: str = ""
     adapter: Any = None  # ARR 0.1 / R2: the domain's engine adapter (ModelAdapter)
     llm_generate: Callable[[str], Any] | None = None  # ARR 0.1 / R3: injected
+    # M6.1-fix-C: formal Harness Loader. When set, the REAL Dispatcher calls
+    # resolve_for_campaign(campaign_id, domain) BEFORE binding/creating a new
+    # campaign and pins the returned immutable SHA into the run spec + record.
+    harness_loader: Any = None
     # generate(prompt)->str|dict|list for autonomous hypothesis proposals. When
     # None, the service builds one from the shared LLM_* gateway if configured,
     # else falls back to the deterministic RuleBasedProposer.
@@ -804,6 +808,34 @@ class ResearchService:
             existing = self.stores.sessions.campaign_for(
                 plan_id, approval_id, digest)
 
+            # M6.1-fix-C: the FORMAL Dispatcher resolves the immutable harness
+            # version from the injected HarnessLoader. This is the ONLY path that
+            # binds a campaign to a harness SHA -- never a callback echoing a
+            # requested id. A recovered campaign keeps the SHA pinned in its
+            # persisted run_spec, so rollback never switches it mid-run.
+            loaded_harness = None
+            if self.deps.harness_loader is not None:
+                if existing is None:
+                    loaded_harness = self.deps.harness_loader.resolve_for_campaign(
+                        campaign_id=make_campaign_id(
+                            plan_id, approval_id, digest),
+                        domain=self.domain.name
+                        if hasattr(self.domain, "name") else "")
+                else:
+                    # P0-B-5: recovery path must use the EXISTING campaign's
+                    # id. Referencing `campaign_id` here was a NameError because
+                    # it is only assigned later (:847 new / :858 existing).
+                    prior_campaign_id = existing.campaign_id
+                    _prior_rec = self.deps.campaign_store.load_campaign(
+                        prior_campaign_id)
+                    prior = _prior_rec.run_spec if _prior_rec else {}
+                    pinned = str(prior.get("harness_sha256", ""))
+                    if not pinned:
+                        raise ResearchGateError(
+                            "harness_binding_missing",
+                            f"campaign {campaign_id} has no pinned harness SHA; "
+                            "refusing to execute with an unknown version")
+
             if existing is None:
                 # (M4.3-00 / P0-03 #1/#2) round cap: NEW BINDING ONLY. A request
                 # whose binding already exists (recovery / duplicate) never
@@ -863,6 +895,12 @@ class ResearchService:
                 max_total_seconds=self.domain.max_total_seconds,
                 approved_hypothesis_ids=approved_ids,
                 resume=resume,
+                harness_sha256=(loaded_harness.harness_sha
+                                if loaded_harness is not None else ""),
+                harness_component_shas=(dict(loaded_harness.component_shas)
+                                        if loaded_harness is not None else {}),
+                harness_activation_id=(loaded_harness.activation_id
+                                       if loaded_harness is not None else ""),
             )
             session.link("campaign_ids", [campaign_id])
             session.status = "running"

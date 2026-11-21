@@ -92,6 +92,22 @@ CREATE TABLE IF NOT EXISTS rt_checkpoint (
     created_at TEXT NOT NULL,
     PRIMARY KEY (run_id, checkpoint_id)
 );
+-- ARR v1.0 WP-01 durable per-campaign execution claim and state machine.
+-- States CREATED CLAIMED RUNNING COMPLETED FAILED RECOVERY_REQUIRED UNKNOWN.
+-- Ownership via executor_id makes the claim AT-MOST-ONCE not exactly-once.
+CREATE TABLE IF NOT EXISTS rt_campaign_exec (
+    campaign_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    executor_id TEXT NOT NULL DEFAULT '',
+    config_sha TEXT NOT NULL DEFAULT '',
+    harness_sha TEXT NOT NULL DEFAULT '',
+    result_json TEXT NOT NULL DEFAULT '',
+    result_sha TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 S_INIT = "INIT"
@@ -726,6 +742,141 @@ class RuntimeState:
                     "orphan_reservations": [o["reservation_id"] for o in orphans]}
         return {"classification": C_COMPLETE, "journal": integ,
                 "budget": budget, "n_rounds": len(rounds)}
+
+    # ----------------------------------------- ARR v1.0 WP-01: campaign claims
+    CAMPAIGN_STATES = frozenset({
+        "CREATED", "CLAIMED", "RUNNING", "COMPLETED", "FAILED",
+        "RECOVERY_REQUIRED", "UNKNOWN"})
+    CAMPAIGN_TERMINAL = frozenset({"COMPLETED", "FAILED"})
+
+    def claim_campaign(self, *, campaign_id: str, run_id: str,
+                       executor_id: str, config_sha: str,
+                       harness_sha: str) -> dict[str, Any]:
+        """Atomically claim ONE campaign for execution (at-most-once).
+
+        Semantics:
+          * first call      -> state=CLAIMED, ok=True;
+          * same executor re-claim while CLAIMED/RUNNING -> idempotent ok=True;
+          * COMPLETED/FAILED -> ok=False + cached result (NEVER re-execute);
+          * different executor while CLAIMED/RUNNING -> ok=False (concurrent);
+          * RECOVERY_REQUIRED/UNKNOWN -> ok=False (unsafe to auto-resume);
+        """
+        if not campaign_id or not executor_id:
+            raise RuntimeStateError("campaign_id and executor_id required")
+        if not harness_sha:
+            raise RuntimeStateError("harness_sha required for campaign claim")
+        with self.db.session() as conn:  # BEGIN IMMEDIATE -> atomic claim
+            row = conn.execute(
+                "SELECT * FROM rt_campaign_exec WHERE campaign_id=?",
+                (campaign_id,)).fetchone()
+            if row is None:
+                conn.execute(
+                    """INSERT INTO rt_campaign_exec
+                       (campaign_id,run_id,state,executor_id,config_sha,
+                        harness_sha,result_json,result_sha,reason,
+                        created_at,updated_at)
+                       VALUES (?,?, 'CLAIMED', ?,?,?, '', '', '', ?, ?)""",
+                    (campaign_id, run_id, executor_id, config_sha,
+                     harness_sha, _now(), _now()))
+                return {"ok": True, "state": "CLAIMED", "first_claim": True}
+            state = row["state"]
+            if state in self.CAMPAIGN_TERMINAL:
+                return {"ok": False, "state": state, "already_terminal": True,
+                        "result": _load_json(row["result_json"], {}),
+                        "result_sha": row["result_sha"]}
+            if state in ("RECOVERY_REQUIRED", "UNKNOWN"):
+                return {"ok": False, "state": state,
+                        "reason": "unsafe_recovery_requires_human_or_verifier"}
+            if row["executor_id"] != executor_id:
+                return {"ok": False, "state": state,
+                        "reason": "claimed_by_another_executor"}
+            # same executor, CLAIMED/RUNNING: resume-in-place, never duplicate
+            conn.execute(
+                "UPDATE rt_campaign_exec SET state='CLAIMED',updated_at=? "
+                "WHERE campaign_id=?", (_now(), campaign_id))
+            return {"ok": True, "state": "CLAIMED", "first_claim": False,
+                    "resume_in_place": True}
+
+    def campaign_state(self, campaign_id: str) -> dict[str, Any] | None:
+        row = self.db.rows(
+            "SELECT * FROM rt_campaign_exec WHERE campaign_id=?",
+            (campaign_id,))
+        if not row:
+            return None
+        r = row[0]
+        return {"campaign_id": r["campaign_id"], "state": r["state"],
+                "executor_id": r["executor_id"],
+                "config_sha": r["config_sha"], "harness_sha": r["harness_sha"],
+                "result": _load_json(r["result_json"], {}),
+                "result_sha": r["result_sha"], "reason": r["reason"],
+                "created_at": r["created_at"], "updated_at": r["updated_at"]}
+
+    def set_campaign_state(self, campaign_id: str, state: str, *,
+                           executor_id: str = "", result: Any = None,
+                           result_sha: str = "", reason: str = "") -> dict[str, Any]:
+        """Validate a campaign state transition and persist it + optional result."""
+        if state not in self.CAMPAIGN_STATES:
+            raise RuntimeStateError(f"unknown campaign state {state!r}")
+        with self.db.session() as conn:
+            row = conn.execute(
+                "SELECT state,executor_id FROM rt_campaign_exec WHERE campaign_id=?",
+                (campaign_id,)).fetchone()
+            if row is None:
+                raise RuntimeStateError(f"unknown campaign {campaign_id!r}")
+            current = row["state"]
+            allowed = {
+                "CREATED": {"CLAIMED"},
+                "CLAIMED": {"RUNNING", "RECOVERY_REQUIRED", "FAILED"},
+                "RUNNING": {"COMPLETED", "FAILED", "RECOVERY_REQUIRED"},
+                "RECOVERY_REQUIRED": {"RUNNING", "UNKNOWN", "FAILED"},
+                "UNKNOWN": {"FAILED"},
+                "COMPLETED": set(), "FAILED": set(),
+            }
+            if state not in allowed.get(current, set()):
+                raise RuntimeStateError(
+                    f"illegal campaign transition {current}->{state}")
+            if executor_id and row["executor_id"] and row["executor_id"] != executor_id:
+                raise RuntimeStateError("campaign owned by another executor")
+            payload = json.dumps(result, sort_keys=True, ensure_ascii=False,
+                                 default=str) if result is not None else ""
+            conn.execute(
+                """UPDATE rt_campaign_exec SET state=?,result_json=?,
+                   result_sha=?,reason=?,updated_at=? WHERE campaign_id=?""",
+                (state, payload, result_sha, reason, _now(), campaign_id))
+        return {"ok": True, "state": state,
+                "result_sha": result_sha or self.campaign_state(campaign_id)["result_sha"]}
+
+    def recover_interrupted_campaigns(self, run_id: str,
+                                      *, executor_id: str) -> list[dict[str, Any]]:
+        """Mark CLAIMED/RUNNING campaigns as RECOVERY_REQUIRED after a restart.
+
+        NEVER auto-resumes a backend that may have physically executed: it
+        records uncertainty so a verifier/human decides (exactly-once honesty).
+        """
+        with self.db.session() as conn:
+            rows = conn.execute(
+                """SELECT campaign_id,state FROM rt_campaign_exec
+                   WHERE run_id=? AND state IN ('CLAIMED','RUNNING')""",
+                (run_id,)).fetchall()
+            out = []
+            for r in rows:
+                conn.execute(
+                    """UPDATE rt_campaign_exec SET state='RECOVERY_REQUIRED',
+                       reason=?,updated_at=? WHERE campaign_id=?""",
+                    (f"interrupted_from_{r['state']}", _now(), r["campaign_id"]))
+                out.append({"campaign_id": r["campaign_id"],
+                            "from_state": r["state"],
+                            "to_state": "RECOVERY_REQUIRED"})
+        return out
+
+
+def _load_json(raw: str, fallback: Any) -> Any:
+    if not raw:
+        return fallback
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return fallback
 
 
 class RuntimeBudgetExhausted(RuntimeError):

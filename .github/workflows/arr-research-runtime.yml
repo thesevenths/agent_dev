@@ -24,9 +24,9 @@ name: ARR Research Runtime (M2.7 + M3.0)
 
 on:
   push:
-    branches: [feature/arr-0.1-domain-registry]
+    branches: [feature/arr-0.1-domain-registry, feature/arr-m6-harness-rsi, feature/arr-m6-acceptance-closure, feature/arr-m6-acceptance-final-fixes, feature/arr-m7-scientific-discovery, feature/arr-m7-capability-validation, feature/arr-m7-6-production-runtime-closure, feature/arr-v1-0-complete-system]
   pull_request:
-    branches: [feature/arr-0.1-domain-registry]
+    branches: [feature/arr-0.1-domain-registry, feature/arr-m6-harness-rsi, feature/arr-m6-acceptance-closure, feature/arr-m6-acceptance-final-fixes, feature/arr-m7-scientific-discovery, feature/arr-m7-capability-validation, feature/arr-m7-6-production-runtime-closure, feature/arr-v1-0-complete-system]
   workflow_dispatch:
 
 jobs:
@@ -218,11 +218,14 @@ jobs:
             research_runtime/tests/test_m5_integrated_phase0.py \
             research_runtime/tests/test_m5_integrated_runtime.py \
             research_runtime/tests/test_m5_hardening_p0.py \
+            research_runtime/tests/test_m6_harness_rsi.py \
+            research_runtime/tests/test_m6_1_acceptance.py \
             research_runtime/tests/test_m5_integrated_rrsi.py \
             research_runtime/tests/test_m4_3_02_real_engine.py \
             research_runtime/tests/test_m5_00_real_engine.py \
             research_runtime/tests/test_m5_01_02_real_engine.py \
             research_runtime/tests/test_m5_integrated_real_engine.py \
+            research_runtime/tests/test_m6_real_engine.py \
             -q > m3_pytest.log 2>&1
           rc=$?
           if [ "$rc" -ne 0 ]; then
@@ -236,6 +239,16 @@ jobs:
             tail -5 m3_pytest.log
           fi
           exit "$rc"
+
+      - name: Run M7 autonomous-discovery engine-free and adversarial gates
+        # M7 is separated from real-engine runs: these tests use FakeProvider /
+        # FakeAgent / synthetic result artifacts ONLY to prove fail-closed gates,
+        # graph/memory integrity, approval/budget/holdout isolation and resume.
+        # They are NEVER presented as real LLM or real engine evidence.
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          python -m pytest research_runtime/tests/test_m7_*.py -q
 
       - name: Verify CLI safety defaults + frozen statistical protocol
         # Independent smoke: the production entry point must default to
@@ -257,3 +270,38 @@ jobs:
           assert b.require_frozen_manifest is False, 'explicit dev opt-out must work'
           print('CLI safety defaults + M3.0 protocol OK (t_df4=%.6f)' % t4)
           "
+
+  # M7 real E2E is deliberately NOT part of the matrix: it needs real academic
+  # APIs, real LLM credentials and the local embodied engine. It runs only on
+  # manual dispatch; failure is reported separately from the engine-free gate.
+  m7-real-e2e:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: multi-agent
+        shell: bash
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_MODEL: ${{ secrets.LLM_MODEL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install M7 runtime deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "PyYAML>=6.0" "pydantic>=2.7.4" "pytest>=8.0"
+
+      - name: Run real Literature + LLM + Engine E2E
+        run: |
+          python -m research_runtime.run_m7_e2e \
+            --out-dir M7_EVIDENCE/ci_run \
+            --run-id m7_ci_real_discovery \
+            --max-requests 6

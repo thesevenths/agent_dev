@@ -304,6 +304,7 @@ class CampaignRunner:
             status="preflighting",
             dataset_version=run_spec.dataset_version,
             evaluation_split=run_spec.evaluation_split,
+            harness_sha256=getattr(run_spec, "harness_sha256", ""),
             plan=plan.model_dump(mode="json"),
             run_spec=run_spec.model_dump(mode="json"),
             policy_snapshot=self.policy.snapshot(),

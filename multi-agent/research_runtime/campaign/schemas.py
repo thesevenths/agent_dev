@@ -65,6 +65,12 @@ class CampaignRunSpec(BaseModel):
     # P1-02 approved these hypotheses; the campaign re-checks that every
     # candidate actually points at one of them (no unreviewed intervention).
     approved_hypothesis_ids: list[str] = Field(default_factory=list)
+    # M6.1-fix-C: immutable harness version bound by the FORMAL Dispatcher
+    # via HarnessLoader.resolve_for_campaign. Empty = legacy path (no harness
+    # adoption configured); never filled from a requested id at execution.
+    harness_sha256: str = ""
+    harness_component_shas: dict[str, str] = Field(default_factory=dict)
+    harness_activation_id: str = ""
 
     @model_validator(mode="after")
     def validate_spec(self) -> "CampaignRunSpec":
@@ -129,6 +135,8 @@ class CampaignRecord(BaseModel):
     dataset_version: str
     baseline_config_sha256: str | None = None
     evaluation_split: str = "validation"
+    # Immutable harness version this campaign is pinned to (M6.1-fix-C).
+    harness_sha256: str = ""
 
     trials: list[TrialRecord] = Field(default_factory=list)
 
