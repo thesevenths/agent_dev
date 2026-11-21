@@ -1,54 +1,53 @@
-"""ARR-RSI-01 -- minimal, evidence-grounded Diagnosis interface.
+"""ARR-RSI-01 P0.1 -- diagnosis inferred ONLY from observed evidence.
 
-The interface deliberately does NOT accept ground truth. ``EvidenceGroundedDiagnoser``
-reads only the public task view, the recorded trajectory, structured experiment
-results and the evidence index. ``ShuffledDiagnoser`` is an attribution control:
-it keeps the real evidence but swaps the diagnosis with another task's, so any
-apparent improvement attributable to "diagnosis quality" disappears.
+No task family, preset failure mode or sealed intervention value is read here.
+When evidence is insufficient the diagnoser returns an explicit
+``insufficient_evidence`` result and proposes NO intervention.
 """
 from __future__ import annotations
 
+import hashlib
+import math
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from ..failure_diagnoser import FailureDiagnoser
 from ..schemas import ExperimentResult
-from .tasks import assert_no_ground_truth, sha256_json
+from .tasks import ALLOWED_CONFIG_SCHEMA, assert_no_ground_truth, sha256_json
 
 REQUIRED_DIAGNOSIS_FIELDS = (
     "failure_modes", "root_cause", "evidence_refs", "confidence",
     "alternative_explanations", "improvement_hypothesis",
     "proposed_intervention", "expected_metric", "falsification_condition",
+    "diagnosis_id", "insufficient_evidence", "evidence_basis",
 )
+INSUFFICIENT = "insufficient_evidence"
+CAUSE_HORIZON = "dynamics_error_accumulation"
+CAUSE_CAPACITY = "representation_capacity_limited"
+CAUSE_OOD = "ood_generalization_gap"
+CAUSE_WEAK = "weak_prediction_signal"
+CAUSE_INFRA = "infrastructure_failure"
 
-# Generic, framework-independent cause vocabulary. Nothing here names a
-# benchmark target, a domain-specific class or a ground-truth field.
-CAUSE_CAPACITY = "insufficient_representation_capacity"
-CAUSE_DYNAMICS = "latent_dynamics_undertrained"
-CAUSE_OBJECTIVE = "weak_prediction_objective"
-CAUSE_IDENTIFIABILITY = "parameter_identifiability_loss"
-CAUSE_EVIDENCE_GAP = "evidence_gap"
-CAUSE_PIPELINE = "measurement_pipeline_defect"
-
-_FAILURE_TO_CAUSE = {
-    "dynamics_error_accumulation": CAUSE_DYNAMICS,
-    "long_horizon_state_drift": CAUSE_DYNAMICS,
-    "parameter_identifiability_loss": CAUSE_IDENTIFIABILITY,
-    "conservation_signal_weak": CAUSE_OBJECTIVE,
-    "ood_regime_shift": CAUSE_CAPACITY,
+CAUSE_PLAN: dict[str, dict[str, Any]] = {
+    CAUSE_HORIZON: {"key": "train.lr", "direction": "decrease",
+                    "mechanism": "error accumulates over rollout; a smaller "
+                                 "optimisation step may stabilise latent dynamics"},
+    CAUSE_CAPACITY: {"key": "model.predictor_hidden", "direction": "increase",
+                     "mechanism": "poor latent similarity suggests limited "
+                                  "predictor capacity"},
+    CAUSE_OOD: {"key": "model.latent_dim", "direction": "increase",
+                "mechanism": "validation/OOD gap suggests latent bottleneck "
+                             "under regime shift"},
+    CAUSE_WEAK: {"key": "jepa.pred_weight", "direction": "increase",
+                 "mechanism": "flat but weak horizons suggest an underweighted "
+                              "prediction objective"},
 }
-
-# Evidence-derived causes override the failure-mode prior when present.
-_EVIDENCE_CAUSE = {
-    "horizon_degradation": CAUSE_DYNAMICS,
-    "metric_quality": CAUSE_PIPELINE,
-    "no_metrics": CAUSE_EVIDENCE_GAP,
-    "result_unavailable": CAUSE_EVIDENCE_GAP,
-    "pipeline_incomplete": CAUSE_PIPELINE,
-    "process_failure": CAUSE_PIPELINE,
-    "budget_exceeded": CAUSE_EVIDENCE_GAP,
-    "worker_lost": CAUSE_PIPELINE,
-}
+INFRA_ERROR_TOKENS = (
+    "worker_interrupted", "AdapterError", "TimeoutError", "timed out",
+    "KeyError", "engine CLI error", "incomplete", "already exist",
+    "ConfigurationError", "RuntimeError",
+)
 
 
 @dataclass(frozen=True)
@@ -63,6 +62,10 @@ class DiagnosisOutput:
     proposed_intervention: dict[str, Any] | None
     expected_metric: dict[str, Any]
     falsification_condition: str
+    diagnosis_id: str = ""
+    insufficient_evidence: bool = False
+    evidence_basis: dict[str, Any] = field(default_factory=dict)
+    shuffled_from: str = ""
     diagnosis_sha256: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -73,172 +76,232 @@ class DiagnosisOutput:
 
     def validate(self) -> list[str]:
         d = self.to_dict()
-        missing = [k for k in REQUIRED_DIAGNOSIS_FIELDS
-                   if k not in d or d[k] in (None, "", [], {})]
-        if not 0.0 <= float(self.confidence) <= 1.0:
-            missing.append("confidence_range")
-        return missing
+        return [k for k in REQUIRED_DIAGNOSIS_FIELDS
+                if k not in d or d[k] in (None, "", [], {})]
 
 
 @runtime_checkable
 class Diagnosis(Protocol):
-    """Diagnosis agent interface. No ground-truth parameter, by design."""
-
     def diagnose(self, *, task: dict[str, Any], trajectory: dict[str, Any],
                  experiment_results: list[dict[str, Any]],
                  evidence: dict[str, Any],
                  budget: dict[str, Any]) -> DiagnosisOutput: ...
 
 
-def _as_experiment_result(raw: dict[str, Any]) -> ExperimentResult:
-    """Project a recorded engine result into the existing structured schema."""
-    allowed = set(ExperimentResult.model_fields)
-    payload = {k: v for k, v in raw.items() if k in allowed}
-    payload.setdefault("experiment_id", str(raw.get("experiment_id", "unknown")))
-    payload.setdefault("job_id", str(raw.get("job_id", "unknown")))
-    payload.setdefault("status", raw.get("status") or "incomplete")
-    return ExperimentResult(**payload)
+def _num(value: Any) -> float | None:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
 
 
-def _collect_evidence_refs(*, trajectory: dict[str, Any],
-                           experiment_results: list[dict[str, Any]],
-                           evidence: dict[str, Any]) -> list[str]:
-    refs: list[str] = []
-    for key in ("experiment_id", "baseline_id", "report_path", "result_path"):
-        value = trajectory.get(key) or evidence.get(key)
-        if value:
-            refs.append(f"{key}:{value}")
+def _dotted(config: dict[str, Any], key: str, default: Any = None) -> Any:
+    node: Any = config
+    for part in key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return node
+
+
+def _perturb(*, key: str, baseline_config: dict[str, Any], direction: str) -> Any:
+    """Generic type-aware perturbation; NO benchmark value is consulted."""
+    base = _dotted(baseline_config, key, None)
+    schema = next((s for s in ALLOWED_CONFIG_SCHEMA if s["key"] == key), None)
+    if base is None or isinstance(base, bool):
+        if not schema:
+            return None
+        base = 1.0
+    factor = 0.8 if direction == "decrease" else 1.25
+    if isinstance(base, list) and base and all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) for v in base):
+        return [max(1, int(round(v * factor))) if isinstance(v, int)
+                else float(v * factor) for v in base]
+    if isinstance(base, int):
+        return max(1, int(round(base * factor)))
+    if isinstance(base, float):
+        return round(base * factor, 8)
+    return None
+
+
+def _metric_index(results: list[dict[str, Any]],
+                  trajectory: dict[str, Any]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    sources = list(results) + list(trajectory.get("experiment_results") or [])
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        for key, value in (item.get("metrics") or {}).items():
+            v = _num(value)
+            if v is not None:
+                out.setdefault(str(key), v)
+    return out
+
+
+def _horizon_ratio(metrics: dict[str, float]) -> float | None:
+    groups: dict[str, list[tuple[int, float]]] = {}
+    for key, value in metrics.items():
+        m = re.match(r"^(.+)@(\d+)$", key)
+        if m:
+            groups.setdefault(m.group(1), []).append((int(m.group(2)), value))
+    for name, points in groups.items():
+        if len(points) < 2 or not any(
+                t in name.lower() for t in ("mse", "loss", "error", "rmse")):
+            continue
+        points.sort()
+        if points[0][1] > 0:
+            return points[-1][1] / points[0][1]
+    return None
+
+
+def _evidence_refs(*, trajectory: dict[str, Any],
+                   experiment_results: list[dict[str, Any]]) -> list[str]:
+    refs: set[str] = set()
+
+    def add(prefix: str, value: Any) -> None:
+        if isinstance(value, str) and value:
+            refs.add(f"{prefix}:{value}")
+
+    for key in ("baseline_id", "report_path", "result_path", "log_path",
+                "applied_config_path"):
+        add(key, trajectory.get(key))
+    evidence = trajectory.get("evidence_refs") or {}
+    if isinstance(evidence, dict):
+        for key, value in evidence.items():
+            add(key, value if isinstance(value, str) else sha256_json(value)[:16])
     for item in experiment_results:
+        if not isinstance(item, dict):
+            continue
         for key in ("experiment_id", "job_id", "result_path", "log_path"):
-            value = item.get(key)
-            if value:
-                refs.append(f"{key}:{value}")
-    for item in (evidence.get("artifacts") or []):
-        if isinstance(item, dict):
-            for key in ("path", "sha256", "artifact_id"):
-                if item.get(key):
-                    refs.append(f"artifact:{item[key]}")
-        elif item:
-            refs.append(f"artifact:{item}")
+            add(key, item.get(key))
     for call in (trajectory.get("tool_calls") or []):
-        if isinstance(call, dict) and call.get("call_id"):
-            refs.append(f"tool_call:{call['call_id']}")
-    # Stable, de-duplicated ordering. Refs point only to RECORDED artifacts.
-    return sorted(set(str(r) for r in refs))
+        if isinstance(call, dict):
+            add("tool_call", call.get("call_id"))
+    return sorted(refs)
 
 
 class EvidenceGroundedDiagnoser:
-    """Deterministic diagnosis from recorded evidence only."""
+    """Deterministic cause inference from measured evidence only."""
 
-    def __init__(self, *, diagnoser: FailureDiagnoser | None = None):
-        self._diagnoser = diagnoser or FailureDiagnoser()
+    def __init__(self, diagnoser: FailureDiagnoser | None = None):
+        self._rules = diagnoser or FailureDiagnoser()
 
     def diagnose(self, *, task: dict[str, Any], trajectory: dict[str, Any],
                  experiment_results: list[dict[str, Any]],
                  evidence: dict[str, Any],
                  budget: dict[str, Any]) -> DiagnosisOutput:
-        # Fail closed if an upstream caller accidentally supplies GT fields.
         assert_no_ground_truth(task)
-        task_id = str(task.get("task_id", "unknown"))
-        failure_mode = str(task.get("failure_mode", ""))
-        refs = _collect_evidence_refs(trajectory=trajectory,
-                                      experiment_results=experiment_results,
-                                      evidence=evidence)
-        matched: list[str] = []
-        reports: list[dict[str, Any]] = []
+        refs = _evidence_refs(trajectory=trajectory,
+                              experiment_results=experiment_results)
+        metrics = _metric_index(experiment_results, trajectory)
+        errors = " ".join(str(item.get("error") or "") for item in
+                          experiment_results if isinstance(item, dict))
+        matched_rules: list[str] = []
         for raw in experiment_results:
+            if not isinstance(raw, dict):
+                continue
+            payload = {k: v for k, v in raw.items()
+                       if k in ExperimentResult.model_fields}
+            payload.setdefault("experiment_id", "unknown")
+            payload.setdefault("job_id", "unknown")
+            payload.setdefault("status", raw.get("status") or "incomplete")
             try:
-                result = _as_experiment_result(raw)
+                for report in self._rules.diagnose_all(ExperimentResult(**payload)):
+                    matched_rules.append(report.category)
             except Exception:
                 continue
-            for report in self._diagnoser.diagnose_all(result):
-                matched.append(str(report.category))
-                reports.append({"category": report.category,
-                                "layer": report.layer,
-                                "hypothesis": report.hypothesis or "",
-                                "evidence": report.evidence})
-                for key in ("experiment_id", "job_id"):
-                    value = getattr(report, key, "")
-                    if value:
-                        refs.append(f"failure_report:{key}:{value}")
 
-        # Cause selection: evidence first, failure-mode prior second. An
-        # unmatched failure mode is an explicit evidence gap, never a guess.
+        baseline_config = dict(trajectory.get("baseline_config") or {}) \
+            if isinstance(trajectory.get("baseline_config"), dict) else {}
+        ratio = _horizon_ratio(metrics)
+        cosine = [_num(v) for k, v in metrics.items() if "cos" in k.lower()]
+        cosine = [v for v in cosine if v is not None]
+        mean_cos = sum(cosine) / len(cosine) if cosine else None
+        final = trajectory.get("final_conclusion") or {}
+        holdout = _num((final.get("holdout") or {}).get("mean_holdout_delta"))
+        ood = _num((final.get("ood") or {}).get("mean_holdout_delta"))
+        ood_gap = holdout - ood if (holdout is not None and ood is not None) else None
+        basis = {"n_metric_keys": len(metrics), "horizon_ratio": ratio,
+                 "mean_cosine": mean_cos, "ood_gap": ood_gap,
+                 "n_evidence_refs": len(refs),
+                 "matched_rules": sorted(set(matched_rules)),
+                 "n_results": len(experiment_results),
+                 "budget_used": (trajectory.get("budget_usage") or {}).get("jobs_used")}
+
         cause = ""
-        for rule_name, mapped in _EVIDENCE_CAUSE.items():
-            if any(rule_name in m or m in str(reports) for m in matched):
-                cause = mapped
-                break
-        if not cause:
-            cause = _FAILURE_TO_CAUSE.get(failure_mode, CAUSE_EVIDENCE_GAP)
-        if not refs:
-            cause = CAUSE_EVIDENCE_GAP
+        if not refs or not metrics:
+            cause = INSUFFICIENT
+        elif any(token in errors for token in INFRA_ERROR_TOKENS) or \
+                any(r in ("worker_lost", "process_failure", "budget_exceeded",
+                          "result_unavailable", "pipeline_incomplete")
+                    for r in matched_rules):
+            cause = CAUSE_INFRA
+        elif ood_gap is not None and ood_gap > 0.05:
+            cause = CAUSE_OOD
+        elif ratio is not None and ratio > 1.08:
+            cause = CAUSE_HORIZON
+        elif mean_cos is not None and mean_cos < 0.6:
+            cause = CAUSE_CAPACITY
+        elif metrics:
+            cause = CAUSE_WEAK
 
-        confidence = 0.35
-        if refs:
+        insufficient = cause in (INSUFFICIENT, CAUSE_INFRA)
+        plan = CAUSE_PLAN.get(cause, {})
+        key = str(plan.get("key") or "")
+        value = _perturb(key=key, baseline_config=baseline_config,
+                         direction=str(plan.get("direction") or "increase")) \
+            if key else None
+        intervention = None
+        if not insufficient and key and value is not None:
+            intervention = {"key": key, "value": value,
+                            "direction": plan.get("direction"),
+                            "mechanism": plan.get("mechanism")}
+
+        confidence = 0.0
+        if not insufficient:
             confidence = 0.55
-        if matched and refs:
-            confidence = 0.82
-        if len(set(matched)) >= 2 and len(refs) >= 3:
-            confidence = 0.9
-
-        candidates = [iv for iv in (task.get("valid_interventions") or [])
-                      if isinstance(iv, dict) and iv.get("role") == "candidate"]
-        intervention = dict(candidates[0]) if candidates else None
-        if cause == CAUSE_EVIDENCE_GAP or not refs:
-            intervention = None
-        if cause == CAUSE_PIPELINE:
-            intervention = None
-
-        metric = str(task.get("primary_metric") or "latent_mse@1")
-        hypothesis = (
-            f"Evidence ({len(refs)} refs, {len(matched)} matched failure rules) "
-            f"indicates {cause}; a single controlled change to "
-            f"{intervention.get('key') if intervention else 'the measurement pipeline'} "
-            f"should improve {metric} on the matched validation split."
-        )
-        alternatives = [
-            "measurement noise or an engine-side artifact rather than a model effect",
-            "the frozen split is not representative of the stated failure mode",
-            "budget truncation produced an unfalsifiable result",
-        ]
-        if intervention is None:
-            alternatives.insert(
-                0, "insufficient evidence to attribute the failure to a method knob")
-        falsification = (
-            f"Reject if a matched-budget arm changing only "
-            f"{intervention.get('key') if intervention else 'an inert control'} "
-            f"does not improve {metric} on the reserved split, or if any "
-            f"infrastructure failure occurred in the arm."
-        )
-        out = DiagnosisOutput(
-            task_id=task_id,
-            failure_modes=sorted(set(matched)) or ([failure_mode] if failure_mode else ["unclassified"]),
-            root_cause=cause,
-            evidence_refs=refs[:50],
-            confidence=round(float(confidence), 4),
-            alternative_explanations=alternatives,
-            improvement_hypothesis=hypothesis,
-            proposed_intervention=intervention,
-            expected_metric={"name": metric,
-                             "direction": str(task.get("metric_direction") or "minimize"),
-                             "minimum_meaningful_delta": 0.02,
-                             "evaluation_split": "validation"},
-            falsification_condition=falsification,
-        )
-        out_dict = out.to_dict()
-        assert_no_ground_truth(out_dict)
+            if len(refs) >= 3 and len(metrics) >= 2:
+                confidence = 0.75
+            if ratio is not None or ood_gap is not None or mean_cos is not None:
+                confidence = 0.82
+        payload = {
+            "task_id": str(task.get("agent_task_id") or task.get("task_id") or ""),
+            "failure_modes": sorted(set(matched_rules)) or [cause],
+            "root_cause": cause, "evidence_refs": refs[:50],
+            "confidence": round(confidence, 4),
+            "alternative_explanations": [
+                "measurement noise or an engine-side artifact rather than a model effect",
+                "the frozen split is not representative of the observed metric pattern",
+                "budget truncation produced an unfalsifiable result",
+            ],
+            "improvement_hypothesis": (
+                f"Observed evidence {basis} supports {cause}. "
+                + (f"A {plan.get('direction')} change to {key} may improve "
+                   f"{task.get('primary_metric', 'the primary metric')}."
+                   if intervention else "No intervention is justified by this evidence.")),
+            "proposed_intervention": intervention,
+            "expected_metric": {
+                "name": task.get("primary_metric", ""),
+                "direction": task.get("metric_direction", "minimize"),
+                "minimum_meaningful_delta": 0.02, "evaluation_split": "validation",
+            },
+            "falsification_condition": (
+                f"Reject if the matched-budget arm changing only {key} does not "
+                f"improve the reserved split, or if any infrastructure failure "
+                f"occurs in that arm." if key else
+                "No candidate is proposed; result remains INSUFFICIENT_EVIDENCE."),
+            "insufficient_evidence": insufficient,
+            "evidence_basis": basis, "shuffled_from": "", "diagnosis_sha256": "",
+        }
+        digest = sha256_json(payload)
+        out = DiagnosisOutput(diagnosis_id=f"dg_{digest[:16]}", **payload)
+        assert_no_ground_truth(out.to_dict())
         return out
 
 
 class ShuffledDiagnoser:
-    """Attribution control: real evidence, permuted diagnosis.
-
-    ``pool`` is a deterministic mapping task_id -> DiagnosisOutput produced by
-    the evidence-grounded diagnoser on OTHER tasks. The shuffled diagnosis is
-    never used to make a scientific claim; it exists only to test whether the
-    Candidate's gain depends on the diagnosis being correct.
-    """
+    """Attribution control using ANOTHER TASK'S REAL diagnosis."""
 
     def __init__(self, *, pool: dict[str, DiagnosisOutput], seed: int = 20261121):
         self._pool = dict(pool)
@@ -248,33 +311,51 @@ class ShuffledDiagnoser:
                  experiment_results: list[dict[str, Any]],
                  evidence: dict[str, Any],
                  budget: dict[str, Any]) -> DiagnosisOutput:
-        task_id = str(task.get("task_id", "unknown"))
-        others = [k for k in sorted(self._pool) if k != task_id]
-        if not others:
-            raise ValueError("shuffled diagnosis requires >=2 diagnosed tasks")
-        index = (int.from_bytes(
-            __import__("hashlib").sha256(
-                f"{self._seed}|{task_id}".encode("utf-8")).digest()[:4],
-            "big")) % len(others)
-        source = self._pool[others[index]]
-        d = source.to_dict()
-        d["task_id"] = task_id
-        d["evidence_refs"] = sorted(set(
-            [f"shuffled_from:{source.task_id}"] +
-            _collect_evidence_refs(trajectory=trajectory,
-                                   experiment_results=experiment_results,
-                                   evidence=evidence)))[:50]
-        d["improvement_hypothesis"] = (
-            "CONTROL ONLY: diagnosis shuffled from another task; no claim made.")
-        d["diagnosis_sha256"] = ""
-        assert_no_ground_truth(d)
-        return DiagnosisOutput(**{k: d[k] for k in DiagnosisOutput.__dataclass_fields__
-                                  if k in d})
+        own_id = str(task.get("agent_task_id") or task.get("task_id") or "")
+        candidates = [k for k in sorted(self._pool) if k != own_id]
+        refs = _evidence_refs(trajectory=trajectory,
+                              experiment_results=experiment_results)
+        index = int.from_bytes(hashlib.sha256(
+            f"{self._seed}|{own_id}".encode()).digest()[:4], "big")
+        if not candidates:
+            alternatives = [c for c in CAUSE_PLAN]
+            cause = alternatives[index % len(alternatives)]
+            plan = CAUSE_PLAN[cause]
+            marker = "synthetic_shuffle"
+        else:
+            src = self._pool[candidates[index % len(candidates)]]
+            cause = src.root_cause
+            plan = CAUSE_PLAN.get(cause, {})
+            marker = f"shuffled_from:{src.diagnosis_id}"
+        baseline_config = dict(trajectory.get("baseline_config") or {}) \
+            if isinstance(trajectory.get("baseline_config"), dict) else {}
+        key = str(plan.get("key") or "")
+        value = _perturb(key=key, baseline_config=baseline_config,
+                         direction=str(plan.get("direction") or "increase")) \
+            if key else None
+        payload = {
+            "task_id": own_id, "failure_modes": [cause], "root_cause": cause,
+            "evidence_refs": sorted(set(refs + [marker]))[:50], "confidence": 0.0,
+            "alternative_explanations": ["CONTROL ONLY: diagnosis not derived "
+                                         "from this task's evidence"],
+            "improvement_hypothesis": "CONTROL ONLY: shuffled diagnosis; no claim.",
+            "proposed_intervention": ({"key": key, "value": value,
+                                       "direction": plan.get("direction"),
+                                       "mechanism": "shuffled control"}
+                                      if value is not None else None),
+            "expected_metric": {}, "falsification_condition": "CONTROL ONLY.",
+            "insufficient_evidence": False,
+            "evidence_basis": {"shuffle": marker}, "shuffled_from": marker,
+            "diagnosis_sha256": "",
+        }
+        digest = sha256_json(payload)
+        out = DiagnosisOutput(diagnosis_id=f"dg_shuffle_{digest[:12]}", **payload)
+        assert_no_ground_truth(out.to_dict())
+        return out
 
 
 __all__ = [
     "Diagnosis", "DiagnosisOutput", "EvidenceGroundedDiagnoser",
-    "ShuffledDiagnoser", "REQUIRED_DIAGNOSIS_FIELDS",
-    "CAUSE_CAPACITY", "CAUSE_DYNAMICS", "CAUSE_OBJECTIVE",
-    "CAUSE_IDENTIFIABILITY", "CAUSE_EVIDENCE_GAP", "CAUSE_PIPELINE",
+    "ShuffledDiagnoser", "REQUIRED_DIAGNOSIS_FIELDS", "INSUFFICIENT",
+    "CAUSE_HORIZON", "CAUSE_CAPACITY", "CAUSE_OOD", "CAUSE_WEAK", "CAUSE_INFRA",
 ]
