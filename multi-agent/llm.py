@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Any
 
 from runlog import log_event
-from config import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, LLM_VERIFY_SSL
+from config import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, LLM_VERIFY_SSL, LLM_EXTRA_BODY
 from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, MessagesPlaceholder
 from langchain.agents import create_agent
@@ -51,6 +51,10 @@ def create_llm(temperature=0.1, model_name=None):
     model = model_name or LLM_MODEL
     # 并行工具调用开关：仅在显式开启时才把 parallel_tool_calls 注入请求体（避免不支持的后端 400）。
     extra_kwargs = {"model_kwargs": {"parallel_tool_calls": True}} if _PARALLEL_TOOL_CALLS else {}
+    # 额外请求体透传（config.LLM_EXTRA_BODY，来自 .env 的 LLM_EXTRA_BODY JSON）：
+    # 经 SDK extra_body 合并进请求体，用于 Qwen3 关 reasoning（enable_thinking=false）等私有参数。
+    if LLM_EXTRA_BODY:
+        extra_kwargs["extra_body"] = dict(LLM_EXTRA_BODY)
     # 本地服务若为自签名/内网证书，LLM_VERIFY_SSL=false 等价于 curl -k。
     # 注意：langchain-openai 会同时构建同步与异步 httpx 客户端，二者都需显式给
     # api_key/base_url 凭证，否则异步客户端会从 OPENAI_API_KEY 环境变量读取而报

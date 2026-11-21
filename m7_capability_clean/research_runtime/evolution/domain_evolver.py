@@ -1,0 +1,347 @@
+"""ARR 1.1 / F2 -- DOMAIN MODEL evolution layer.
+
+Reuses the EXISTING per-domain ``ALLOWED_KEYS`` / ``VALUE_RULES`` and the
+EXISTING ``research_runtime.candidate_config.CandidateConfigBuilder`` -- it does
+NOT rewrite the domain config safety boundary. A domain candidate is still a
+whitelisted, dotted config override that the builder verifies (forbidden roots,
+frozen dataset on disk, per-seed isolation). This module only adds the
+``DomainModelCandidate`` carrier, generation scoped to a domain's whitelist, and
+a paired-run hook that delegates engine execution to the existing domain
+campaign.
+"""
+from __future__ import annotations
+
+import importlib
+import json
+import math
+from pathlib import Path
+from typing import Any, Callable
+
+from .candidate import CandidateStatus, DomainModelCandidate, CandidateType
+from adaptive_runtime.evolution_spaces import (
+    space_for, DOMAIN_TO_TARGET, is_frozen,
+)
+from research_runtime.candidate_config import CandidateConfigBuilder
+
+#: The canonical layer tag for Domain-Model evolution.
+DOMAIN_LAYER = "domain_model"
+
+_DOMAIN_MODULES = {
+    "scinet": "research_runtime.domains.scinet",
+    "embodied": "research_runtime.domains.embodied",
+    "quant": "research_runtime.domains.quant",
+}
+
+
+def domain_whitelist(domain: str) -> tuple[tuple[str, ...], dict[str, Any]]:
+    mod = importlib.import_module(_DOMAIN_MODULES[domain])
+    return tuple(getattr(mod, "ALLOWED_KEYS", ())), dict(getattr(mod, "VALUE_RULES", {}))
+
+
+#: Canonical fallback so the evaluation direction is always defined even if a
+#: domain module has not yet exported it. The domain modules
+#: (embodied/quant/scinet) are the SINGLE SOURCE OF TRUTH and expose
+#: ``PRIMARY_METRIC`` / ``METRIC_DIRECTION``; this table only guards against a
+#: missing export.
+_METRIC_FALLBACK: dict[str, tuple[str, str]] = {
+    "embodied": ("state_mse@1", "minimize"),
+    "quant": ("net_return_after_cost", "maximize"),
+    "scinet": ("latent_mse@1", "minimize"),
+}
+
+
+def domain_metric(domain: str) -> tuple[str, str]:
+    """Return ``(primary_metric, direction)`` for a domain.
+
+    ``direction`` is ``"minimize"`` or ``"maximize"``. It is read from the
+    domain module's exported ``PRIMARY_METRIC`` / ``METRIC_DIRECTION`` so the
+    optimization goal lives in exactly one place and is shared by the research
+    task, the engine runner and the dual-layer RRSI decision.
+    """
+    mod = importlib.import_module(_DOMAIN_MODULES[domain])
+    pm = getattr(mod, "PRIMARY_METRIC", None)
+    md = getattr(mod, "METRIC_DIRECTION", None)
+    if pm and md:
+        return str(pm), str(md)
+    return _METRIC_FALLBACK.get(domain, ("unknown", "maximize"))
+
+
+def _is_finite(x: Any) -> bool:
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def _std(values: list[float]) -> float:
+    n = len(values)
+    if n < 2:
+        return 0.0
+    m = sum(values) / n
+    return math.sqrt(sum((v - m) ** 2 for v in values) / (n - 1))
+
+
+def _coerce(raw: Any) -> Any:
+    if isinstance(raw, str):
+        try:
+            return int(raw) if raw.isdigit() else float(raw)
+        except ValueError:
+            return raw
+    return raw
+
+
+def _read_ood_q(directory: str | Path, primary_metric: str) -> float:
+    """Read the OOD metric Q that ``scinet_compute`` wrote for one artifact.
+
+    Returns NaN when the OOD evaluation did not run or did not succeed, so a
+    missing / broken OOD result fails closed into the OOD gate (never faked).
+    The OOD Q lives in ``ood_metrics.json`` in the SAME research_runtime job_dir
+    as the ID ``backtest_metrics.json``; the two files are disjoint by design.
+    """
+    p = Path(directory) / "ood_metrics.json"
+    if not p.is_file():
+        return float("nan")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return float("nan")
+    metrics = data.get("metrics") or {}
+    q = metrics.get(primary_metric)
+    if not _is_finite(q):
+        return float("nan")
+    return float(q)
+
+
+def _axis_record(base_Q: list[float], cand_Q: list[float],
+                ho_base: list[float] | None, ho_cand: list[float] | None,
+                sign: float, min_valid_seeds: int, *, prefix: str = ""
+                ) -> dict[str, Any]:
+    """Direction-normalized improvement record for ONE evaluation axis.
+
+    The ID axis uses ``prefix=""``; the OOD axis (M3.3) uses ``prefix="ood_"``.
+    Every field is namespaced with ``prefix`` so the SAME gate primitives
+    (``_significance_direction`` / ``_holdout_confirms`` / ``domain_family_…
+    ``) read the correct axis by key. ``ho_base`` / ``ho_cand`` are ``None``
+    when no holdout seeds were requested for this axis.
+    """
+    valid = [(b, c) for b, c in zip(base_Q, cand_Q)
+             if _is_finite(b) and _is_finite(c)]
+    n_invalid = len(base_Q) - len(valid)
+    improvements = [sign * (c - b) for (b, c) in valid]
+    if valid:
+        mean_improvement = sum(improvements) / len(improvements)
+        std_improvement = _std(improvements)
+        baseline_mean = sum(b for (b, c) in valid) / len(valid)
+    else:
+        mean_improvement = std_improvement = baseline_mean = None
+    f: dict[str, Any] = {
+        f"{prefix}base_Q": base_Q,
+        f"{prefix}cand_Q": cand_Q,
+        f"{prefix}deltas": [round(c - b, 6) for b, c in zip(base_Q, cand_Q)],
+        f"{prefix}improvements": [round(x, 6) for x in improvements],
+        f"{prefix}mean_improvement": (round(mean_improvement, 6)
+                                     if mean_improvement is not None else None),
+        f"{prefix}std_improvement": (round(std_improvement, 6)
+                                    if std_improvement is not None else None),
+        f"{prefix}baseline_mean": (round(baseline_mean, 6)
+                                  if baseline_mean is not None else None),
+        f"{prefix}n_seeds": len(base_Q),
+        f"{prefix}n_valid": len(valid),
+        f"{prefix}n_invalid": n_invalid,
+        f"{prefix}min_valid_seeds": min_valid_seeds,
+    }
+    if ho_base is not None and ho_cand is not None:
+        ho_valid = [(b, c) for b, c in zip(ho_base, ho_cand)
+                    if _is_finite(b) and _is_finite(c)]
+        ho_imp = [sign * (c - b) for (b, c) in ho_valid]
+        f[f"{prefix}holdout_base_Q"] = [b if _is_finite(b) else None
+                                       for b in ho_base]
+        f[f"{prefix}holdout_cand_Q"] = [c if _is_finite(c) else None
+                                       for c in ho_cand]
+        f[f"{prefix}holdout_improvements"] = [round(x, 6) for x in ho_imp]
+        f[f"{prefix}holdout_n_seeds"] = len(ho_base)
+        f[f"{prefix}holdout_n_valid"] = len(ho_valid)
+        f[f"{prefix}holdout_n_invalid"] = len(ho_base) - len(ho_valid)
+        f[f"{prefix}holdout_n_positive"] = sum(1 for x in ho_imp if x > 0)
+        f[f"{prefix}holdout_direction_fraction"] = (
+            round(f[f"{prefix}holdout_n_positive"] / len(ho_imp), 6)
+            if ho_imp else None)
+        if ho_imp:
+            f[f"{prefix}holdout_improvement"] = round(sum(ho_imp) / len(ho_imp), 6)
+            f[f"{prefix}holdout_std_improvement"] = round(_std(ho_imp), 6)
+        else:
+            f[f"{prefix}holdout_improvement"] = None
+            f[f"{prefix}holdout_std_improvement"] = None
+    return f
+
+
+def generate_domain_candidates(*, domain: str, dominant: str,
+                               limit: int = 3) -> list[DomainModelCandidate]:
+    """Generate DOMAIN_MODEL candidates scoped to the domain's whitelist.
+
+    The target is chosen from ``DOMAIN_TO_TARGET`` for the dominant failure, then
+    constrained to the domain's own ``ALLOWED_KEYS`` so we only ever propose
+    knobs the engine actually consumes. Returns an empty list when the dominant's
+    target is not whitelisted for that domain (the caller then falls back to its
+    own harness loop rather than fabricating a domain change).
+    """
+    allowed, _ = domain_whitelist(domain)
+    space = space_for(CandidateType.DOMAIN_MODEL)
+    target = DOMAIN_TO_TARGET.get(dominant)
+    if target is None or target not in allowed:
+        target = next((k for k in space.search_space if k in allowed), None)
+    if target is None or is_frozen(CandidateType.DOMAIN_MODEL, target):
+        return []
+    spec = space.search_space[target]
+    out: list[DomainModelCandidate] = []
+    for raw_new in spec.get("values", []):
+        new = _coerce(raw_new)
+        cand = DomainModelCandidate(
+            candidate_id="", domain=domain, target=target, old=None, new=new,
+            taxonomy=dominant, hypothesis=spec.get("rationale", ""))
+        out.append(cand)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def materialize_domain_candidate(*, domain: str, candidate: DomainModelCandidate,
+                                 base_config: str | Path, project_dir: str | Path,
+                                 campaign_id: str, seed: int,
+                                 dataset_version: str,
+                                 require_frozen_manifest: bool = True
+                                 ) -> dict[str, Any]:
+    """Build isolated baseline + candidate configs via the EXISTING builder.
+
+    Returns the artifact descriptors (directories, config paths, sha256) for the
+    engine to consume. The safety boundary (whitelist, forbidden roots, frozen
+    dataset, per-seed isolation) is enforced by ``CandidateConfigBuilder``.
+    """
+    allowed, value_rules = domain_whitelist(domain)
+    builder = CandidateConfigBuilder(
+        project_dir, allowed_keys=allowed, value_rules=value_rules,
+        require_frozen_manifest=require_frozen_manifest)
+    base = builder.build_baseline(
+        base_config=base_config, campaign_id=campaign_id, seed=seed,
+        dataset_version=dataset_version)
+    cand = builder.build(
+        base_config=base_config, campaign_id=campaign_id,
+        candidate_id=candidate.candidate_id,
+        hypothesis_id=candidate.candidate_id, seed=seed,
+        overrides={candidate.target: candidate.new},
+        dataset_version=dataset_version)
+    return {
+        "base": {
+            "directory": str(base.directory),
+            "config_path": str(base.config_path),
+            "baseline_config_sha256": base.baseline_config_sha256,
+            "candidate_config_sha256": base.candidate_config_sha256,
+        },
+        "candidate": {
+            "directory": str(cand.directory),
+            "config_path": str(cand.config_path),
+            "baseline_config_sha256": cand.baseline_config_sha256,
+            "candidate_config_sha256": cand.candidate_config_sha256,
+        },
+    }
+
+
+#: A domain engine runner takes ONE materialized artifact descriptor and returns
+#: the REAL domain metric Q (latent_mse / state_mse / sharpe ...). It is injected
+#: so the heavy, domain-specific engine (SciNet++ / simulator / backtest) is
+#: reused from the existing campaign rather than faked here.
+DomainRunner = Callable[[dict[str, Any]], float]
+
+
+def evaluate_domain_candidate(*, domain: str, candidate: DomainModelCandidate,
+                              base_config: str | Path, project_dir: str | Path,
+                              campaign_id: str, seeds: tuple[int, ...],
+                              dataset_version: str,
+                              runner: DomainRunner | None = None,
+                              require_frozen_manifest: bool = True,
+                              holdout_seeds: tuple[int, ...] = (),
+                              min_valid_seeds: int = 2,
+                              ood_config_path: str | Path | None = None
+                              ) -> dict[str, Any]:
+    """Paired Base/Candidate experiment for ONE domain candidate on fixed seeds.
+
+    Engine execution is injected via ``runner`` so it reuses the existing domain
+    campaign. When ``runner`` is None a clear error is raised: a fabricated
+    metric is NEVER accepted as real evidence.
+
+    The reported ``improvements`` are DIRECTION-NORMALIZED so that a strictly
+    positive value always means the candidate is better than baseline, regardless
+    of whether the domain metric is minimized (``state_mse@1``) or maximized
+    (``net_return_after_cost``). Raw ``deltas`` (cand - base) are kept for
+    traceability only; the decision is made on ``improvements``.
+
+    Evidence hygiene (no fabricated verdicts):
+      * NaN / Inf / None / missing metrics are NOT treated as a real delta. They
+        increment ``n_invalid``; a candidate with any invalid run, or with fewer
+        than ``min_valid_seeds`` valid paired runs, is INCONCLUSIVE -- never
+        silently ACCEPTED or counted as genuine REJECTION.
+      * An optional independent ``holdout_seeds`` set is evaluated; if it clearly
+        contradicts the paired improvement, the decision is downgraded to
+        INCONCLUSIVE (the gain is not trustworthy on unseen data).
+    """
+    if runner is None:
+        raise NotImplementedError(
+            "evaluate_domain_candidate requires an injected domain engine "
+            "runner (the existing domain campaign). A fabricated metric is "
+            "never accepted as real evidence.")
+    primary_metric, direction = domain_metric(domain)
+    # sign: +1 -> larger (cand - base) is better (maximize);
+    #       -1 -> smaller (cand - base) is better (minimize).
+    sign = -1.0 if direction == "minimize" else 1.0
+
+    def _run_on(run_seeds: tuple[int, ...], *, need_ood: bool
+                ) -> tuple[list[float], list[float], list[float], list[float]]:
+        bQ: list[float] = []
+        cQ: list[float] = []
+        bOQ: list[float] = []
+        cOQ: list[float] = []
+        for seed in run_seeds:
+            arts = materialize_domain_candidate(
+                domain=domain, candidate=candidate, base_config=base_config,
+                project_dir=project_dir, campaign_id=campaign_id, seed=seed,
+                dataset_version=dataset_version,
+                require_frozen_manifest=require_frozen_manifest)
+            bQ.append(runner(arts["base"]))
+            cQ.append(runner(arts["candidate"]))
+            if need_ood:
+                bOQ.append(_read_ood_q(arts["base"]["directory"], primary_metric))
+                cOQ.append(_read_ood_q(arts["candidate"]["directory"], primary_metric))
+        return bQ, cQ, bOQ, cOQ
+
+    rec: dict[str, Any] = {
+        "candidate_type": CandidateType.DOMAIN_MODEL.value,
+        "domain": domain,
+        "primary_metric": primary_metric,
+        "metric_direction": direction,
+        "target": candidate.target,
+        "old": candidate.old,
+        "new": candidate.new,
+        "taxonomy": candidate.taxonomy,
+        "hyp_fingerprint": candidate.hyp_fingerprint,
+    }
+
+    # ---- ID axis (in-distribution): prefix "" reuses the exact M3.0 gate ----
+    base_Q, cand_Q, _bO, _cO = _run_on(seeds, need_ood=False)
+    rec.update(_axis_record(base_Q, cand_Q, None, None, sign, min_valid_seeds))
+    if holdout_seeds:
+        ho_base, ho_cand, _hbO, _hcO = _run_on(holdout_seeds, need_ood=False)
+        rec.update(_axis_record(base_Q, cand_Q, ho_base, ho_cand, sign,
+                               min_valid_seeds))
+
+    # ---- OOD axis (M3.3, regime shift): SAME gate, namespaced "ood_" ----
+    # The runner produces the OOD Q as a side-effect (scinet_compute writes
+    # ood_metrics.json); _read_ood_q then reads it. When ``ood_config_path`` is
+    # None the axis is simply absent and every OOD gate read fails closed.
+    if ood_config_path is not None:
+        _b, _c, ood_base_Q, ood_cand_Q = _run_on(seeds, need_ood=True)
+        ood_rec = _axis_record(ood_base_Q, ood_cand_Q, None, None, sign,
+                               min_valid_seeds, prefix="ood_")
+        if holdout_seeds:
+            _hb, _hc, ho_base_o, ho_cand_o = _run_on(holdout_seeds, need_ood=True)
+            ood_rec.update(_axis_record(ood_base_Q, ood_cand_Q, ho_base_o,
+                                        ho_cand_o, sign, min_valid_seeds,
+                                        prefix="ood_"))
+        rec.update(ood_rec)
+    return rec

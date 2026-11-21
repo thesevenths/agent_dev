@@ -24,6 +24,24 @@ LLM_MODEL = os.getenv("LLM_MODEL", "qwen-plus")
 # 是否校验 SSL 证书；本地自签名/内网证书请设为 false（等价于 curl -k）
 LLM_VERIFY_SSL = os.getenv("LLM_VERIFY_SSL", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 
+# === 额外请求体字段（OpenAI SDK extra_body 透传，任何 OpenAI 兼容后端通用）===
+# 作用：把 JSON 里写的字段原样合并进 /chat/completions 请求体，用于承载非 OpenAI 标准的
+#       私有参数（经 SDK extra_body 通道，绕过 SDK 类型校验）。
+# 典型用途：Qwen3 系列关闭 reasoning 思维链（省 token + 降延迟）：
+#       LLM_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":false}}
+# 注意：切到不认识该字段的后端（如 DashScope）时必须清空/注释本行，否则请求会被后端拒绝。
+LLM_EXTRA_BODY_RAW = os.getenv("LLM_EXTRA_BODY", "").strip()
+if LLM_EXTRA_BODY_RAW:
+    import json as _json
+    try:
+        LLM_EXTRA_BODY: dict = _json.loads(LLM_EXTRA_BODY_RAW)
+        if not isinstance(LLM_EXTRA_BODY, dict):
+            raise ValueError("顶层必须是 JSON object")
+    except ValueError as e:
+        raise ValueError(f"LLM_EXTRA_BODY 不是合法 JSON object: {e} (raw={LLM_EXTRA_BODY_RAW!r})") from None
+else:
+    LLM_EXTRA_BODY = {}
+
 
 # === 自建端点必须绕过系统代理 ===
 # 症状：模型「连不上」（SSL: UNEXPECTED_EOF_WHILE_READING / 502 / Connection error），

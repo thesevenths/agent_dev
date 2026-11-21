@@ -1,0 +1,76 @@
+# =============================================================================
+# SciNet++ smoke config -- P0 end-to-end acceptance run for research_api.
+# -----------------------------------------------------------------------------
+# Tiny enough to finish in seconds on CPU, but it exercises the REAL
+# train.py -> evaluate.py pipeline, so the Agent -> Adapter -> SciNet++ loop
+# is verified with genuine artifacts rather than mocks.
+#
+#   python train.py     --config configs/pendulum_smoke.yaml --epochs 1
+#   python evaluate.py  --config configs/pendulum_smoke.yaml --run-id <same>
+# =============================================================================
+experiment: pendulum_smoke
+seed: 42                 # model init / training randomness ONLY
+device: cpu
+output_dir: outputs
+
+# --- Data -------------------------------------------------------------------
+# All four splits are frozen on disk with SHA-256 + manifest verification.
+# ``dataset_seed`` (not ``seed``) defines data identity, so a paired
+# multi-seed experiment can change ``seed`` without minting a new dataset.
+data:
+  generator: pendulum
+  dataset_seed: 20261109
+  frozen_dir: datasets/pendulum_smoke_v1
+  sequence_length: 80
+  block_size: 20          # 4 blocks -> rollout_steps up to 3
+  t_max: 8.0
+  train_samples: 64
+  validation_samples: 16  # train-time monitoring (train.py)
+  adapt_samples: 16       # TTA adaptation (tta.py)
+  test_samples: 16        # final independent evaluation ONLY (evaluate.py --split test)
+
+# --- Model ------------------------------------------------------------------
+model:
+  latent_dim: 4
+  encoder_type: mlp
+  encoder_hidden: [32, 16]
+  predictor_type: mlp
+  predictor_hidden: [32, 32]
+
+# --- V-JEPA training --------------------------------------------------------
+jepa:
+  rollout_steps: [1, 2, 3]
+  ema_momentum: 0.996
+  ema_warmup_epochs: 1
+  pred_weight: 1.0
+  vicreg_var_weight: 25.0
+  vicreg_cov_weight: 1.0
+
+# --- Optimization -----------------------------------------------------------
+train:
+  epochs: 1
+  batch_size: 16
+  lr: 0.001
+  weight_decay: 0.0001
+
+# --- Kept for the other stages (probe / symbolic / tta) ---------------------
+probe:
+  hidden: [32, 16]
+  epochs: 5
+  lr: 0.001
+  out_dim: 2
+
+symbolic:
+  niterations: 5
+  binary_operators: ["+", "-", "*"]
+  unary_operators: ["exp", "cos"]
+  max_complexity: 8
+  batch_size: 32
+  parallelism: serial
+  early_stop: 0.0
+
+tta:
+  steps: 3
+  lr: 0.0005
+  adapt_encoder: false
+  n_samples: 8
