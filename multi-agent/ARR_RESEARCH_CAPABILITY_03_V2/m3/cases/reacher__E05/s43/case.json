@@ -1,0 +1,451 @@
+{
+  "agent_fresh": {
+    "abstain": false,
+    "alternatives": [
+      {
+        "cause": "insufficient_model_capacity",
+        "why_rejected": "Underfitting would manifest as consistently high errors across all steps without recovery. The observed non-monotonic step errors (step_5_mse=8.70 > step_10_mse=5.54) and the explicit high learning rate point to training dynamics rather than architectural limits."
+      },
+      {
+        "cause": "dynamics_distribution_shift",
+        "why_rejected": "Distribution shift causes compounding error growth in long horizons. Here, error_growth is negative (-0.632) and rollout_mse (7.118) remains tightly coupled to one_step_mse (7.181), ruling out trajectory-level divergence."
+      },
+      {
+        "cause": "insufficient_state_action_coverage",
+        "why_rejected": "While n_episodes=8 with random actions limits coverage, poor coverage typically degrades rollout performance disproportionately. The fact that rollout error does not exceed one-step error, combined with the high final training loss, indicates the model cannot fit the available data due to optimizer behavior rather than data scarcity."
+      }
+    ],
+    "base_url": "http://192.168.50.46:8888/v1",
+    "case_id": "case_369a0f47ddae",
+    "confidence": 0.82,
+    "diagnostic_experiment": "Reduce learning rate by one order of magnitude (lr=0.03) and retrain for the same number of epochs, logging per-epoch train loss and validation MSE.",
+    "error": "",
+    "evidence_against": [
+      "Negative error_growth (-0.632) directly contradicts compounding dynamics shift or severe underfitting, both of which would produce positive, accelerating error growth.",
+      "Rollout MSE (7.118) is slightly lower than one-step MSE (7.181), showing local prediction consistency despite high absolute error, inconsistent with distributional mismatch or coverage gaps."
+    ],
+    "evidence_for": [
+      "Learning rate is excessively high (model.lr=0.3), which commonly causes gradient oscillation and prevents convergence to a stable minimum in MSE regression tasks.",
+      "Train final loss is high (8.198) and closely mirrors one-step MSE (7.181), indicating the optimizer failed to minimize the training objective effectively.",
+      "Prediction errors fluctuate non-monotonically across rollout steps (step_5_mse=8.700 > step_10_mse=5.537), a hallmark of unstable gradient updates or noisy parameter updates during training/evaluation."
+    ],
+    "expected_outcome": "If optimization_instability is the root cause, the lower LR will yield a substantially lower train_final_loss (<5.0) and stabilize the non-monotonic step errors into a consistent trend.",
+    "falsification_condition": "Reducing the learning rate produces negligible improvement in train_final_loss or error stability, while doubling hidden dimensions to [64, 64] immediately drops train_final_loss below 4.0.",
+    "generator": "qwen3.6-flash",
+    "missing_evidence": [
+      "Per-epoch training loss trajectory to confirm oscillation or divergence patterns.",
+      "Gradient norm statistics or Hessian condition number to quantify optimization landscape difficulty."
+    ],
+    "model": "qwen3.6-flash",
+    "ok": true,
+    "primary_cause": "optimization_instability",
+    "prompt_sha256": "ab018aea573d6050ecb4e3f33aa2d92edc3e2de393ecf0efa6f51d0bcfa93beb",
+    "proposed_cause": "optimization_instability",
+    "rejections": [],
+    "response_sha256": "800f2ea82b99acf3e9299cf20ceb6cc777e1d1bffb5431cc2a7fa859f566d104"
+  },
+  "agent_transfer": {
+    "abstain": false,
+    "alternatives": [
+      {
+        "cause": "insufficient_model_capacity",
+        "why_rejected": "The hidden size [32, 32] is modest, but underfitting typically produces consistently high error across all prediction horizons without significant fluctuation. The observed erratic step-wise MSE (step_5: 8.70, step_10: 5.54) and high final training loss point more strongly to gradient oscillation than representational bottleneck. Transferred knowledge shows capacity interventions yield moderate improvement (confidence 0.66), weaker than the learning rate signal."
+      },
+      {
+        "cause": "insufficient_state_action_coverage",
+        "why_rejected": "Only 8 episodes were collected, limiting exploration, but data scarcity usually manifests as uniformly elevated prediction error rather than the high, non-convergent train_final_loss (8.198) and horizon-dependent error swings seen here. Knowledge confidence for sample augmentation is 0.63, secondary to the optimization signal."
+      }
+    ],
+    "base_url": "http://192.168.50.46:8888/v1",
+    "case_id": "case_369a0f47ddae",
+    "confidence": 0.88,
+    "diagnostic_experiment": "Retrain the dynamics model using a fixed learning rate of 0.001 (reducing by two orders of magnitude) while keeping all other hyperparameters identical, and log per-epoch train/validation loss and gradient norms.",
+    "error": "",
+    "evidence_against": [
+      "Rollout MSE (7.1185) is slightly lower than one-step MSE (7.1813), contradicting the hallmark of dynamics_distribution_shift where multi-step error compounds rapidly.",
+      "Error growth metric is negative (-0.6326), showing rollout error does not diverge monotonically, which rules out severe policy-induced distribution shift as the dominant factor.",
+      "Action mode is random with scale 1.0, providing uniform excitation; lack of targeted exploration would not explain the high training loss or gradient-like instability patterns."
+    ],
+    "evidence_for": [
+      "Current learning rate is 0.3, which is orders of magnitude above standard practice for MLP dynamics modeling and directly matches the configuration regime known to trigger optimization_instability.",
+      "High train_final_loss (8.1987) indicates the optimizer failed to settle into a stable basin, consistent with excessive step sizes causing gradient oscillation or divergence.",
+      "Non-monotonic step-wise MSE progression (step_5: 8.700, step_10: 5.537) reflects unstable trajectory propagation rather than systematic model bias or compounding distribution shift."
+    ],
+    "expected_outcome": "Training loss should decrease smoothly and converge to a substantially lower plateau (<3.0), with one-step and rollout MSE dropping proportionally. Gradient norms should remain bounded, confirming that the original LR=0.3 caused optimization_instability.",
+    "falsification_condition": "If reducing the learning rate to 0.001 yields negligible improvement in train_final_loss or prediction MSE, or if loss continues to diverge/oscillate, then optimization_instability is not the primary driver.",
+    "generator": "qwen3.6-flash",
+    "missing_evidence": [
+      "Gradient norm trajectories or weight update magnitudes across training steps to confirm oscillatory behavior.",
+      "Validation loss curve to distinguish whether the high train loss stems from optimization failure or severe overfitting.",
+      "Learning rate schedule history to determine if a warmup or decay was omitted."
+    ],
+    "model": "qwen3.6-flash",
+    "ok": true,
+    "primary_cause": "optimization_instability",
+    "prompt_sha256": "adbf2ff1641fa3e9be0b270084e6634a46040ce028ff0819db2f33a73820bbfa",
+    "proposed_cause": "optimization_instability",
+    "rejections": [],
+    "response_sha256": "afe7080be6df3250f5a55330bb12b5315c7bcbbb153ca9eb598018fccf707be5"
+  },
+  "arms": {
+    "arr_fresh": {
+      "applied_config": {
+        "epochs": 160,
+        "model": {
+          "hidden": [
+            32,
+            32
+          ],
+          "lr": 0.001
+        },
+        "seed": 43,
+        "test_data": {
+          "action_mode": "random",
+          "action_scale": 1.0,
+          "max_steps": 30,
+          "n_episodes": 6,
+          "target_mode": "mixed"
+        },
+        "train_data": {
+          "action_mode": "random",
+          "action_scale": 1.0,
+          "max_steps": 30,
+          "n_episodes": 8,
+          "target_mode": "mixed"
+        }
+      },
+      "arm": "arr_fresh",
+      "budget": {
+        "max_epochs": 160,
+        "seed": 43,
+        "wall_seconds": 1.498
+      },
+      "config_sha256": "1d081e5efeb769ffa296b6001834100a016a3c19d49c65f0d210d9a90bb8dc67",
+      "data_sha256": "8db448a11808f1af3f9cb64fbc7322282bb61c9122d93f52a546386f018ab510",
+      "error": "",
+      "metrics": {
+        "error_growth": 0.026020698337620895,
+        "one_step_mse": 0.27027478146053163,
+        "rollout_mse": 0.46210557160787097,
+        "step_10_mse": 0.5271573174519232,
+        "step_5_mse": 0.39705382576381876,
+        "train_final_loss": 0.15092337901393574
+      },
+      "model_sha256": "1af8d885fe83c7b89accacb104ae04ef20f239f024af3b6067c1c06a56cc05b7",
+      "ok": true,
+      "regime_id": "reacher::E05",
+      "seed": 43,
+      "test_sha256": "39a3bedd59b084c2e68c5b8d05fbfe31255a9ce056780b02469c3b8573ceadf9"
+    },
+    "arr_transfer": {
+      "applied_config": {
+        "epochs": 160,
+        "model": {
+          "hidden": [
+            32,
+            32
+          ],
+          "lr": 0.001
+        },
+        "seed": 43,
+        "test_data": {
+          "action_mode": "random",
+          "action_scale": 1.0,
+          "max_steps": 30,
+          "n_episodes": 6,
+          "target_mode": "mixed"
+        },
+        "train_data": {
+          "action_mode": "random",
+          "action_scale": 1.0,
+          "max_steps": 30,
+          "n_episodes": 8,
+          "target_mode": "mixed"
+        }
+      },
+      "arm": "arr_transfer",
+      "budget": {
+        "max_epochs": 160,
+        "seed": 43,
+        "wall_seconds": 1.519
+      },
+      "config_sha256": "1d081e5efeb769ffa296b6001834100a016a3c19d49c65f0d210d9a90bb8dc67",
+      "data_sha256": "8db448a11808f1af3f9cb64fbc7322282bb61c9122d93f52a546386f018ab510",
+      "error": "",
+      "metrics": {
+        "error_growth": 0.026020698337620895,
+        "one_step_mse": 0.27027478146053163,
+        "rollout_mse": 0.46210557160787097,
+        "step_10_mse": 0.5271573174519232,
+        "step_5_mse": 0.39705382576381876,
+        "train_final_loss": 0.15092337901393574
+      },
+      "model_sha256": "1af8d885fe83c7b89accacb104ae04ef20f239f024af3b6067c1c06a56cc05b7",
+      "ok": true,
+      "regime_id": "reacher::E05",
+      "seed": 43,
+      "test_sha256": "39a3bedd59b084c2e68c5b8d05fbfe31255a9ce056780b02469c3b8573ceadf9"
+    },
+    "base": {
+      "applied_config": {
+        "epochs": 160,
+        "model": {
+          "hidden": [
+            32,
+            32
+          ],
+          "lr": 0.3
+        },
+        "seed": 43,
+        "test_data": {
+          "action_mode": "random",
+          "action_scale": 1.0,
+          "max_steps": 30,
+          "n_episodes": 6,
+          "target_mode": "mixed"
+        },
+        "train_data": {
+          "action_mode": "random",
+          "action_scale": 1.0,
+          "max_steps": 30,
+          "n_episodes": 8,
+          "target_mode": "mixed"
+        }
+      },
+      "arm": "base",
+      "budget": {
+        "max_epochs": 160,
+        "seed": 43,
+        "wall_seconds": 1.557
+      },
+      "config_sha256": "4f489b1f62bc6a28dbc64567664701d5eede71b7a7913d2786f59c9d973ae48a",
+      "data_sha256": "8db448a11808f1af3f9cb64fbc7322282bb61c9122d93f52a546386f018ab510",
+      "error": "",
+      "metrics": {
+        "error_growth": -0.632617334420809,
+        "one_step_mse": 7.181317412492414,
+        "rollout_mse": 7.1185190820212405,
+        "step_10_mse": 5.536975745969216,
+        "step_5_mse": 8.700062418073266,
+        "train_final_loss": 8.198766326904297
+      },
+      "model_sha256": "377724ee8e3983e00be24b736e2efd45cace1252cca3bb06764205c919b81bc6",
+      "ok": true,
+      "regime_id": "reacher::E05",
+      "seed": 43,
+      "test_sha256": "39a3bedd59b084c2e68c5b8d05fbfe31255a9ce056780b02469c3b8573ceadf9"
+    },
+    "oracle": {
+      "applied_config": {
+        "epochs": 160,
+        "model": {
+          "hidden": [
+            32,
+            32
+          ],
+          "lr": 0.001
+        },
+        "seed": 43,
+        "test_data": {
+          "action_mode": "random",
+          "action_scale": 1.0,
+          "max_steps": 30,
+          "n_episodes": 6,
+          "target_mode": "mixed"
+        },
+        "train_data": {
+          "action_mode": "random",
+          "action_scale": 1.0,
+          "max_steps": 30,
+          "n_episodes": 8,
+          "target_mode": "mixed"
+        }
+      },
+      "arm": "oracle",
+      "budget": {
+        "max_epochs": 160,
+        "seed": 43,
+        "wall_seconds": 1.553
+      },
+      "config_sha256": "1d081e5efeb769ffa296b6001834100a016a3c19d49c65f0d210d9a90bb8dc67",
+      "data_sha256": "8db448a11808f1af3f9cb64fbc7322282bb61c9122d93f52a546386f018ab510",
+      "error": "",
+      "metrics": {
+        "error_growth": 0.026020698337620895,
+        "one_step_mse": 0.27027478146053163,
+        "rollout_mse": 0.46210557160787097,
+        "step_10_mse": 0.5271573174519232,
+        "step_5_mse": 0.39705382576381876,
+        "train_final_loss": 0.15092337901393574
+      },
+      "model_sha256": "1af8d885fe83c7b89accacb104ae04ef20f239f024af3b6067c1c06a56cc05b7",
+      "ok": true,
+      "regime_id": "reacher::E05",
+      "seed": 43,
+      "test_sha256": "39a3bedd59b084c2e68c5b8d05fbfe31255a9ce056780b02469c3b8573ceadf9"
+    },
+    "random": {
+      "applied_config": {
+        "epochs": 160,
+        "model": {
+          "hidden": [
+            64,
+            64
+          ],
+          "lr": 0.3
+        },
+        "seed": 43,
+        "test_data": {
+          "action_mode": "random",
+          "action_scale": 1.0,
+          "max_steps": 30,
+          "n_episodes": 6,
+          "target_mode": "mixed"
+        },
+        "train_data": {
+          "action_mode": "random",
+          "action_scale": 1.0,
+          "max_steps": 30,
+          "n_episodes": 8,
+          "target_mode": "mixed"
+        }
+      },
+      "arm": "random",
+      "budget": {
+        "max_epochs": 160,
+        "seed": 43,
+        "wall_seconds": 1.668
+      },
+      "config_sha256": "9c69470ef99c188732eca3db8b6be018d8116bc6e98169c8f19ae45f1af77ce3",
+      "data_sha256": "8db448a11808f1af3f9cb64fbc7322282bb61c9122d93f52a546386f018ab510",
+      "error": "",
+      "metrics": {
+        "error_growth": -0.6465387219658788,
+        "one_step_mse": 7.148743270918241,
+        "rollout_mse": 7.154535618161956,
+        "step_10_mse": 5.538188813247256,
+        "step_5_mse": 8.770882423076657,
+        "train_final_loss": 8.192906379699707
+      },
+      "model_sha256": "cb3232aa622f2330adc347f5b2733f7af60a226fad87b4c53da71c99795560f3",
+      "ok": true,
+      "regime_id": "reacher::E05",
+      "seed": 43,
+      "test_sha256": "39a3bedd59b084c2e68c5b8d05fbfe31255a9ce056780b02469c3b8573ceadf9"
+    }
+  },
+  "case_id": "reacher::E05::s43",
+  "diagnoses": {
+    "arr": {
+      "abstain": false,
+      "candidates": [
+        "optimization_instability",
+        "insufficient_model_capacity",
+        "insufficient_state_action_coverage"
+      ],
+      "confidence": 0.88,
+      "evidence_for": [
+        "Current learning rate is 0.3, which is orders of magnitude above standard practice for MLP dynamics modeling and directly matches the configuration regime known to trigger optimization_instability.",
+        "High train_final_loss (8.1987) indicates the optimizer failed to settle into a stable basin, consistent with excessive step sizes causing gradient oscillation or divergence.",
+        "Non-monotonic step-wise MSE progression (step_5: 8.700, step_10: 5.537) reflects unstable trajectory propagation rather than systematic model bias or compounding distribution shift."
+      ],
+      "primary": "optimization_instability"
+    },
+    "oracle": {
+      "candidates": [
+        "optimization_instability"
+      ],
+      "confidence": 1.0,
+      "evidence_for": [],
+      "primary": "optimization_instability"
+    },
+    "random": {
+      "candidates": [],
+      "confidence": 0.5,
+      "evidence_for": [],
+      "primary": "insufficient_model_capacity"
+    },
+    "rule": {
+      "candidates": [
+        "insufficient_model_capacity",
+        "optimization_instability"
+      ],
+      "confidence": 0.6,
+      "evidence_for": [],
+      "primary": "insufficient_model_capacity"
+    },
+    "shuffled": {
+      "candidates": [],
+      "confidence": 0.5,
+      "evidence_for": [],
+      "primary": "insufficient_state_action_coverage"
+    }
+  },
+  "evidence": {
+    "artifact_resolver": {
+      "claims": [
+        {
+          "actual_sha256": "70a3b0a3adf40d0551ed1ddcf186c8dcb1e92ec23fab31ed09eb50912714a2b8",
+          "artifact_path": "E:\\agent_dev\\multi-agent\\ARR_RESEARCH_CAPABILITY_03_V2\\m3\\cases\\reacher__E05\\s43\\base\\run.json",
+          "artifact_sha256": "70a3b0a3adf40d0551ed1ddcf186c8dcb1e92ec23fab31ed09eb50912714a2b8",
+          "claim_id": "artifact:base:run_json",
+          "claim_sha256": "8b55100d3d3c0882a7c9ca4d1f3d80c6e328aca34d0467a145b5c93ab6ee1d31",
+          "claim_text": "engine run record with verified metrics",
+          "ok": true,
+          "reasons": [],
+          "run_id": "base"
+        },
+        {
+          "actual_sha256": "377724ee8e3983e00be24b736e2efd45cace1252cca3bb06764205c919b81bc6",
+          "artifact_path": "E:\\agent_dev\\multi-agent\\ARR_RESEARCH_CAPABILITY_03_V2\\m3\\cases\\reacher__E05\\s43\\base\\model_signature.json",
+          "artifact_sha256": "377724ee8e3983e00be24b736e2efd45cace1252cca3bb06764205c919b81bc6",
+          "claim_id": "artifact:base:model_signature",
+          "claim_sha256": "2e2e87fd5f5be9d703e804278304bc6ec78f566703900cf6ee50bc9aece0f2f4",
+          "claim_text": "trained model signature",
+          "ok": true,
+          "reasons": [],
+          "run_id": "base"
+        }
+      ],
+      "integrity_pass": true,
+      "n_claims": 2,
+      "n_verified": 2
+    },
+    "config_view": {
+      "data.action_mode": "random",
+      "data.action_scale": 1.0,
+      "data.n_episodes": 8,
+      "model.hidden": [
+        32,
+        32
+      ],
+      "model.lr": 0.3
+    },
+    "metrics": {
+      "error_growth": -0.632617334420809,
+      "one_step_mse": 7.181317412492414,
+      "rollout_mse": 7.1185190820212405,
+      "step_10_mse": 5.536975745969216,
+      "step_5_mse": 8.700062418073266,
+      "train_final_loss": 8.198766326904297
+    }
+  },
+  "fresh_cause": "optimization_instability",
+  "independent_unit": "reacher::E05",
+  "knowledge_sha256": "2e57b8fc66d5b7f293f119fa6122ff3b39138f7629af3193c8c75bd49c8c9c60",
+  "normalized_improvement": {
+    "arr_fresh": 0.9623641783344141,
+    "arr_transfer": 0.9623641783344141,
+    "oracle": 0.9623641783344141,
+    "random": 0.0045359562463438965
+  },
+  "ok": true,
+  "regime_id": "reacher::E05",
+  "seed": 43,
+  "track": "M3",
+  "transfer_cause": "optimization_instability",
+  "truth": {
+    "cause": "optimization_instability",
+    "oracle_sensitivity": 0.8954
+  }
+}
