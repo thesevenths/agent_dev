@@ -71,3 +71,34 @@ Verified knowledge items transferred: 4 (SHA-256 2e57b8fc66d5b7f2)
 - State-based dynamics (SciNet++) and Reacher-v5 dynamics are simulator experiments; no visual JEPA, no real robot, no action-conditioned representation learning beyond a small MLP dynamics model.
 - Independent units are task regimes (10 + 6); seeds are repeated measurements.
 - Overall PASS requires M1, M2 and M3 each PASS; engineering PASS cannot compensate a scientific FAIL.
+
+## Deliverables index
+
+- Source audit: `ARR_RESEARCH_CAPABILITY_03_SOURCE_AUDIT.md`
+- Preregistration (frozen): `ARR_RESEARCH_CAPABILITY_03_V2/preregistration.json`
+- Canonical results: `ARR_RESEARCH_CAPABILITY_03_V2/canonical_results.json`
+- Statistical analysis: `ARR_RESEARCH_CAPABILITY_03_V2/statistical_analysis.json`
+- Evidence audit: `ARR_RESEARCH_CAPABILITY_03_V2/evidence_audit.json`
+- Failure analysis: `ARR_RESEARCH_CAPABILITY_03_V2/failure_analysis.json`
+- Full experiment data: `ARR_RESEARCH_CAPABILITY_03_V2/m2_cases.json`, `m3_cases.json`
+- Reproduction commands: see Source Audit §9
+
+## Final scientific answer
+
+1. Does ARR genuinely diagnose scientific failures? **PARTIAL** — accuracy
+   0.583 (< 0.65 gate), over-confident (ECE 0.241); significantly above random
+   but below acceptance. M1 = FAIL.
+2. Does ARR select better interventions than Random Research? **NO clear
+   evidence** — Candidate vs Random +0.048, CI crosses 0, Holm n.s.
+3. Does ARR produce measurable causal improvements? **YES vs Base**
+   (+0.759, Holm p≈1.6e-6), but not distinguishable from random research.
+4. Does ARR transfer verified knowledge to a new embodied domain? **NO** —
+   Transfer vs Fresh -0.118, n.s.
+5. Does Research Memory improve over Fresh Research? **NO measured benefit**
+   in this campaign.
+6. Actual limitations: E03 evidence-ambiguity (shared config), confidence
+   miscalibration, no abstention, no random-beating attribution, no transfer
+   gain.
+
+Overall: **INCONCLUSIVE**. This campaign does NOT certify ARR as an
+Autonomous Scientific Research System.
