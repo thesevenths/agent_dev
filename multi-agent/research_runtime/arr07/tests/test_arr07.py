@@ -61,3 +61,13 @@ def test_leak_detection():
         assert_no_leak({"configuration": {"hidden": [4]}})
     with pytest.raises(IntegrityError):
         assert_no_leak({"cause": "capacity"})
+
+
+def test_evidence_gate_is_evidence_sensitive():
+    from research_runtime.arr07.evidence_gate import evidence_candidates, gated_prompt
+    opt = evidence_candidates({"one_step_mse": 19.0, "final_loss": 12.0})
+    act = evidence_candidates({"one_step_mse": 17.0, "final_loss": 0.0007})
+    assert opt[0] == "EXP_OPT" and "EXP_OPT" not in act
+    assert act[0] in ("EXP_ACT", "EXP_COV", "EXP_DIST")
+    o = gated_prompt({"measurement": {"one_step_mse": 19.0}}, opt)
+    assert "evidence_supported_candidates" in o
