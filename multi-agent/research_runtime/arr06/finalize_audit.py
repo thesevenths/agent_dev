@@ -52,9 +52,16 @@ def finalize(root: str | Path) -> dict:
         "rq2_research_selection": "PASS" if (c["rq2"].get("arr_vs_random",{}).get("significant")
             and c["rq2"].get("arr_vs_random",{}).get("mean",0) >= g["rq2_mme"])
             else "INCONCLUSIVE",
-        "rq3_memory_transfer": "PASS" if (c["rq3"].get("gated_vs_fresh",{}).get("mean",0)
-            >= g["rq3_mme"] and c["rq3"].get("negative_transfer_rate",1) <= g["rq3_max_negative"])
-            else "INCONCLUSIVE",
+        "rq3_memory_transfer": (
+            "FAIL" if (c["rq3"].get("gated_vs_fresh",{}).get("p",1) <= 0.05
+                       and c["rq3"].get("gated_vs_fresh",{}).get("mean",0) < 0)
+            else "PASS" if (c["rq3"].get("gated_vs_fresh",{}).get("mean",0)
+                            >= g["rq3_mme"]
+                            and c["rq3"].get("negative_transfer_rate",1)
+                            <= g["rq3_max_negative"])
+            else "INCONCLUSIVE"),
+        # Task book rule: a statistically significant harmful effect is FAIL,
+        # never INCONCLUSIVE. ARR-06 gated transfer is -0.426 at p~0.
         "rq4_methodology_evolution": "PASS" if c["rq4"].get("actual_promotions",0) >= 1
             and not c["rq4"].get("ood_regression",True) else "INCONCLUSIVE",
         "rq5_rq_discovery": "PASS" if (c["rq5"].get("arr_vs_random",{}).get("mean",0)

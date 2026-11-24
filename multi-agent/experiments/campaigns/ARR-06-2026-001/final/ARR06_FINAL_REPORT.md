@@ -6,17 +6,17 @@ Overall: **PARTIALLY VALIDATED** · Certification: **L4** · Terminal: COMPLETED
 
 | Layer | Verdict |
 |---|---|
-| certification_level | L4 |
+| source_integrity | PASS |
 | engineering | PASS |
-| independent_audit | PASS |
-| overall | PARTIALLY VALIDATED |
 | reproducibility | PASS |
 | rq1_belief_calibration | PASS |
 | rq2_research_selection | PASS |
-| rq3_memory_transfer | INCONCLUSIVE |
+| rq3_memory_transfer | FAIL |
 | rq4_methodology_evolution | INCONCLUSIVE |
 | rq5_rq_discovery | PASS |
-| source_integrity | PASS |
+| independent_audit | PASS |
+| certification_level | L4 |
+| overall | PARTIALLY VALIDATED |
 
 ## Source & Determinism
 
@@ -58,10 +58,10 @@ Overall: **PARTIALLY VALIDATED** · Certification: **L4** · Terminal: COMPLETED
 ## Independent Audit
 
 {
-  "claims": true,
   "integrity": true,
-  "replay": true,
-  "statistics": true
+  "statistics": true,
+  "claims": true,
+  "replay": true
 }
 
 ## Budget
@@ -69,12 +69,12 @@ Overall: **PARTIALLY VALIDATED** · Certification: **L4** · Terminal: COMPLETED
 {
   "formal": 405,
   "llm": 60,
+  "preflight": 12,
+  "replay": 80,
   "max_formal": 700,
   "max_llm": 600,
   "max_preflight": 80,
-  "max_replay": 120,
-  "preflight": 12,
-  "replay": 80
+  "max_replay": 120
 }
 
-- Canonical SHA-256: d6daf9fb21e8ee107e8210a10ff4e937d5d80926a4769f32fe527c18e8fdba21
+- Canonical SHA-256: 6bb242a32f8e8e0ae569689d344477577e110f701def8f670481ecf435641aba
