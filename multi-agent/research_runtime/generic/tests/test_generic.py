@@ -103,3 +103,37 @@ def test_scinet_loop_wiring_uses_generic_modules():
     src = inspect.getsource(scinet_loop)
     assert "GoalGate" in src and "design_discriminative" in src
     assert "run_scinet_experiment" in src
+
+
+def test_llm_autonomy_validates_proposals_and_finish():
+    from research_runtime.generic.llm_autonomy import (
+        LLMResearcher, validate_proposal)
+    allowed = {"train.lr": (0.0, 1.0), "model.latent_dim": None}
+    ok, why, clean = validate_proposal({"train.lr": 0.01}, allowed)
+    assert ok and clean == {"train.lr": 0.01}
+    bad, why, _ = validate_proposal({"train.lr": 5.0}, allowed)
+    assert not bad and "outside" in why
+    bad2, why2, _ = validate_proposal({"fake.key": 1}, allowed)
+    assert not bad2 and "not in allowed" in why2
+    calls = []
+    def gen(prompt):
+        calls.append(prompt)
+        return '{"finish": true, "reasoning": "mse 0.01 < 0.026", "quoted_metrics": {"latent_mse@1": 0.01}}'
+    r = LLMResearcher(gen, Path("experiments/campaigns/ARR-07-AUTONOMY-TEST"))
+    d = r.decide_finish(objective="minimize mse", target=0.1,
+                        baseline={"latent_mse@1": 0.026},
+                        latest={"latent_mse@1": 0.01}, improvement=0.6,
+                        iteration=0, max_iterations=3)
+    assert d.finish is True and d.quoted_metrics["latent_mse@1"] == 0.01
+
+
+def test_budget_does_not_rewrite_llm_finish_verdict():
+    from research_runtime.generic.llm_autonomy import LLMResearcher
+    calls = []
+    def gen(prompt):
+        calls.append(prompt)
+        return '{"finish": false, "reasoning": "target not met", "quoted_metrics": {}}'
+    r = LLMResearcher(gen, Path("experiments/campaigns/ARR-07-AUTONOMY-TEST2"))
+    d = r.decide_finish(objective="x", target=0.1, baseline={}, latest={},
+                        improvement=0.05, iteration=1, max_iterations=2)
+    assert d.finish is False, "LLM said continue; budget exhaustion must NOT rewrite it"
