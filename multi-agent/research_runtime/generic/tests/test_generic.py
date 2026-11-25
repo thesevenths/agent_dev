@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
 from research_runtime.generic.identifiability import (
     RegisteredExperiment, audit, apply_override, effective_config_hash,
@@ -76,3 +77,29 @@ def test_unfalsifiable_hypotheses_flagged():
     op = Operator("OP", "x", lambda c, v: c, [1])
     audit = check_unfalsifiable([h1, h2], [op])
     assert audit["unfalsifiable"] == [["H1", "H2"]]
+
+
+def test_scinet_backend_config_materialisation():
+    from research_runtime.arr07.scinet_backend import materialise_config, ALLOWED
+    from research_runtime.adapters.scinet_adapter import SciNetAdapter
+    import tempfile
+    a = SciNetAdapter(strict=False)
+    with tempfile.TemporaryDirectory() as td:
+        p = materialise_config(a.project_dir / "configs/pendulum_smoke.yaml",
+                               {"train.lr": 0.0005}, Path(td) / "c.yaml")
+        cfg = __import__("yaml").safe_load(Path(p).read_text(encoding="utf-8"))
+        assert cfg["train"]["lr"] == 0.0005
+        try:
+            materialise_config(a.project_dir / "configs/pendulum_smoke.yaml",
+                               {"bad.key": 1}, Path(td) / "x.yaml")
+            assert False, "unsupported knob must raise"
+        except ValueError:
+            pass
+
+
+def test_scinet_loop_wiring_uses_generic_modules():
+    import inspect
+    from research_runtime.arr07 import scinet_loop
+    src = inspect.getsource(scinet_loop)
+    assert "GoalGate" in src and "design_discriminative" in src
+    assert "run_scinet_experiment" in src

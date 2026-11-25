@@ -72,8 +72,14 @@ class ResearchBrain:
             prompt + "\n---RESPONSE---\n" + raw, encoding="utf-8")
         return raw
 
-    def plan(self, observation: dict, history: list[dict]) -> tuple[str, str]:
-        """Return (reasoning, chosen experiment id)."""
+    def plan(self, observation: dict, history: list[dict],
+             allowed_ids: set[str] | None = None) -> tuple[str, str]:
+        """Return (reasoning, chosen experiment id).
+
+        allowed_ids: the current task's experiment menu. Defaults to the
+        Reacher benchmark IDs for backward compatibility; SciNet/other backends
+        MUST pass their own candidate IDs (otherwise valid choices get replaced).
+        """
         prompt = {
             "role": "autonomous_researcher",
             "task": "You are studying a dynamical system whose held-out prediction "
@@ -92,15 +98,19 @@ class ResearchBrain:
         if text.startswith("```"):
             text = "\n".join(l for l in text.splitlines()
                              if not l.strip().startswith("```")).strip()
+        if text.startswith("json\n"):
+            text = text[5:].strip()
         try:
             d = json.loads(text)
             exp = str(d.get("experiment_id", ""))
             reasoning = str(d.get("reasoning", ""))[:800]
         except (ValueError, TypeError):
             exp, reasoning = "", raw[:800]
-        if exp not in {e.id for e in benchmark.EXPERIMENTS}:
-            # Fallback: deterministic round-robin when LLM output is malformed.
-            exp = benchmark.EXPERIMENTS[len(history) % len(benchmark.EXPERIMENTS)].id
+        allowed = allowed_ids or {e.id for e in benchmark.EXPERIMENTS}
+        if exp not in allowed:
+            # Fallback: deterministic first candidate when LLM output is malformed.
+            ordered = sorted(allowed)
+            exp = ordered[len(history) % len(ordered)] if ordered else ""
         return reasoning, exp
 
 
