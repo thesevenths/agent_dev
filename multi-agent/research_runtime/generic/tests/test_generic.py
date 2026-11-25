@@ -222,3 +222,18 @@ def test_scinet_config_seed_propagation():
         p = materialise_config(a.project_dir / "configs/pendulum_smoke.yaml",
                                {"train.lr": 0.01}, Path(td) / "c.yaml", seed=43)
         assert yaml.safe_load(Path(p).read_text(encoding="utf-8"))["seed"] == 43
+
+
+def test_change_budget_limits_llm_proposal():
+    from research_runtime.generic.llm_autonomy import LLMResearcher
+    calls = []
+    def gen(prompt):
+        calls.append(prompt)
+        return ('{"reasoning": "change many", "overrides": {"train.lr": 0.01, '
+                '"jepa.pred_weight": 5.0, "model.latent_dim": 8}}')
+    r = LLMResearcher(gen, Path("experiments/campaigns/ARR-07-CHANGEBUDGET-TEST"))
+    p = r.propose_experiment(objective="x", allowed={
+        "train.lr": (0.0, 1.0), "jepa.pred_weight": (0.0, 100.0),
+        "model.latent_dim": (2, 32)}, baseline_metrics={}, history=[],
+        max_changes=2)
+    assert p.valid is False and "max 2" in p.rejection_reason

@@ -82,6 +82,9 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
             json.dumps({"n_train_samples": 64}), encoding="utf-8")
     contract = load_contract(root)
     n_train = load_dataset_scale(root)
+    prior_path = root / "prior_evidence.json"
+    prior_evidence = (json.loads(prior_path.read_text(encoding="utf-8"))
+                      if prior_path.is_file() else {})
 
     base = scinet_backend.run_scinet_experiment(
         experiment_id=f"auto_{core.sha256_json(task_id)[:8]}_base",
@@ -105,7 +108,9 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
             baseline_metrics=baseline, history=history,
             search_hint=memory.direction_hint(metric=scinet_backend.DEFAULT_METRIC),
             contract={"goals": [g.to_dict() for g in contract.goals],
-                      "rule": contract.evaluate(baseline, latest)["rule"]})
+                      "rule": contract.evaluate(baseline, latest)["rule"]},
+            max_changes=2,
+            prior_evidence=prior_evidence)
         if not p.valid:
             res.rounds.append({"iteration": it, "phase": "proposal",
                                "valid": False, "reason": p.rejection_reason,

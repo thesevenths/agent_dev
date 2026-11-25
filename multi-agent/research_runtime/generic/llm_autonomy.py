@@ -114,7 +114,9 @@ class LLMResearcher:
                            baseline_metrics: dict[str, float],
                            history: list[dict],
                            search_hint: dict[str, Any] | None = None,
-                           contract: dict[str, Any] | None = None) -> Proposal:
+                           contract: dict[str, Any] | None = None,
+                           max_changes: int = 2,
+                           prior_evidence: dict[str, Any] | None = None) -> Proposal:
         payload = {
             "role": "autonomous_researcher",
             "task": "Propose ONE experiment by choosing SciNet++ model structure "
@@ -124,6 +126,16 @@ class LLMResearcher:
             "baseline_measured_metrics": baseline_metrics,
             "previous_rounds": history,
             "search_memory_hint": search_hint or {"hint": "no trials yet"},
+            "verified_prior_evidence": prior_evidence or {"note": "none supplied"},
+            "prior_evidence_rule": ("These are MEASURED results from earlier real "
+                                    "experiments. Treat them as strong evidence: "
+                                    "if a prior config improved the objective, "
+                                    "test it (or a nearby value) before inventing "
+                                    "new directions."),
+            "change_budget": (f"Change AT MOST {max_changes} config keys per round. "
+                              "One-factor-at-a-time is preferred so the measured "
+                              "effect can be attributed. Changing 7 keys at once "
+                              "previously lowered cosine while MSE improved."),
             "why_constraints_exist": ("Structural limits are enforced in code because "
                                       "a 64-sample dataset cannot fit a huge model; "
                                       "see rejected attempts in previous_rounds."),
@@ -139,6 +151,10 @@ class LLMResearcher:
             return Proposal("", {}, raw, False, "LLM response not valid JSON")
         reasoning = str(d.get("reasoning", ""))[:1200]
         ok, why, clean = validate_proposal(d.get("overrides"), allowed)
+        if ok and len(clean) > max_changes:
+            return Proposal(reasoning, clean, raw, False,
+                            f"proposal changes {len(clean)} keys, max {max_changes} "
+                            "per round (one-factor-at-a-time)")
         return Proposal(reasoning, clean, raw, ok, why)
 
     # ③ LLM decides finish vs continue
