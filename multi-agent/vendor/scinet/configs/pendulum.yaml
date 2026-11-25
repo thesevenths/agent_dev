@@ -1,0 +1,80 @@
+# =============================================================================
+# SciNet++ (2026) configuration -- 1D damped pendulum.
+# -----------------------------------------------------------------------------
+# Ground-truth physical concepts to be rediscovered by the latent space:
+#   gamma (damping rate) and omega (angular frequency) of
+#       x(t) = A * exp(-gamma * t) * cos(omega * t + phi).
+# This single file drives every stage of the pipeline:
+#   train.py -> analyze.py -> symbolic.py -> evaluate.py -> tta.py
+# =============================================================================
+
+experiment: pendulum
+seed: 42
+device: cuda            # falls back to cpu automatically when unavailable
+output_dir: outputs
+
+# --- Data -------------------------------------------------------------------
+data:
+  generator: pendulum   # pendulum | double_pendulum
+  sequence_length: 800  # timesteps per trajectory
+  block_size: 160       # encoder window; MUST span ~10 time-units so that BOTH
+                        # omega (>=1 oscillation) and gamma (visible envelope
+                        # decay) are identifiable from a single block. A short
+                        # window (e.g. 20 steps) makes the concepts unrecoverable.
+  t_max: 80.0           # physical time-span -> dt=0.1, each block spans 10 units
+  train_samples: 50000
+  test_samples: 2000
+
+# --- Model ------------------------------------------------------------------
+model:
+  latent_dim: 4                   # >= #concepts (gamma,omega) + nuisances (A,phi)
+  encoder_type: conv              # mlp | conv | transformer (conv is default; transformer available but slower)
+  conv_channels: [64, 128, 128]   # conv feature channels (used when type: conv)
+  tf_d_model: 64                  # transformer width   (used when type: transformer)
+  tf_heads: 4                     # transformer attention heads
+  tf_layers: 2                    # transformer encoder layers
+  encoder_hidden: [256, 128]      # head after pooling (conv) / hidden layers (mlp)
+  predictor_type: mlp              # mlp | transformer (mlp recommended; see docs)
+  predictor_hidden: [256, 256]    # capacity for multi-step latent dynamics
+  pred_tf_heads: 2                # predictor transformer heads (when type: transformer)
+  pred_tf_layers: 2               # predictor transformer layers
+
+# --- V-JEPA training --------------------------------------------------------
+jepa:
+  rollout_steps: [1, 2, 3, 4]     # multi-step latent horizons (<= num_blocks-1 = 4)
+  ema_momentum: 0.996           # target-encoder EMA momentum (base)
+  ema_warmup_epochs: 10         # momentum ramps up during warmup
+  pred_weight: 1.0              # weight of the latent prediction loss
+  vicreg_var_weight: 25.0       # VICReg variance (anti-collapse) weight
+  vicreg_cov_weight: 1.0        # VICReg covariance (decorrelation) weight
+
+# --- Optimization -----------------------------------------------------------
+train:
+  epochs: 200
+  batch_size: 1024      # large batch -> stable VICReg var/cov statistics
+  lr: 0.001
+  weight_decay: 0.0001
+
+# --- Physics probe (SciNet concept discovery) -------------------------------
+probe:
+  hidden: [32, 16]
+  epochs: 50
+  lr: 0.001
+  out_dim: 2            # predict (gamma, omega)
+
+# --- Symbolic regression (AI Feynman / PySR) --------------------------------
+symbolic:
+  niterations: 40
+  binary_operators: ["+", "-", "*"]
+  unary_operators: ["exp", "cos", "log", "sqrt", "inv"]
+  max_complexity: 15
+  batch_size: 100
+  parallelism: serial     # Windows下multithreading会吞掉逐轮日志且小数据更慢
+  early_stop: 0.0         # >0时,best loss低于该值即停止(如1e-3);0=关闭
+
+# --- Test-time adaptation (AdaJEPA) -----------------------------------------
+tta:
+  steps: 30
+  lr: 0.0005
+  adapt_encoder: false  # adapt predictor only (true = also adapt encoder)
+  n_samples: 64

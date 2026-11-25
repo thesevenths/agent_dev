@@ -1,0 +1,101 @@
+# =============================================================================
+# SciNet++ -- P1-B1 Controlled Pendulum V2 (20-episode pilot)
+# -----------------------------------------------------------------------------
+#   python scripts/collect_controlled_pendulum_v2.py \
+#       --config configs/dynamics/controlled_pendulum_v2_pilot.yaml
+#
+# Q-A DECISION (approved by reviewer): RESTORE the original spec
+# P2_03_ACTION_JEPA.md 4.4 for the primary training distribution. The v1
+# strong-drive pilot is preserved unchanged as historical stress-test evidence.
+#
+# This config is EXPLICIT: every physical / data / collapse / OOD value is a
+# config key (no implicit defaults), and the collector writes the RESOLVED
+# values into manifest.json together with git SHA and dataset hash.
+#
+# Determinism: SHA-256 seed derivation (see derive_episode_seed), NOT
+# master_seed*1000. Verified by scripts/check_config_impl_consistency.py.
+# =============================================================================
+experiment:
+  name: controlled_pendulum_v2_pilot
+  seed: 20261112
+  output_root: datasets/controlled_pendulum_v2_pilot
+  git_commit_required: true          # collector records actual HEAD SHA
+
+simulator:
+  integrator: rk4                    # classical RK4, fixed step, float64
+  theta_representation: unwrapped    # theta never reduced mod 2*pi
+  dt: 0.02                          # seconds per step (primary distribution)
+  episode_steps: 1000               # T transitions -> 1001 observations
+  torque_bounds: [-1.0, 1.0]        # N*m (spec 4.4)
+  observation_dim: 2                # [theta_unwrapped(rad), omega(rad/s)]
+  action_dim: 1                     # [torque(N*m)]
+  per_step_finite_guard: true       # assert finite at EVERY RK4 step
+  parameter_validation: true        # m>0, L>0, dt>0, g>0, b>=0, all finite
+
+# Physical parameter distributions (PRIMARY/train ranges from spec 5.1).
+distributions:
+  gravity_g: 9.81                   # fixed for the primary distribution
+  theta0_range: [-3.141592653589793, 3.141592653589793]   # U(-pi, pi)
+  omega0_range: [-1.0, 1.0]                                # U(-1, 1) rad/s
+  mass_range: [0.8, 1.2]            # kg, train range (spec 5.1)
+  length_range: [0.8, 1.2]         # m,  train range (spec 5.1)
+  damping_rate_range: [0.05, 0.15] # 1/s normalized b = c/(m*L^2), train range
+
+# Four action profiles from the spec + a genuine zero-torque profile.
+# `action_hold_steps_options` provides diverse hold durations.
+action_profiles:
+  - name: random
+    type: random
+  - name: step
+    type: step
+    fraction: 0.5
+    magnitude: 0.6
+  - name: sinusoid
+    type: sinusoid
+    amplitude: 0.7
+    frequency_hz: 0.5
+    phase: 0.0
+  - name: alternating
+    type: alternating
+    magnitude: 0.5
+  - name: zero
+    type: zero                     # genuine all-zero torque episode
+action_hold_steps_options: [1, 2, 5, 10]
+
+# Preregistered latent-collapse thresholds (spec 4.4). MUST be frozen before
+# any frozen_test / parameter_ood_test result is inspected.
+collapse_thresholds:
+  min_latent_std: 0.1
+  max_collapsed_fraction: 0.25
+  max_cov_offdiag: 0.1
+  require_finite: true
+
+# Four Parameter-OOD groups from spec 5.1 (PRESERVED, no fifth group added).
+# Not generated in the pilot; recorded so the full dataset inherits them.
+parameter_ood_groups:
+  mass_ood:     {mass: [1.4, 1.6], length: [0.8, 1.2], damping: [0.05, 0.15], episodes: 75}
+  length_ood:   {mass: [0.8, 1.2], length: [1.4, 1.6], damping: [0.05, 0.15], episodes: 75}
+  damping_ood:  {mass: [0.8, 1.2], length: [0.8, 1.2], damping: [0.20, 0.30], episodes: 75}
+  joint_ood:    {mass: [1.4, 1.6], length: [1.4, 1.6], damping: [0.20, 0.30], episodes: 75}
+
+# Preregistered regime criteria (reviewer Phase 3).
+regime_criteria:
+  continuous_rotation: {min_abs_winding: 1.0, max_omega_sign_changes: 2}
+  bounded_oscillation: {max_theta_range_rad: 6.283185307179586, min_omega_sign_changes: 2}
+  transitional: otherwise
+
+pilot:
+  episodes: 20
+  storage_dtype: float64
+  require_exactly: true
+
+# Q-C: short_rod stress-test evaluated separately with dt=0.005, preserving
+# the same physical duration and torque waveform (200*0.02 = 800*0.005 = 4 s).
+stress_test:
+  source: datasets/controlled_pendulum_pilot   # historical v1, READ ONLY
+  scenario: short_rod
+  dt: 0.005
+  preserve_physical_duration: true
+
+# Contract alignment: observations [B,T+1,2] / conditions [B,T,1] /
+# valid_mask [B,T] bool / episode_ids [B] str == dynamics.contracts.DynamicsBatch.

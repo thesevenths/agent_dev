@@ -306,3 +306,79 @@ langgraph dev
 | 投递结果                      | mail2    |
 
 </details>
+
+---
+
+## 10. ARR-07 自主科研循环（LLM 操控真实 SciNet++ 引擎）
+
+### 10.1 这一节解决什么
+
+让 LLM 完整跑通「**人给想法 → LLM 定网络结构/参数 → SciNet++ 真训练评估 → LLM 看实测数据复盘 → LLM 改方案 → 再测 → LLM 判达标 finish**」的闭环。SciNet++ 已 **vendored 进本仓库**（`vendor/scinet/`，1.8MB，含冻结 smoke 数据集），因此 clone 本仓库即可获得引擎源码，不必再单独下载 `SciNet++` 项目。
+
+### 10.2 依赖（两层，必须分清）
+
+| 层 | 内容 | 是否随仓库下载 |
+|---|---|---|
+| 引擎代码 | `vendor/scinet/`（train.py / evaluate.py / models / datasets…） | ✅ 是 |
+| Agent 代码 | `research_runtime/arr07/`、`research_runtime/generic/` | ✅ 是 |
+| 运行时环境 | Python 3.13（主 agent）+ 一个装了 torch/scipy/PyYAML 的 Python（引擎） | ❌ 否，需自行安装 |
+
+引擎 Python 由环境变量 `SCINET_PYTHON` 指定（默认 Windows 本机 `D:/conda_envs/scinet_gpu/python.exe`）；引擎代码目录由 `SCINET_DIR` 指定（默认仓库内 `vendor/scinet`）。`vendor/scinet/requirements.txt` 列出引擎依赖（`torch>=2.2, numpy, scipy, scikit-learn, matplotlib, tensorboard, PyYAML, pysr`）。smoke 配置用 CPU 即可（config `device: cpu`），**不强制 GPU**。
+
+### 10.3 快速开始（3 步）
+
+```bash
+# 1) 安装主环境（agent）与引擎环境（SciNet++）
+pip install -r requirements.txt                       # 仓库根目录
+pip install -r vendor/scinet/requirements.txt         # 引擎依赖，装到 SCINET_PYTHON 指向的 env
+
+# 2) 配置 .env（不入库）：LLM 网关 + 引擎路径
+# 本项目所有 ARR-07 实测使用本地 vLLM 网关（非阿里云在线）：
+LLM_BASE_URL=http://192.168.50.46:8888/v1
+LLM_API_KEY=<local gateway key>
+LLM_MODEL=qwen3.7-flash
+LLM_VERIFY_SSL=false
+# 若改用在线 qwen，改成 https://dashscope.aliyuncs.com/compatible-mode/v1 + 对应 key/model
+SCINET_PYTHON=/path/to/python-with-torch              # 必改：本机实际路径
+# SCINET_DIR 默认 vendor/scinet，无需设置
+
+# 3) 跑一次自主循环（真实 train+evaluate）
+cd /e/agent_dev/multi-agent
+PYTHONPATH=/e/agent_dev/multi-agent python -u -c "
+from pathlib import Path
+from research_runtime.arr07.autonomous_scinet_loop import run_autonomous
+r = run_autonomous(task_id='my_study', root=Path('experiments/campaigns/MY-RUN'),
+                   seed=42, max_iterations=3, target=0.10)
+print(r.to_dict())
+"
+```
+
+### 10.4 冻结合同与先验证据（每个 campaign 自带，写在外部文件）
+
+`run_autonomous()` 在 campaign 根目录读取：
+- `contract.json`：冻定的多目标阈值（如 `latent_mse@1` 至少降 10%、`cosine@1` 不回退）。不同实验写不同文件 → 同一套 harness 代码服务不同主题。
+- `dataset_scale.json`：训练样本数（sanity check 的分母）。
+- `prior_evidence.json`：可选，已验证的实测结论（如 `lr=0.01` 改善了两个指标）。LLM 提案时会看到并引用它——**实验证明：注入真实证据后 1 轮达标，盲目放大预算到 10 轮反而不达标**。
+
+### 10.5 决策权归属（谁做什么）
+
+| 环节 | 谁负责 |
+|---|---|
+| 提网络结构/参数 | **LLM**（每轮最多改 2 个键，可配） |
+| 执行 train/evaluate | SciNet++ 引擎（vendored，纯执行） |
+| 看数据、判 finish/continue | **LLM**（harness 把冻结合同判定喂给它，但决定权在 LLM） |
+| 结构合理性 / 防作弊 / 统计判定 | harness 代码（`generic/research_contract.py`），不在 SciNet++ |
+
+### 10.6 产物与审计
+
+每次运行写入 `experiments/campaigns/<RUN>/`：
+- `raw_data/autonomy/`：LLM 每次提案与判定原文、search_memory.json、result.json
+- `raw_data/scinet/`：每次真实 train/evaluate 记录（config hash / run_id / 指标 / result_hash）
+- `final/`：各 campaign 报告
+
+### 10.7 验证过的结论与诚实边界
+
+- 真实引擎：vendored 副本 smoke 验证 `cosine@1=0.928 / latent_mse@1=0.0127`（与独立 SciNet++ 一致）。
+- 1 轮达标实验（ARR-07-PRIOR-EVIDENCE）：注入已验证证据后 LLM 自主达标并判 finish。
+- 多 seed 统计：3 seed 配对 CI [0.524, 1.045]，显著改善。
+- **边界**：注入的证据（lr=0.01）来自确定性扫描，不是 LLM 自主发现；当前仍是 64 样本/1 epoch 的 smoke 数据集，不能外推到完整 V-JEPA/机器人。

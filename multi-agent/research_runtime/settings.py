@@ -18,7 +18,12 @@ from pathlib import Path
 
 RUNTIME_DIR = Path(__file__).resolve().parent
 
-DEFAULT_SCINET_DIR = Path(os.getenv("SCINET_DIR", r"E:\LLM\SciNet++"))
+# SciNet++ is VENDORED inside this repo (vendor/scinet) so a fresh clone has the
+# engine source + frozen smoke dataset. Override with SCINET_DIR to use a
+# separate checkout. The PYTHON executable is still external: it must have
+# torch/scipy/PyYAML (a conda/venv), see multi-agent/README.md.
+VENDORED_SCINET_DIR = RUNTIME_DIR.parent / "vendor" / "scinet"
+DEFAULT_SCINET_DIR = Path(os.getenv("SCINET_DIR", str(VENDORED_SCINET_DIR)))
 DEFAULT_SCINET_PYTHON = Path(
     os.getenv("SCINET_PYTHON", r"D:\conda_envs\scinet_gpu\python.exe")
 )

@@ -1,0 +1,245 @@
+# Research Autonomy Implementation Roadmap
+# Machine-readable companion to RESEARCH_AUTONOMY_MASTER_SPEC.md.
+#
+# Each task records:
+#   task_id, title, phase, dependencies, owner, affected_paths,
+#   acceptance_criteria, verification_commands, evidence_outputs, status,
+#   engineering_complete (code/deliverable exists & passes),
+#   scientific_validated (independent reviewer + replay confirm the science claim).
+#
+# Status vocabulary:
+#   done | in_progress | planned | blocked_requires_approval | dropped
+
+project: research-autonomy
+spec: RESEARCH_AUTONOMY_MASTER_SPEC.md
+shared_control_plane: agent_dev/multi-agent   # Planner/Executor/Reviewer/Memory live here
+
+tasks:
+
+  - task_id: P1-A
+    title: V1 controlled-pendulum pilot + collector + independent audit
+    phase: ai4s-foundation
+    dependencies: []
+    owner: ai4s-adapter
+    affected_paths:
+      - datasets/controlled_pendulum_pilot/
+      - scripts/collect_controlled_pendulum.py
+      - scripts/audit_controlled_pendulum.py
+      - data/controlled_pendulum.py
+    acceptance_criteria:
+      - 20-episode pilot collected deterministically
+      - audit PASS 8/8
+    verification_commands:
+      - "python scripts/audit_controlled_pendulum.py --config configs/dynamics/controlled_pendulum_jepa.yaml --dataset-dir datasets/controlled_pendulum_pilot"
+    evidence_outputs:
+      - datasets/controlled_pendulum_pilot/audit_report.json
+    status: done
+    engineering_complete: true
+    scientific_validated: true
+
+  - task_id: P1-B1
+    title: V2 spec-compliant pilot + collector + independent audit (pre-P6/7/8)
+    phase: ai4s-foundation
+    dependencies: [P1-A]
+    owner: ai4s-adapter
+    affected_paths:
+      - datasets/controlled_pendulum_v2_pilot/
+      - scripts/collect_controlled_pendulum_v2.py
+      - scripts/audit_controlled_pendulum_v2.py
+      - data/controlled_pendulum_v2.py
+    acceptance_criteria:
+      - 20-episode V2 pilot (action profiles, physical-param sampling, regimes)
+      - audit PASS 10/10
+    verification_commands:
+      - "python scripts/audit_controlled_pendulum_v2.py --dataset-dir datasets/controlled_pendulum_v2_pilot"
+    evidence_outputs:
+      - datasets/controlled_pendulum_v2_pilot/audit_report.json
+    status: done
+    engineering_complete: true
+    scientific_validated: true
+
+  - task_id: P1-B1.1
+    title: Scientific Provenance & Independent Audit Hardening (P6/P7/P8)
+    phase: rrsi-hardening
+    dependencies: [P1-B1]
+    owner: rrsi
+    affected_paths:
+      - data/source_provenance.py
+      - data/stratified_split.py
+      - scripts/compute_stratified_split_v2.py
+      - scripts/verify_historical_datasets.py
+      - data/controlled_pendulum_v2.py            # classify_regime YAML-driven
+      - scripts/audit_controlled_pendulum_v2.py   # independent_regime_audit
+      - scripts/collect_controlled_pendulum_v2.py # provenance block
+      - datasets/controlled_pendulum_v2_pilot/manifest.json  # provenance: incomplete_historical
+    acceptance_criteria:
+      - P6: git_commit_required, dirty-tree rejection, source SHA-256, dep versions (incl SciPy), worktree isolation, post-run identity re-check, fail-closed
+      - P7: true stratified allocation, episode isolation, no window leakage, min_per_cell, BLOCKED/INCONCLUSIVE honesty, deterministic
+      - P8: YAML regime criteria, recompute-from-raw audit, hard gate on tampering
+      - historical datasets SHA-verified and exactly replayable (max err == 0.0)
+    verification_commands:
+      - "python -m pytest tests/dynamics/ -p no:cacheprovider --ignore=tests/dynamics/test_pysr.py"
+      - "python scripts/audit_controlled_pendulum_v2.py --dataset-dir datasets/controlled_pendulum_v2_pilot"
+      - "python scripts/verify_historical_datasets.py"
+      - "python scripts/compute_stratified_split_v2.py"
+    evidence_outputs:
+      - datasets/controlled_pendulum_pilot/historical_replay_evidence.json
+      - datasets/controlled_pendulum_v2_pilot/historical_replay_evidence.json
+      - datasets/controlled_pendulum_v2_pilot/stratified_split_report.json
+      - tests/dynamics/test_source_provenance.py   # 14 passed
+      - tests/dynamics/test_stratified_split.py    # 10 passed
+      - tests/dynamics/test_regime_audit.py        # 10 passed
+    status: done
+    engineering_complete: true
+    scientific_validated: true
+    notes: >
+      Reference implementation of the entire RRSI layer. 34 new tests pass;
+      full dynamics suite 189 passed / 270 subtests; v1 audit 8/8; v2 audit 10/10;
+      V1 & V2 exact replay max abs error = 0.0. Historical v1/v2 datasets retained
+      byte-for-byte; v2 manifest provenance flagged incomplete_historical.
+
+  - task_id: P1-B2
+    title: JEPA training on V2 pilot + downstream representation evaluation
+    phase: ai4s-training
+    dependencies: [P1-B1.1]
+    owner: ai4s-adapter
+    affected_paths:
+      - models/
+      - train.py
+      - evaluate.py
+    acceptance_criteria:
+      - representation eval meets preregistered metric floor
+      - all training I/O carries provenance block
+    verification_commands:
+      - "echo 'BLOCKED: requires explicit human approval (STOP rule #1)'"
+    evidence_outputs: []
+    status: blocked_requires_approval
+    engineering_complete: false
+    scientific_validated: false
+    notes: >
+      STOP — training is prohibited without explicit human approval. Provenance
+      and audit hardening (P1-B1.1) remove the blockers that previously made this
+      unsafe, but the run itself remains human-gated. NOT auto-executable.
+
+  - task_id: P2-01
+    title: Embodied domain adapter contract + simulator provenance harness
+    phase: embodied-bootstrap
+    dependencies: [P1-B1.1]
+    owner: embodied-adapter
+    affected_paths:
+      - robotics/adapter.py
+      - data/embodied_provenance.py
+    acceptance_criteria:
+      - DomainAdapter + Environment protocols implemented for one robotics env
+      - provenance harness reuses data/source_provenance.py and fails closed
+    verification_commands:
+      - "python -m pytest tests/robotics/ -p no:cacheprovider"
+    evidence_outputs:
+      - tests/robotics/test_embodied_adapter.py
+    status: planned
+    engineering_complete: false
+    scientific_validated: false
+    notes: >
+      NEXT AUTO-EXECUTABLE TASK. Depends only on completed P1-B1.1 and requires
+      no training / no human approval. Builds the Embodied adapter on the existing
+      RRSI primitives.
+
+  - task_id: P2-02
+    title: Embodied independent reviewer + regime preregistration
+    phase: embodied-bootstrap
+    dependencies: [P2-01]
+    owner: embodied-adapter
+    affected_paths:
+      - robotics/reviewer.py
+      - configs/robotics/*.yaml
+    acceptance_criteria:
+      - YAML regime_criteria + independent re-derivation from raw episodes
+      - hard gate on label/count/threshold tampering
+    verification_commands:
+      - "python scripts/audit_embodied_pilot.py --dataset-dir datasets/embodied_pilot"
+    evidence_outputs:
+      - datasets/embodied_pilot/audit_report.json
+    status: planned
+    engineering_complete: false
+    scientific_validated: false
+
+  - task_id: P3-01
+    title: Quant domain adapter + point-in-time data reviewer
+    phase: quant-bootstrap
+    dependencies: [P1-B1.1]
+    owner: quant-adapter
+    affected_paths:
+      - quant/adapter.py
+      - quant/pit_reviewer.py
+    acceptance_criteria:
+      - backtest adapter with explicit no-look-ahead + point-in-time checks
+      - survivorship/look-ahead bias gates fail closed
+    verification_commands:
+      - "python -m pytest tests/quant/ -p no:cacheprovider"
+    evidence_outputs:
+      - tests/quant/test_quant_adapter.py
+    status: planned
+    engineering_complete: false
+    scientific_validated: false
+
+  - task_id: P4-01
+    title: Cross-domain Diagnosis / Evolution engine
+    phase: meta-engine
+    dependencies: [P2-01, P3-01]
+    owner: meta-engine
+    affected_paths:
+      - research_api/diagnosis.py
+      - research_api/evolution.py
+    acceptance_criteria:
+      - failure classification + memory lookup + remediation proposal
+      - loop closes without human intervention except on prohibited actions
+    verification_commands:
+      - "python -m pytest tests/research_api/ -p no:cacheprovider"
+    evidence_outputs:
+      - tests/research_api/test_diagnosis.py
+    status: planned
+    engineering_complete: false
+    scientific_validated: false
+
+  - task_id: P5-01
+    title: Research Memory consolidation (SciNet++ <-> agent_dev/multi-agent)
+    phase: memory
+    dependencies: [P1-B1.1]
+    owner: shared-control-plane
+    affected_paths:
+      - research_api/memory_bridge.py
+    acceptance_criteria:
+      - decision log + evidence index + negative-results persisted to shared memory
+    verification_commands:
+      - "python -m pytest tests/research_api/ -p no:cacheprovider"
+    evidence_outputs:
+      - tests/research_api/test_memory_bridge.py
+    status: planned
+    engineering_complete: false
+    scientific_validated: false
+
+  - task_id: P6-01
+    title: Safety/Approval + Compute budget enforcement in Shared Runtime
+    phase: governance
+    dependencies: [P1-B1.1]
+    owner: shared-control-plane
+    affected_paths:
+      - data/source_provenance.py   # extends with budget + approval gates
+      - scripts/runtime_guard.py
+    acceptance_criteria:
+      - over-budget / unapproved-training runs refused by scheduler
+      - branch hygiene enforced (no main mutation, no auto-PR)
+    verification_commands:
+      - "python -m pytest tests/dynamics/test_source_provenance.py"
+    evidence_outputs:
+      - scripts/runtime_guard.py
+    status: planned
+    engineering_complete: false
+    scientific_validated: false
+
+# ---------------------------------------------------------------------------
+# Auto-executable summary (for the agent's next-step selection):
+#   - DONE:                 P1-A, P1-B1, P1-B1.1
+#   - BLOCKED (human):     P1-B2   (training, STOP rule #1)
+#   - NEXT AUTO-RUNNABLE:  P2-01   (Embodied adapter; only needs P1-B1.1)
+# ---------------------------------------------------------------------------
