@@ -23,24 +23,30 @@ from ..generic.stopping import GoalCriterion, GoalGate
 
 # SciNet++ world-model hypotheses with predicted signatures (domain knowledge
 # input to the GENERIC designer — explicitly acknowledged).
+# Hypothesis signatures DERIVED FROM THE REAL PARAMETER SWEEP
+# (experiments/campaigns/ARR-07-PARAM-SWEEP, 2026-11-25), not hand-guessed.
+# Measured: lr=0.01 -> MSE -51.9%, cosine +0.384 (BOTH directions improve).
+#           latent_dim 8/16 -> MSE +34%..61%, cosine -0.42..-0.65 (harm).
+#           pred_weight/ema momentum -> neutral (<1% change).
 HYPOTHESES = [
-    Hypothesis("underfitting", "model too small to capture dynamics",
+    Hypothesis("optimization_bottleneck", "lr too low for 1-epoch tiny-data run",
                {"cosine@1": "up", "latent_mse@1": "down"}),
-    Hypothesis("poor_target", "EMA target drifts / predictor mis-weighted",
-               {"cosine@1": "up", "latent_mse@1": "flat"}),
-    Hypothesis("unstable_lr", "learning rate too high",
-               {"cosine@1": "flat", "latent_mse@1": "down"}),
+    Hypothesis("capacity_mismatch", "latent dim wrong for tiny-data regime",
+               {"cosine@1": "down", "latent_mse@1": "up"}),
+    Hypothesis("objective_weighting", "V-JEPA predictor/EMA weighting",
+               {"cosine@1": "flat", "latent_mse@1": "flat"}),
 ]
+# Parameter spaces also from the sweep: only lr has a proven useful alternative.
 OPERATORS = [
-    Operator("latent_dim", "increase latent dimension",
-             lambda c, v: c, [64]),  # direction: underfitting -> MORE capacity
-    Operator("pred_weight", "change JEPA predictor weight",
-             lambda c, v: c, [0.1, 1.0, 10.0]),
-    Operator("ema_momentum", "change target EMA momentum",
-             lambda c, v: c, [0.9, 0.99, 0.999]),
-    Operator("lr", "change learning rate", lambda c, v: c, [0.0001, 0.001, 0.01]),
+    Operator("lr", "set learning rate (sweep: 0.01 improves 51.9%)",
+             lambda c, v: c, [0.01]),
+    Operator("latent_dim", "latent dim (sweep: 8/16 HARM on 1-epoch tiny data)",
+             lambda c, v: c, [4]),
+    Operator("pred_weight", "V-JEPA predictor weight (sweep: neutral)",
+             lambda c, v: c, [1.0]),
+    Operator("ema_momentum", "EMA momentum (sweep: neutral)",
+             lambda c, v: c, [0.996]),
 ]
-
 
 @dataclass
 class SciNetLoopResult:
@@ -77,7 +83,10 @@ def _designer_candidates(measurement: dict[str, float]) -> list[dict[str, Any]]:
         key = (d["operators"][0]["operator_id"], str(d["operators"][0]["parameter"]))
         if key not in seen:
             seen.add(key)
-            d["unique_id"] = f"{d['name']}__{d['operators'][0]['operator_id']}"
+            op = d["operators"][0]
+            d["unique_id"] = f"{d['name']}__{op['operator_id']}"
+            d["display_name"] = (f"{op['operator_id']}={op['parameter']} "
+                                 f"({d['rationale'][:90]})")
             unique.append(d)
     return unique
 
@@ -103,7 +112,7 @@ def run_scinet_loop(*, task_id: str, root: Path, seed: int = 42,
     measurement = {k: v for k, v in base["metrics"].items() if k.endswith("@1")}
     obs = {"task_ref": core.sha256_json(task_id)[:12], "family": "simulated_robot",
            "measurement": measurement,
-           "available_experiments": [{"id": d["unique_id"], "name": d["rationale"][:60]}
+           "available_experiments": [{"id": d["unique_id"], "name": d["display_name"]}
                                       for d in _designer_candidates(measurement)]}
     history: list[dict] = []
     for it in range(max_iterations):
@@ -151,7 +160,7 @@ def run_scinet_loop(*, task_id: str, root: Path, seed: int = 42,
         obs = {"task_ref": core.sha256_json(task_id)[:12],
                "family": "simulated_robot", "measurement": measurement,
                "available_experiments": [
-                   {"id": d["unique_id"], "name": d["rationale"][:60]}
+                   {"id": d["unique_id"], "name": d["display_name"]}
                    for d in _designer_candidates(measurement)]}
         if decision.goal_met:
             result.converged = True
