@@ -19,8 +19,8 @@ from research_runtime.llm_client import llm_config, make_generate
 from . import core, scinet_backend
 from ..generic.llm_autonomy import LLMResearcher
 from ..generic.research_contract import (
-    MetricGoal, ResearchContract, sanity_check, SearchMemory,
-    paired_seed_verdict)
+    MetricGoal, ResearchContract, sanity_check, SearchMemory, paired_seed_verdict,
+    freeze_contract, load_contract, load_dataset_scale)
 
 # REAL SciNet++ config schema with TYPE + SCALE validation.
 # LLM chooses values freely WITHIN these constraints (not from a fixed menu),
@@ -38,18 +38,6 @@ SCHEMA = {
 OBJECTIVE = ("LeJEPA-style study: improve held-out latent prediction by tuning "
              "regularisation (VICReg variance/covariance) AND model structure. "
              "Minimize latent_mse@1 AND maximize cosine@1 jointly.")
-
-# FROZEN multi-objective contract. The user asked "where is the target written?":
-# goal THRESHOLDS live HERE in code (reproducible, not prompt-only). The prompt
-# explains them so the LLM understands, and the harness feeds the evaluated
-# verdict into the LLM's finish decision.
-CONTRACT = ResearchContract(
-    goals=(MetricGoal("latent_mse@1", "min", min_relative_gain=0.10),
-           MetricGoal("cosine@1", "max", min_relative_gain=0.0)),
-    budget=3,
-    max_params_per_train_sample=8.0)
-N_TRAIN_SAMPLES = 64  # from the frozen pendulum_smoke dataset config
-
 
 @dataclass
 class AutonomousResult:
@@ -83,9 +71,17 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
     memory = SearchMemory(root / "raw_data" / "autonomy" / "search_memory.json")
     res = AutonomousResult(task_id=task_id, finished=False, iterations=0,
                            final_improvement=None)
-    contract = ResearchContract(goals=CONTRACT.goals,
-                                budget=max_iterations,
-                                max_params_per_train_sample=CONTRACT.max_params_per_train_sample)
+    # Contract comes from the CAMPAIGN FILE (frozen before run), not Python code.
+    # Different domains/tests supply their own contract.json -> same harness code.
+    if not (root / "contract.json").exists():
+        freeze_contract(root, ResearchContract(
+            goals=(MetricGoal("latent_mse@1", "min", 0.10),
+                   MetricGoal("cosine@1", "max", 0.0)),
+            budget=max_iterations, max_params_per_train_sample=8.0))
+        (root / "dataset_scale.json").write_text(
+            json.dumps({"n_train_samples": 64}), encoding="utf-8")
+    contract = load_contract(root)
+    n_train = load_dataset_scale(root)
 
     base = scinet_backend.run_scinet_experiment(
         experiment_id=f"auto_{core.sha256_json(task_id)[:8]}_base",
@@ -118,7 +114,7 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
                             "reason": p.rejection_reason})
             continue
         # ④ STRUCTURAL SANITY in code: reject absurd structures for a 64-sample set.
-        sane = sanity_check(p.overrides, n_train_samples=N_TRAIN_SAMPLES,
+        sane = sanity_check(p.overrides, n_train_samples=n_train,
                             ratio_limit=contract.max_params_per_train_sample)
         if not sane["ok"]:
             res.rounds.append({"iteration": it, "phase": "sanity",

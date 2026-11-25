@@ -143,5 +143,54 @@ def paired_seed_verdict(baseline_pairs: list[tuple[float, float]],
             "note": "normal-approx CI; use t critical for n<30 in production"}
 
 
+def default_contract_file(root: str | Path) -> Path:
+    return Path(root) / "contract.json"
+
+
+def load_contract(root: str | Path, *, default: ResearchContract | None = None) -> ResearchContract:
+    """Load the FROZEN contract from a campaign file.
+
+    Generalisation answer: thresholds are NOT hardcoded per experiment type in
+    Python. Each campaign freezes its OWN contract.json BEFORE running; the same
+    harness code serves JEPA / AI4S / quant with different goals and limits.
+    Freeze = file written once, never edited during/after the campaign.
+    """
+    path = default_contract_file(root)
+    if not path.is_file():
+        return default or ResearchContract(
+            goals=(MetricGoal("latent_mse@1", "min", 0.10),), budget=3)
+    d = json.loads(path.read_text(encoding="utf-8"))
+    goals = tuple(MetricGoal(g["metric"], g["direction"],
+                             float(g.get("min_relative_gain", 0.0)))
+                  for g in d.get("goals", []))
+    if not goals:
+        raise ValueError(f"contract {path} has no goals")
+    return ResearchContract(goals=goals, budget=int(d.get("budget", 3)),
+        max_params_per_train_sample=float(d.get("max_params_per_train_sample", 8.0)))
+
+
+def freeze_contract(root: str | Path, contract: ResearchContract) -> dict[str, Any]:
+    """Write the campaign contract ONCE; refuse to overwrite (freeze guarantee)."""
+    path = default_contract_file(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing != contract.to_dict():
+            raise ValueError(f"contract already frozen at {path}; never edit mid-campaign")
+        return existing
+    data = contract.to_dict()
+    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    return data
+
+
+def load_dataset_scale(root: str | Path, default: int = 64) -> int:
+    """Dataset size comes from the campaign file, not a Python literal."""
+    path = Path(root) / "dataset_scale.json"
+    if not path.is_file():
+        return default
+    return int(json.loads(path.read_text(encoding="utf-8")).get("n_train_samples", default))
+
+
 __all__ = ["MetricGoal", "ResearchContract", "sanity_check", "SearchMemory",
-           "paired_seed_verdict"]
+           "paired_seed_verdict", "freeze_contract", "load_contract",
+           "load_dataset_scale", "default_contract_file"]

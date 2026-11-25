@@ -39,7 +39,7 @@ def _set_nested(d: dict, dotted: str, value: Any) -> None:
 
 
 def materialise_config(base_path: str | Path, overrides: dict[str, Any],
-                       out: Path) -> str:
+                       out: Path, seed: int | None = None) -> str:
     bp = Path(base_path)
     if not bp.is_absolute():
         bp = DEFAULT_SCINET_DIR / bp
@@ -48,6 +48,10 @@ def materialise_config(base_path: str | Path, overrides: dict[str, Any],
         if k not in ALLOWED:
             raise ValueError(f"unsupported SciNet knob: {k}")
         _set_nested(base, k, v)
+    # CRITICAL: SciNet train.py reads cfg["seed"] from YAML, NOT the CLI/spec.
+    # Without this, all "multi-seed" runs silently use the SAME seed.
+    if seed is not None:
+        base["seed"] = int(seed)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(yaml.safe_dump(base, sort_keys=False), encoding="utf-8")
     return str(out.resolve())
@@ -80,7 +84,8 @@ def run_scinet_experiment(*, experiment_id: str, task_id: str, seed: int,
         return json.loads(out.read_text(encoding="utf-8"))
     a = adapter or SciNetAdapter(strict=False)
     cfg = materialise_config(a.project_dir / DEFAULT_CONFIG, overrides,
-                             root / "raw_data" / "configs" / f"{experiment_id}.yaml")
+                             root / "raw_data" / "configs" / f"{experiment_id}.yaml",
+                             seed=seed)
     rec: dict[str, Any] = {
         "experiment_id": experiment_id, "task_id": task_id, "seed": seed,
         "timestamp": core.now_iso(), "source_commit": core.git_head(".."),

@@ -184,3 +184,41 @@ def test_hidden_failure_detector():
     import pytest as _p
     with _p.raises(RuntimeError):
         _assert_no_hidden_failure(R(), "train")
+
+
+def test_contract_externalised_and_frozen():
+    import tempfile
+    from research_runtime.generic.research_contract import (
+        ResearchContract, MetricGoal, freeze_contract, load_contract,
+        load_dataset_scale)
+    with tempfile.TemporaryDirectory() as td:
+        c1 = ResearchContract(goals=(MetricGoal("mse", "min", 0.1),
+                                     MetricGoal("cos", "max", 0.2)), budget=5)
+        freeze_contract(td, c1)
+        loaded = load_contract(Path(td) / "sub")
+        # load_contract without local file falls back to default; load from same dir:
+        loaded2 = load_contract(td)
+        assert loaded2.goals[1].min_relative_gain == 0.2 and loaded2.budget == 5
+        # Different campaign can have DIFFERENT thresholds (generalisation).
+        c2 = ResearchContract(goals=(MetricGoal("other_metric", "max", 0.9),), budget=2)
+        with tempfile.TemporaryDirectory() as td2:
+            freeze_contract(td2, c2)
+            assert load_contract(td2).goals[0].metric == "other_metric"
+        # Freeze: refuse to change mid-campaign.
+        try:
+            freeze_contract(td, c2)
+            assert False, "must refuse to overwrite frozen contract"
+        except ValueError:
+            pass
+
+
+def test_scinet_config_seed_propagation():
+    """SciNet train.py reads cfg['seed'] from YAML; backend must write it."""
+    from research_runtime.arr07.scinet_backend import materialise_config
+    from research_runtime.adapters.scinet_adapter import SciNetAdapter
+    import yaml, tempfile
+    a = SciNetAdapter(strict=False)
+    with tempfile.TemporaryDirectory() as td:
+        p = materialise_config(a.project_dir / "configs/pendulum_smoke.yaml",
+                               {"train.lr": 0.01}, Path(td) / "c.yaml", seed=43)
+        assert yaml.safe_load(Path(p).read_text(encoding="utf-8"))["seed"] == 43
