@@ -53,3 +53,26 @@ def test_goal_gate_respects_budget_and_mechanism():
     g2 = GoalGate(GoalCriterion(0.3, 3, mechanism_hit_required=True))
     d = g2.observe(iteration=0, improvement=0.9, mechanism_correct=False)
     assert d.goal_met is False and d.should_stop is False
+
+
+def test_design_discriminative_experiment():
+    from research_runtime.generic.experiment_design import (
+        Hypothesis, Operator, design_discriminative, check_unfalsifiable)
+    h1 = Hypothesis("H1", "mechanism one", {"mse": "down", "loss": "flat"})
+    h2 = Hypothesis("H2", "mechanism two", {"mse": "down", "loss": "up"})
+    op = Operator("OP", "do something", lambda c, v: c, [0.5])
+    d = design_discriminative(h1, h2, [op])
+    assert d is not None and d.predicted_separation > 0
+    assert "loss" in d.separating_metrics
+    audit = check_unfalsifiable([h1, h2], [op])
+    assert audit["pairs"][0]["falsifiable"] is True
+
+
+def test_unfalsifiable_hypotheses_flagged():
+    from research_runtime.generic.experiment_design import (
+        Hypothesis, Operator, check_unfalsifiable)
+    h1 = Hypothesis("H1", "same", {"mse": "down"})
+    h2 = Hypothesis("H2", "same", {"mse": "down"})
+    op = Operator("OP", "x", lambda c, v: c, [1])
+    audit = check_unfalsifiable([h1, h2], [op])
+    assert audit["unfalsifiable"] == [["H1", "H2"]]

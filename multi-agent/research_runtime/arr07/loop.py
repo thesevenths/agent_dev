@@ -151,6 +151,12 @@ def run_loop(*, task: benchmark.Task, seed: int, root: Path, blind: bool = True,
     obs = task.blind_observation(base.get("metrics") or {}) if blind \
         else task.leaky_observation(base.get("metrics") or {})
 
+    # Domain-agnostic frozen stopping rule (research_runtime/generic/stopping.py).
+    from ..generic.stopping import GoalCriterion, GoalGate
+    gate = GoalGate(GoalCriterion(target_improvement=target,
+                                  max_iterations=max_iterations))
+    result.stop_decisions = []
+
     for it in range(max_iterations):
         result.llm_calls += 1
         reasoning, exp_id = brain.plan(obs, history)
@@ -184,8 +190,14 @@ def run_loop(*, task: benchmark.Task, seed: int, root: Path, blind: bool = True,
                         "improvement_vs_baseline": imp, "llm_reasoning": reasoning})
         if it > 0 and reasoning and history[-1]["experiment"] != history[-2]["experiment"]:
             result.replans += 1
-        if met:
+        # Frozen goal gate: stop on preregistered target OR iteration budget.
+        # Uses MEASURED improvement only; mechanism correctness is a separate
+        # judgement (frozen_evaluate above) and does not override stopping.
+        decision = gate.observe(iteration=it, improvement=imp)
+        result.stop_decisions.append(decision.to_dict())
+        if decision.goal_met:
             result.converged = True
+        if decision.should_stop:
             break
         # Replan next iteration with updated measurement (never re-show config in blind).
         obs = task.blind_observation({"one_step_mse": em}) if blind \
