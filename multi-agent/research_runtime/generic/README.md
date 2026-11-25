@@ -21,6 +21,10 @@ modules with **no dependency on any benchmark, domain, or ARR version**.
 - `stopping.py` — frozen `GoalCriterion(target, max_iterations, min_consecutive)`.
   `GoalGate.observe()` returns stop/continue from measured numbers only; once
   stopped it is sticky (no residual chasing). Optional `mechanism_hit_required`.
+- `warm_causality.py` — plan-revision test WITH an experiment list and a failed
+  prior experiment (the conditions a real loop faces). Corrects the earlier
+  cold-start-only V4 test, which had `available_experiments=[]` and therefore
+  measured first-guess prior, not evidence-driven replanning.
 
 ## Cross-domain validation (same code, zero changes)
 
@@ -32,6 +36,21 @@ modules with **no dependency on any benchmark, domain, or ARR version**.
 
 Stop rule on ARR-07's actual numbers `0.13 → 0.91 → 0.16 → −0.03`: stops at
 iteration 1 (0.91 ≥ 0.3). The original loop continued into 0.16/−0.03.
+
+## Corrected verdict on the loop
+
+Two separate tests, two different questions:
+
+- Cold-start test (V4, history=[], no experiment list): all signatures → EXP_COV.
+  This shows a FIRST-GUESS bias, not an inability to revise.
+- Warm test (experiment list + failed EXP_COV history): three signatures →
+  EXP_ACT / EXP_CAP / EXP_DIST — plan revision IS data-driven.
+
+Therefore "replan is FAIL — ignores data" was an overstatement caused by testing
+the wrong condition. The real loop's step 2 (`coverage failed → rule out coverage
+→ action-conditioning hypothesis → 91% improvement`) is genuine scientific
+reasoning. The remaining honest limits: a fixed cold-start prior, and the
+mechanism-label collision (now handled by identifiability audit).
 
 ## Honest boundary
 
