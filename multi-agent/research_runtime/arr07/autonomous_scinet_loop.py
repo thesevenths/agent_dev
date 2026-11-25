@@ -27,10 +27,14 @@ SCHEMA = {
     "train.lr": (0.00001, 0.1),
     "jepa.pred_weight": (0.0, 100.0),
     "jepa.ema_momentum": (0.5, 0.9999),
+    "jepa.vicreg_var_weight": (0.0, 100.0),
+    "jepa.vicreg_cov_weight": (0.0, 100.0),
     "model.latent_dim": (2, 32),          # tiny smoke dataset (64 samples)
     "model.predictor_hidden": "list_int", # MUST be a list of ints (SciNet build_mlp)
 }
-OBJECTIVE = "minimize latent_mse@1 and maximize cosine@1 on held-out test"
+OBJECTIVE = ("LeJEPA-style study: improve held-out latent prediction by tuning "
+             "regularisation (VICReg variance/covariance) AND model structure. "
+             "Minimize latent_mse@1 AND maximize cosine@1 jointly.")
 
 
 @dataclass

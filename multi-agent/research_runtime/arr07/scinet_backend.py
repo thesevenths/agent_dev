@@ -22,6 +22,8 @@ ALLOWED = {
     "train.lr": (0.0, 1.0),
     "jepa.pred_weight": (0.0, 100.0),
     "jepa.ema_momentum": (0.0, 1.0),
+    "jepa.vicreg_var_weight": (0.0, 100.0),   # LeJEPA-style embedding regularisation
+    "jepa.vicreg_cov_weight": (0.0, 100.0),
     "model.predictor_hidden": None,
     "model.latent_dim": None,
 }
