@@ -65,3 +65,34 @@ Requirements: `.env` LLM_* (loaded via `import config`); SciNet++ at
 - `generic/experiment_design.py` — discriminative design from signatures.
 - `generic/llm_autonomy.py` — the two decision rights used here.
 - `arr07/scinet_loop.py` — older menu-based loop (kept for comparison).
+
+## Hardening (2026-11-25) — prompt vs harness decision rule
+
+USER QUESTION: "写在 prompt 里还是 harness 代码里？"
+ANSWER (applied to all six items):
+- EXECUTABLE constraints and JUDGEMENTS -> harness code (frozen, reproducible,
+  LLM cannot rewrite them): `generic/research_contract.py`.
+- RATIONALE and context -> prompt, so the LLM understands WHY a constraint
+  exists (e.g. "64 samples cannot fit a 256-unit hidden layer").
+- DECISION RIGHT stays with the LLM: the harness computes a frozen verdict and
+  FEEDS it into `decide_finish`; the LLM still says finish/continue.
+
+Six items implemented:
+1. Quantified goal: `ResearchContract` with per-metric direction + minimum
+   relative gain (frozen in code, shown in prompt). No more "MSE↓ & cosine↑" as
+   vague prose.
+2. Multi-objective Pareto verdict: `contract.evaluate()` requires ALL goals to
+   meet thresholds; result fed into LLM finish decision with quoted numbers.
+3. Search memory: `SearchMemory` = parameter->result table, persisted across
+   rounds (`raw_data/autonomy/search_memory.json`); rejects duplicates and gives
+   a direction hint from measured best. DISTINCT from arr04/arr06 verified memory.
+4. Structural sanity: `sanity_check()` estimates params vs dataset size and
+   REJECTS absurd structures in code (e.g. 256x256 hidden on 64 samples).
+5. Hidden engine failure: `scinet_backend._assert_no_hidden_failure()` detects
+   traceback markers in adapter errors (SciNet worker exits 0 despite crash);
+   failed runs produce improvement=None, never a fake 100%.
+6. Paired multi-seed CI: `paired_seed_verdict()` records seed pairs and 95% CI;
+   single-seed runs are explicitly marked "no paired CI yet".
+
+Verification: 23 unit tests; real-engine hardened run at
+`experiments/campaigns/ARR-07-HARDENED`.

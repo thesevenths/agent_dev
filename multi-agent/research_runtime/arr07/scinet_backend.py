@@ -53,6 +53,22 @@ def materialise_config(base_path: str | Path, overrides: dict[str, Any],
     return str(out.resolve())
 
 
+def _assert_no_hidden_failure(result: Any, stage: str) -> None:
+    """SciNet++ worker can exit 0 with a traceback in stdout -> AdapterError.
+
+    Detect structured failure markers in the error field; do NOT parse raw
+    stdout here (adapter already formats it into error). This is a harness-side
+    guard: an engine run with a hidden crash must never count as success.
+    """
+    err = str(getattr(result, "error", "") or "")
+    markers = ("Traceback (most recent call last)", "TypeError:", "RuntimeError:",
+               "ValueError:", "AdapterError:")
+    hit = [m for m in markers if m in err]
+    if hit:
+        raise RuntimeError(f"SciNet {stage} hidden failure markers {hit}: "
+                           f"{err[:400]}")
+
+
 def run_scinet_experiment(*, experiment_id: str, task_id: str, seed: int,
                           overrides: dict[str, Any], root: Path,
                           adapter: Any = None, metric: str = DEFAULT_METRIC,
@@ -82,6 +98,7 @@ def run_scinet_experiment(*, experiment_id: str, task_id: str, seed: int,
         tr = a.collect_result(jt)
         if tr.status != "succeeded" or not tr.run_id:
             raise RuntimeError(f"SciNet train failed: {tr.status} {tr.error}")
+        _assert_no_hidden_failure(tr, "train")
         ev = ExperimentSpec(experiment_id=experiment_id, objective_id=task_id,
             hypothesis_id="auto", stage="evaluate", config_path=cfg, seed=seed,
             split="test", run_id=tr.run_id)
@@ -90,6 +107,7 @@ def run_scinet_experiment(*, experiment_id: str, task_id: str, seed: int,
         er = a.collect_result(je)
         if er.status != "succeeded":
             raise RuntimeError(f"SciNet evaluate failed: {er.status} {er.error}")
+        _assert_no_hidden_failure(er, "evaluate")
         rec["metrics"] = {k: float(v) for k, v in er.metrics.items()
                           if isinstance(v, (int, float))}
         rec["result_hash"] = core.sha256_json(rec["metrics"])

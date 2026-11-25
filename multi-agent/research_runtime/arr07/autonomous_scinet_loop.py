@@ -18,6 +18,9 @@ from research_runtime.llm_client import llm_config, make_generate
 
 from . import core, scinet_backend
 from ..generic.llm_autonomy import LLMResearcher
+from ..generic.research_contract import (
+    MetricGoal, ResearchContract, sanity_check, SearchMemory,
+    paired_seed_verdict)
 
 # REAL SciNet++ config schema with TYPE + SCALE validation.
 # LLM chooses values freely WITHIN these constraints (not from a fixed menu),
@@ -35,6 +38,17 @@ SCHEMA = {
 OBJECTIVE = ("LeJEPA-style study: improve held-out latent prediction by tuning "
              "regularisation (VICReg variance/covariance) AND model structure. "
              "Minimize latent_mse@1 AND maximize cosine@1 jointly.")
+
+# FROZEN multi-objective contract. The user asked "where is the target written?":
+# goal THRESHOLDS live HERE in code (reproducible, not prompt-only). The prompt
+# explains them so the LLM understands, and the harness feeds the evaluated
+# verdict into the LLM's finish decision.
+CONTRACT = ResearchContract(
+    goals=(MetricGoal("latent_mse@1", "min", min_relative_gain=0.10),
+           MetricGoal("cosine@1", "max", min_relative_gain=0.0)),
+    budget=3,
+    max_params_per_train_sample=8.0)
+N_TRAIN_SAMPLES = 64  # from the frozen pendulum_smoke dataset config
 
 
 @dataclass
@@ -66,8 +80,12 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
         raise RuntimeError("LLM not configured")
     researcher = LLMResearcher(make_generate(),
                                root / "raw_data" / "autonomy" / core.sha256_json(task_id)[:10])
+    memory = SearchMemory(root / "raw_data" / "autonomy" / "search_memory.json")
     res = AutonomousResult(task_id=task_id, finished=False, iterations=0,
                            final_improvement=None)
+    contract = ResearchContract(goals=CONTRACT.goals,
+                                budget=max_iterations,
+                                max_params_per_train_sample=CONTRACT.max_params_per_train_sample)
 
     base = scinet_backend.run_scinet_experiment(
         experiment_id=f"auto_{core.sha256_json(task_id)[:8]}_base",
@@ -82,19 +100,39 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
     latest = baseline
     imp = 0.0
     history: list[dict] = []
+    seed_pairs: list[tuple[tuple[float, float], tuple[float, float]]] = []
 
     for it in range(max_iterations):
-        # ① LLM proposes structure / hyperparameters (NO menu).
+        # ① LLM proposes structure/params, WITH frozen goal + search memory in prompt.
         p = researcher.propose_experiment(
             objective=OBJECTIVE, allowed=SCHEMA,
-            baseline_metrics=baseline, history=history)
+            baseline_metrics=baseline, history=history,
+            search_hint=memory.direction_hint(metric=scinet_backend.DEFAULT_METRIC),
+            contract={"goals": [g.to_dict() for g in contract.goals],
+                      "rule": contract.evaluate(baseline, latest)["rule"]})
         if not p.valid:
-            # Invalid LLM proposal -> record and continue with no experiment.
             res.rounds.append({"iteration": it, "phase": "proposal",
                                "valid": False, "reason": p.rejection_reason,
                                "raw": p.raw_response[:500]})
             history.append({"iteration": it, "proposal_valid": False,
                             "reason": p.rejection_reason})
+            continue
+        # ④ STRUCTURAL SANITY in code: reject absurd structures for a 64-sample set.
+        sane = sanity_check(p.overrides, n_train_samples=N_TRAIN_SAMPLES,
+                            ratio_limit=contract.max_params_per_train_sample)
+        if not sane["ok"]:
+            res.rounds.append({"iteration": it, "phase": "sanity",
+                               "overrides": p.overrides, "rejected": True,
+                               "reason": sane["reason"]})
+            history.append({"iteration": it, "overrides": p.overrides,
+                            "sanity_rejected": True, "reason": sane["reason"]})
+            continue
+        if memory.seen(p.overrides):
+            res.rounds.append({"iteration": it, "phase": "search_memory",
+                               "overrides": p.overrides, "duplicate": True,
+                               "reason": "configuration already tried; LLM should propose a new direction"})
+            history.append({"iteration": it, "overrides": p.overrides,
+                            "duplicate": True})
             continue
         exp_id = f"auto_{core.sha256_json(task_id)[:8]}_it{it}"
         rec = scinet_backend.run_scinet_experiment(
@@ -105,24 +143,40 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
         measured = {k: float(v) for k, v in (rec.get("metrics") or {}).items()} \
             if engine_ok else {}
         em = measured.get(scinet_backend.DEFAULT_METRIC)
-        # NEVER turn a FAILED experiment into a fake 100% improvement.
         imp = None if em is None else ((bm - em) / abs(bm) if abs(bm) > 1e-12 else 0.0)
-        # ③ LLM decides finish from measured data.
+        verdict = contract.evaluate(baseline, measured or latest)
+        # ⑤ Paired multi-seed evidence (record; CI used only when >=2 seeds).
+        if engine_ok:
+            b_pair = (baseline.get(scinet_backend.DEFAULT_METRIC, 0.0),
+                      baseline.get("cosine@1", 0.0))
+            a_pair = (measured.get(scinet_backend.DEFAULT_METRIC, 0.0),
+                      measured.get("cosine@1", 0.0))
+            seed_pairs.append((b_pair, a_pair))
+        ci = paired_seed_verdict([x[0] for x in seed_pairs],
+                                 [x[1] for x in seed_pairs]) if len(seed_pairs) >= 2 \
+            else {"note": "single seed - no paired CI yet"}
+        # ③ LLM decides finish, fed the FROZEN quantified verdict.
         dec = researcher.decide_finish(
             objective=OBJECTIVE, target=target, baseline=baseline,
             latest=measured or latest, improvement=imp,
-            iteration=it, max_iterations=max_iterations)
+            iteration=it, max_iterations=max_iterations,
+            contract_verdict={**verdict, "paired_seed_ci": ci})
+        memory.record(iteration=it, overrides=p.overrides, metrics=measured,
+                      verdict=verdict, engine_ok=engine_ok)
         res.rounds.append({"iteration": it, "llm_proposal": p.to_dict(),
+                           "sanity": sane,
                            "engine": {"ok": engine_ok,
                                       "raw_error": rec.get("error", "") if not engine_ok else "",
                                       "experiment_id": exp_id,
                                       "metrics": measured,
                                       "result_hash": rec.get("result_hash")},
                            "measured_improvement": imp,
+                           "frozen_contract_verdict": verdict,
+                           "paired_seed_ci": ci,
                            "llm_finish_decision": dec.to_dict()})
         history.append({"iteration": it, "overrides": p.overrides,
-                        "engine_ok": engine_ok,
-                        "measured_mse": em, "improvement": imp,
+                        "engine_ok": engine_ok, "measured_mse": em,
+                        "improvement": imp, "contract_met": verdict["contract_met"],
                         "llm_reasoning": p.reasoning})
         latest = measured or latest
         res.iterations = it + 1
@@ -131,13 +185,14 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
             res.finished = True
             break
         if it + 1 >= max_iterations:
-            # Stop the LOOP, but do NOT claim the LLM finished — it said continue.
             res.budget_exhausted = True
             break
     res.llm_calls = researcher.n_calls
     (root / "raw_data" / "autonomy" / "result.json").write_text(json.dumps(
         res.to_dict(), indent=2, sort_keys=True, ensure_ascii=False, default=str),
         encoding="utf-8")
+    (root / "raw_data" / "autonomy" / "search_memory_final.json").write_text(
+        json.dumps(memory.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
     return res
 
 

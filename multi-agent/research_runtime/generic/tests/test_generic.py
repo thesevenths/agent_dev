@@ -137,3 +137,50 @@ def test_budget_does_not_rewrite_llm_finish_verdict():
     d = r.decide_finish(objective="x", target=0.1, baseline={}, latest={},
                         improvement=0.05, iteration=1, max_iterations=2)
     assert d.finish is False, "LLM said continue; budget exhaustion must NOT rewrite it"
+
+
+def test_frozen_contract_multi_objective():
+    from research_runtime.generic.research_contract import (
+        MetricGoal, ResearchContract)
+    c = ResearchContract(goals=(MetricGoal("mse", "min", 0.10),
+                                MetricGoal("cos", "max", 0.0)), budget=3)
+    good = c.evaluate({"mse": 0.02, "cos": 0.6}, {"mse": 0.015, "cos": 0.7})
+    assert good["contract_met"] is True
+    bad = c.evaluate({"mse": 0.02, "cos": 0.6}, {"mse": 0.015, "cos": 0.5})
+    assert bad["contract_met"] is False
+
+
+def test_sanity_check_rejects_oversized_structure():
+    from research_runtime.generic.research_contract import sanity_check
+    ok = sanity_check({"model.latent_dim": 8, "model.predictor_hidden": [16]},
+                      n_train_samples=64)
+    bad = sanity_check({"model.latent_dim": 32, "model.predictor_hidden": [256, 256]},
+                       n_train_samples=64)
+    assert ok["ok"] is True and bad["ok"] is False
+
+
+def test_search_memory_dedup_and_hint():
+    from research_runtime.generic.research_contract import SearchMemory
+    m = SearchMemory()
+    m.record(iteration=0, overrides={"train.lr": 0.01},
+             metrics={"latent_mse@1": 0.02}, verdict={"contract_met": True},
+             engine_ok=True)
+    assert m.seen({"train.lr": 0.01}) and not m.seen({"train.lr": 0.02})
+    hint = m.direction_hint(metric="latent_mse@1")
+    assert hint["n"] == 1
+
+
+def test_paired_seed_ci():
+    from research_runtime.generic.research_contract import paired_seed_verdict
+    r = paired_seed_verdict([(1.0, 0.0), (1.0, 0.0), (1.0, 0.0)],
+                            [(0.8, 0.0), (0.82, 0.0), (0.81, 0.0)])
+    assert r["n_seeds"] == 3 and r["significantly_positive"] is True
+
+
+def test_hidden_failure_detector():
+    from research_runtime.arr07.scinet_backend import _assert_no_hidden_failure
+    class R:
+        error = "engine CLI error: Traceback (most recent call last): TypeError: bad"
+    import pytest as _p
+    with _p.raises(RuntimeError):
+        _assert_no_hidden_failure(R(), "train")

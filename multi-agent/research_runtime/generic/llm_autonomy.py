@@ -112,14 +112,21 @@ class LLMResearcher:
     # ① LLM proposes structure / parameters
     def propose_experiment(self, *, objective: str, allowed: dict[str, Any],
                            baseline_metrics: dict[str, float],
-                           history: list[dict]) -> Proposal:
+                           history: list[dict],
+                           search_hint: dict[str, Any] | None = None,
+                           contract: dict[str, Any] | None = None) -> Proposal:
         payload = {
             "role": "autonomous_researcher",
             "task": "Propose ONE experiment by choosing SciNet++ model structure "
                     "and/or hyperparameters. You decide the keys and values yourself.",
             "objective": objective,
+            "frozen_quantified_goal": contract or {},
             "baseline_measured_metrics": baseline_metrics,
             "previous_rounds": history,
+            "search_memory_hint": search_hint or {"hint": "no trials yet"},
+            "why_constraints_exist": ("Structural limits are enforced in code because "
+                                      "a 64-sample dataset cannot fit a huge model; "
+                                      "see rejected attempts in previous_rounds."),
             "allowed_config_keys_and_ranges": allowed,
             "rules": ["choose values you believe will improve the objective",
                       "only use keys from allowed_config_keys_and_ranges",
@@ -138,20 +145,25 @@ class LLMResearcher:
     def decide_finish(self, *, objective: str, target: float,
                       baseline: dict[str, float], latest: dict[str, float],
                       improvement: float | None, iteration: int,
-                      max_iterations: int) -> FinishDecision:
+                      max_iterations: int,
+                      contract_verdict: dict[str, Any] | None = None) -> FinishDecision:
         payload = {
             "role": "autonomous_researcher",
             "task": "Decide whether the research objective is met (finish) or "
                     "another experiment is needed (continue). You are the judge.",
             "objective": objective,
             "target_improvement": target,
+            "frozen_contract_evaluation": contract_verdict or {},
             "baseline_metrics": baseline,
             "latest_metrics": latest,
             "computed_improvement": improvement,
             "iteration": iteration, "max_iterations": max_iterations,
             "rules": ["quote the measured numbers you rely on",
-                      "finish only if the target is genuinely met",
-                      "budget exhausted => finish regardless"],
+                      "frozen_contract_evaluation is computed by the harness from "
+                      "measured data (ALL goals must meet their threshold); you may "
+                      "disagree only with evidence, not ignore it",
+                      "finish only if the objective is genuinely met",
+                      "budget exhaustion is recorded separately - it is NOT your verdict"],
             "output_format": "JSON: {\"finish\": bool, \"reasoning\": str, "
                              "\"quoted_metrics\": {key: value}}",
         }
