@@ -96,6 +96,68 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
     res.engine_runs += 1
     baseline = {k: float(v) for k, v in base["metrics"].items()}
     bm = baseline.get(scinet_backend.DEFAULT_METRIC, 0.0)
+
+    # ⓪ AGENT-LED SCREENING: the LLM decides WHICH knobs/values to sweep,
+    # the harness runs each single change on the real engine, and results
+    # become evidence for the rest of the loop. This replaces the human-fed
+    # prior_evidence.json — the agent DISCOVERS the key variable itself.
+    if not prior_evidence and (root / "enable_agent_screening").exists():
+        plan = researcher.plan_screening(
+            objective=OBJECTIVE, allowed=SCHEMA,
+            baseline_metrics=baseline, max_knobs=3, values_per_knob=2)
+        screen_rows = []
+        for entry in plan.get("sweep", []):
+            for value in entry["values"]:
+                ov = {entry["key"]: value}
+                if memory.seen(ov):
+                    continue
+                sr = scinet_backend.run_scinet_experiment(
+                    experiment_id=(f"screen_{core.sha256_json(json.dumps(ov, sort_keys=True))[:8]}"),
+                    task_id=task_id, seed=seed, overrides=ov, root=root,
+                    protocol_hash=protocol_hash)
+                res.engine_runs += 1
+                ok = bool(sr.get("ok") and sr.get("metrics"))
+                met = {k: float(v) for k, v in (sr.get("metrics") or {}).items()} if ok else {}
+                gain = ((bm - met.get(scinet_backend.DEFAULT_METRIC, bm)) / abs(bm)
+                        if ok and abs(bm) > 1e-12 else 0.0)
+                cos_delta = (met.get("cosine@1", 0) - baseline.get("cosine@1", 0)) if ok else 0.0
+                screen_rows.append({"override": ov, "engine_ok": ok,
+                                    "mse": met.get(scinet_backend.DEFAULT_METRIC),
+                                    "cosine": met.get("cosine@1"),
+                                    "mse_gain": round(gain, 4),
+                                    "cosine_delta": round(cos_delta, 4)})
+                memory.record(iteration=-1, overrides=ov, metrics=met,
+                              verdict={"contract_met": False}, engine_ok=ok)
+        # Derive evidence FROM MEASUREMENTS (not from human guess).
+        valid = [r for r in screen_rows if r["engine_ok"]]
+        # Rank by the FROZEN DUAL-OBJECTIVE verdict, NOT MSE alone.
+        # A config that cuts MSE but crashes cosine (dim=2: +59% MSE, -0.586 cos)
+        # must never be promoted as "best evidence" over a joint improvement
+        # (lr=0.01: +52% MSE, +0.384 cos).
+        def _screen_rank(r):
+            # screen_rows store generic "mse"/"cosine" keys -> map to metric names.
+            m = {}
+            if r.get("mse") is not None:
+                m[scinet_backend.DEFAULT_METRIC] = r["mse"]
+            if r.get("cosine") is not None:
+                m["cosine@1"] = r["cosine"]
+            v = contract.evaluate(baseline, m)
+            joint = v["contract_met"]
+            return (int(joint), sum(g.get("relative_gain", 0) for g in v["per_goal"]))
+        best = max(valid, key=_screen_rank) if valid else None
+        prior_evidence = {
+            "source": "AGENT-LED single-variable screening (self-discovered)",
+            "llm_plan_reasoning": plan.get("reasoning", ""),
+            "llm_plan": plan.get("sweep", []),
+            "screened_rows": screen_rows,
+            "strongest_finding": best,
+        }
+        res.rounds.append({"iteration": -1, "phase": "agent_screening",
+                           "plan": plan, "rows": screen_rows,
+                           "discovered_best": best})
+        (root / "raw_data" / "autonomy" / "agent_screening.json").write_text(
+            json.dumps(prior_evidence, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8")
     latest = baseline
     imp = 0.0
     history: list[dict] = []

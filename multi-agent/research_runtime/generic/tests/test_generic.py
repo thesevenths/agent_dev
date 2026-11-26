@@ -237,3 +237,20 @@ def test_change_budget_limits_llm_proposal():
         "model.latent_dim": (2, 32)}, baseline_metrics={}, history=[],
         max_changes=2)
     assert p.valid is False and "max 2" in p.rejection_reason
+
+
+def test_screen_rank_selects_joint_improvement():
+    """Agent screening must rank lr=0.01 above dim=2 (MSE-only trap)."""
+    from research_runtime.generic.research_contract import (
+        ResearchContract, MetricGoal)
+    c = ResearchContract(goals=(MetricGoal("latent_mse@1", "min", 0.10),
+                                MetricGoal("cosine@1", "max", 0.0)), budget=3)
+    base = {"latent_mse@1": 0.0264, "cosine@1": 0.5437}
+    def rank(r):
+        m = {"latent_mse@1": r["mse"], "cosine@1": r["cosine"]}
+        v = c.evaluate(base, m)
+        return (int(v["contract_met"]),
+                sum(g.get("relative_gain", 0) for g in v["per_goal"]))
+    lr = {"mse": 0.0127, "cosine": 0.928}
+    dim = {"mse": 0.0108, "cosine": -0.042}
+    assert rank(lr) > rank(dim)

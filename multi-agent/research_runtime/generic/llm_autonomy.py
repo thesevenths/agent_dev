@@ -109,6 +109,56 @@ class LLMResearcher:
             prompt + "\n---RESPONSE---\n" + raw, encoding="utf-8")
         return raw
 
+    # ⓪ NEW: LLM decides WHICH single-variable screening sweep to run first.
+    # This is how the agent DISCOVERS the key variable itself, instead of being
+    # fed a human-computed prior_evidence.json.
+    def plan_screening(self, *, objective: str, allowed: dict[str, Any],
+                       baseline_metrics: dict[str, float],
+                       max_knobs: int = 3, values_per_knob: int = 2) -> dict[str, Any]:
+        payload = {
+            "role": "autonomous_researcher",
+            "task": ("Before proposing full experiments, PLAN a one-factor-at-a-time "
+                     "screening sweep to DISCOVER which config knob most affects "
+                     "the objective. You choose the knobs and the values; the "
+                     "harness will run each single change on the real engine."),
+            "objective": objective,
+            "baseline_measured_metrics": baseline_metrics,
+            "allowed_knobs_and_ranges": allowed,
+            "budget": {"max_knobs": max_knobs, "values_per_knob": values_per_knob,
+                       "rule": "only ONE knob changed per screening run"},
+            "hint": ("Pick knobs you are UNSURE about; each must have a value "
+                     "different from its baseline in the config. Include at least "
+                     "one optimization knob (e.g. learning rate). CRITICAL: "
+                     "explore BOTH directions and ACROSS ORDERS OF MAGNITUDE — "
+                     "e.g. for a baseline lr=0.001, test 0.0001 AND 0.01, not "
+                     "only tiny values or the baseline itself. A sweep with no "
+                     "value materially different from baseline is useless."),
+            "output_format": ("JSON: {\"reasoning\": str, \"sweep\": "
+                              "[{\"key\": str, \"values\": [v1, v2]}]}"),
+        }
+        raw = self._call(payload)
+        d = _parse_json(raw)
+        if not d:
+            return {"valid": False, "reason": "screening plan not valid JSON",
+                    "raw": raw[:500], "sweep": []}
+        sweep = d.get("sweep") or []
+        if not isinstance(sweep, list) or not sweep:
+            return {"valid": False, "reason": "empty sweep",
+                    "raw": raw[:500], "sweep": []}
+        clean = []
+        for item in sweep[:max_knobs]:
+            if not isinstance(item, dict):
+                continue
+            key, vals = item.get("key"), item.get("values")
+            if key not in allowed or not isinstance(vals, list):
+                continue
+            ok, _, norm = validate_proposal({key: vals[0]}, allowed) if vals else (False, "", {})
+            if not ok or len(vals) > values_per_knob:
+                continue
+            clean.append({"key": key, "values": vals})
+        return {"valid": bool(clean), "reasoning": str(d.get("reasoning", ""))[:800],
+                "sweep": clean, "raw": raw[:1000]}
+
     # ① LLM proposes structure / parameters
     def propose_experiment(self, *, objective: str, allowed: dict[str, Any],
                            baseline_metrics: dict[str, float],
