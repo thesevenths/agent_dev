@@ -254,3 +254,16 @@ def test_screen_rank_selects_joint_improvement():
     lr = {"mse": 0.0127, "cosine": 0.928}
     dim = {"mse": 0.0108, "cosine": -0.042}
     assert rank(lr) > rank(dim)
+
+
+def test_symbolic_backend_graceful_blocked():
+    """run_symbolic must record real BLOCKED, never fabricate equations."""
+    from research_runtime.arr07.scinet_backend import run_symbolic
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        r = run_symbolic(run_id="nonexistent_run_for_blocked_test",
+                         experiment_id="sym_blocked", task_id="t",
+                         root=Path(td), timeout=30.0)
+        assert r["ok"] is False
+        assert r.get("blocked") is not None
+        assert "formulas" not in r

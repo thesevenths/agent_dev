@@ -185,5 +185,60 @@ def run_analyze(*, run_id: str, experiment_id: str, task_id: str,
     return rec
 
 
+def run_symbolic(*, run_id: str, experiment_id: str, task_id: str,
+                 root: Path, adapter: Any = None, timeout: float = 1200.0,
+                 protocol_hash: str = "") -> dict[str, Any]:
+    """Run SciNet++ Stage 3 (PySR formula discovery) on an analyzed run.
+
+    Reads real equations_<concept>.txt / .csv produced by symbolic.py.
+    If the Julia/PySR backend is unavailable, returns ok=False with the
+    real error — NEVER fabricate equations. Caller decides how to degrade.
+    """
+    import csv
+    root = Path(root).resolve()
+    out = root / "raw_data" / "symbolic" / f"{experiment_id}.json"
+    if out.is_file():
+        return json.loads(out.read_text(encoding="utf-8"))
+    a = adapter or SciNetAdapter(strict=False)
+    rec: dict[str, Any] = {"experiment_id": experiment_id, "task_id": task_id,
+                           "engine": "scinet++", "stage": "symbolic",
+                           "run_id": run_id, "protocol_hash": protocol_hash}
+    try:
+        spec = ExperimentSpec(experiment_id=experiment_id, objective_id=task_id,
+            hypothesis_id="formula_discovery", stage="symbolic",
+            config_path=str(a.project_dir / DEFAULT_CONFIG), seed=42,
+            split="test", run_id=run_id)
+        jid = a.submit(spec); a.wait(jid, timeout=timeout)
+        r = a.collect_result(jid)
+        if r.status != "succeeded":
+            raise RuntimeError(f"symbolic failed: {r.status} {str(r.error)[:300]}")
+        _assert_no_hidden_failure(r, "symbolic")
+        run_dir = a.project_dir / "outputs" / "pendulum_smoke" / run_id
+        formulas = {}
+        for txt in sorted(run_dir.glob("equations_*.txt")):
+            concept = txt.stem.replace("equations_", "")
+            body = txt.read_text(encoding="utf-8", errors="replace")
+            csvp = run_dir / f"equations_{concept}.csv"
+            rows = []
+            if csvp.is_file():
+                with csvp.open(encoding="utf-8", errors="replace") as fh:
+                    rows = list(csv.DictReader(fh))[:3]
+            formulas[concept] = {"equations_txt": body[:2000],
+                                 "top_candidates": rows,
+                                 "best_equation": rows[0].get("Equation", "") if rows else ""}
+        rec.update({"ok": True, "formulas": formulas,
+                    "artifacts": list(r.artifacts or []),
+                    "result_hash": core.sha256_json(formulas)})
+    except Exception as exc:
+        rec.update({"ok": False, "blocked": "JULIA_PYSR_UNAVAILABLE"
+                    if "PySR" in str(exc) or "julia" in str(exc).lower()
+                    else "SYMBOLIC_FAILED",
+                    "error": f"{type(exc).__name__}: {str(exc)[:800]}"})
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(rec, indent=2, sort_keys=True, ensure_ascii=False,
+                              default=str), encoding="utf-8")
+    return rec
+
+
 __all__ = ["ALLOWED", "DEFAULT_METRIC", "materialise_config",
-           "run_scinet_experiment", "run_analyze"]
+           "run_scinet_experiment", "run_analyze", "run_symbolic"]

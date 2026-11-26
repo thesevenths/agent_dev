@@ -50,6 +50,7 @@ class AutonomousResult:
     engine_runs: int = 0
     budget_exhausted: bool = False
     concept_evolution: list[dict] = field(default_factory=list)
+    formula_evolution: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {"task_id": self.task_id, "finished": self.finished,
@@ -58,6 +59,7 @@ class AutonomousResult:
                 "llm_calls": self.llm_calls, "engine_runs": self.engine_runs,
                 "budget_exhausted": self.budget_exhausted,
                 "concept_evolution": self.concept_evolution,
+                "formula_evolution": self.formula_evolution,
                 "rounds": self.rounds}
 
 
@@ -114,6 +116,30 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
         else:
             res.concept_evolution.append({"stage": "baseline", "analyze_ok": False,
                                           "error": ca.get("error", "")[:200]})
+
+    # ⓪c FORMULA DISCOVERY (PySR): marker-triggered, like analyze.
+    # If Julia/PySR is unavailable, record BLOCKED honestly and continue —
+    # the LLM is TOLD formulas are unavailable, never fed fabricated ones.
+    formula_baseline: dict[str, Any] = {}
+    if (root / "enable_formula_discovery").exists():
+        sr = scinet_backend.run_symbolic(
+            run_id=base["run_id"],
+            experiment_id=f"auto_{core.sha256_json(task_id)[:8]}_formula0",
+            task_id=task_id, root=root, protocol_hash=protocol_hash)
+        if sr.get("ok"):
+            formula_baseline = sr.get("formulas", {})
+            res.formula_evolution.append({"stage": "baseline", "formulas": formula_baseline,
+                                          "symbolic_ok": True})
+        else:
+            res.formula_evolution.append({"stage": "baseline", "symbolic_ok": False,
+                                          "blocked": sr.get("blocked"),
+                                          "error": sr.get("error", "")[:300]})
+            prior_evidence = dict(prior_evidence)
+            prior_evidence["formula_discovery_status"] = {
+                "status": "BLOCKED", "reason": sr.get("blocked"),
+                "detail": sr.get("error", "")[:300],
+                "note": ("PySR formula discovery is UNAVAILABLE (Julia env). "
+                         "Do NOT invent formulas; reason only from probe R2 and metrics.")}
 
     # ⓪ AGENT-LED SCREENING: the LLM decides WHICH knobs/values to sweep,
     # the harness runs each single change on the real engine, and results
@@ -176,6 +202,12 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
         (root / "raw_data" / "autonomy" / "agent_screening.json").write_text(
             json.dumps(prior_evidence, indent=2, ensure_ascii=False, default=str),
             encoding="utf-8")
+    if formula_baseline:
+        prior_evidence = dict(prior_evidence)
+        prior_evidence["discovered_formulas"] = {
+            "note": ("Closed-form equations from PySR mapping latents to concepts. "
+                     "Reflect on these as candidate laws."),
+            "formulas": formula_baseline}
     if concept_baseline:
         prior_evidence = dict(prior_evidence)
         prior_evidence["concept_discovery_baseline"] = {
