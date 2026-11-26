@@ -1,0 +1,78 @@
+# =============================================================================
+# SciNet++ (2026) configuration -- chaotic double pendulum (multivariate path).
+# -----------------------------------------------------------------------------
+# Demonstrates that the encoder/predictor are state-dim agnostic and gives the
+# V-JEPA latent predictor a genuinely chaotic signal. The physical concept to
+# rediscover here is the conserved total mechanical energy E of each trajectory
+# (constant along a trajectory, varying across trajectories -- exactly the
+# SciNet notion of a "concept").
+# =============================================================================
+
+experiment: double_pendulum
+seed: 42
+device: cuda
+output_dir: outputs
+
+# --- Data -------------------------------------------------------------------
+data:
+  generator: double_pendulum
+  sequence_length: 500        # same as pendulum for structural consistency
+  block_size: 100             # MUST match pendulum; ~10 time-units per block
+                              # so that conserved energy is identifiable from one window
+  t_max: 50.0                 # dt=0.1, each block spans 10 units
+  train_samples: 10000        # smaller than pendulum: RK45 ODE integration is costly
+  test_samples: 1000
+
+# --- Model ------------------------------------------------------------------
+model:
+  latent_dim: 4                   # same as pendulum
+  encoder_type: conv              # mlp | conv | transformer (same options)
+  conv_channels: [64, 128, 128]   # same as pendulum
+  tf_d_model: 64                  # transformer width   (used when type: transformer)
+  tf_heads: 4                     # transformer attention heads
+  tf_layers: 2                    # transformer encoder layers
+  encoder_hidden: [256, 128]      # same as pendulum
+  predictor_type: mlp              # mlp | transformer (same options as pendulum)
+  predictor_hidden: [256, 256]    # same as pendulum
+  pred_tf_heads: 2                # predictor transformer heads (when type: transformer)
+  pred_tf_layers: 2               # predictor transformer layers
+
+# --- V-JEPA training --------------------------------------------------------
+jepa:
+  rollout_steps: [1, 2, 3, 4]     # same as pendulum (<= num_blocks-1 = 4)
+  ema_momentum: 0.996
+  ema_warmup_epochs: 10
+  pred_weight: 1.0
+  vicreg_var_weight: 25.0
+  vicreg_cov_weight: 1.0
+
+# --- Optimization -----------------------------------------------------------
+train:
+  epochs: 300                     # same as pendulum
+  batch_size: 1024                # same as pendulum
+  lr: 0.001
+  weight_decay: 0.0001
+
+# --- Physics probe (SciNet concept discovery) -------------------------------
+probe:
+  hidden: [32, 16]                # same as pendulum
+  epochs: 50                      # same as pendulum
+  lr: 0.001
+  out_dim: 1            # predict conserved total energy E (physics-specific)
+
+# --- Symbolic regression (AI Feynman / PySR) --------------------------------
+symbolic:
+  niterations: 40
+  binary_operators: ["+", "-", "*"]
+  unary_operators: ["exp", "cos", "log", "sqrt", "inv"]
+  max_complexity: 15
+  batch_size: 100
+  parallelism: serial     # Windows下multithreading会吞掉逐轮日志且小数据更慢
+  early_stop: 0.0         # >0时,best loss低于该值即停止(如1e-3);0=关闭
+
+# --- Test-time adaptation (AdaJEPA) -----------------------------------------
+tta:
+  steps: 30
+  lr: 0.0005
+  adapt_encoder: false
+  n_samples: 64

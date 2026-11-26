@@ -1,0 +1,70 @@
+# =============================================================================
+# SciNet++ -- P2-02 Raw-State Dynamics Baselines (Pusher-v1)
+# -----------------------------------------------------------------------------
+#   python scripts/train_dynamics.py    --config configs/dynamics/pusher_v1_baselines.yaml
+#   python scripts/evaluate_dynamics.py --config configs/dynamics/pusher_v1_baselines.yaml
+#
+# All values below are FIRST-ROUND choices, not tuned optima. Nothing here is
+# fitted on frozen_test. `seed` is the dataset identity; model stochasticity is
+# controlled exclusively by `training.seeds` (dataset_seed / model_seed split).
+# =============================================================================
+experiment:
+  name: pusher_v1_dynamics
+  seed: 20261110
+  device: cpu
+  output_root: outputs/dynamics/pusher_v1
+
+dataset:
+  root: datasets/pusher_v1
+  observation_dim: 23
+  action_dim: 7
+  action_bounds: [-2.0, 2.0]
+  verify_manifest: true
+  require_phase0_audit: true
+  splits:
+    train: train
+    validation: validation
+    test: frozen_test
+    heldout: ood_test        # NOT a verified OOD split; ordinary held-out only
+  # Semantic groups verified against gymnasium 1.2.1
+  # pusher_v5.PusherEnv._get_obs (see Phase 0 audit report for the source).
+  feature_groups:
+    joint_qpos: [0, 7]
+    joint_qvel: [7, 14]
+    fingertip_com: [14, 17]
+    object_com: [17, 20]
+    goal_com: [20, 23]
+    robot_kinematics: [0, 17]
+  distance_spec:
+    object: [17, 20]
+    goal: [20, 23]
+  primary_group: robot_kinematics
+
+model:
+  hidden_dims: [256, 256]
+  residual_prediction: true
+
+training:
+  batch_size: 256
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  epochs: 200
+  early_stopping_patience: 20
+  seeds: [11, 22, 33, 44, 55]
+  ridge_alphas: [0.000001, 0.0001, 0.01, 1.0, 10.0]
+  shuffle_seed_offset: 1000
+  baselines: [B1, B2, B3, B4]
+
+evaluation:
+  horizons: [1, 2, 5, 10, 20]
+  rollout_splits: [validation, frozen_test]
+  report_splits: [validation, frozen_test, ood_test]
+  n_bootstrap: 10000
+  alpha: 0.05
+  bootstrap_seed: 20261110
+  baselines:
+    - persistence
+    - linear_ridge
+    - unconditioned_mlp
+    - conditioned_mlp
+    - shuffled_action

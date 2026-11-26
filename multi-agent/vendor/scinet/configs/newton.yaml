@@ -1,0 +1,97 @@
+# =============================================================================
+# SciNet++ (2026) configuration -- Newton's second law (F = m * a).
+# -----------------------------------------------------------------------------
+# The latent space is asked to rediscover TWO physical concepts of
+#     x(t) = x0 + v0 * t + 0.5 * (F / m) * t^2      (Newton's 2nd law integrated)
+# namely the applied force F and the mass m. The observed signal has two channels
+# (position x(t), constant force F); the curvature of x(t) carries a = F/m, so the
+# only way to recover m is through the relationship F = m * a -- that is the
+# "formula derivation" this experiment demonstrates (AI-Feynman / PySR step).
+#
+# This single file drives every stage, exactly like configs/pendulum.yaml:
+#   train.py -> analyze.py -> symbolic.py -> evaluate.py -> tta.py
+# So the Newton experiment is run with exactly the same command, just a different
+# --config:
+#   python run_all.py --config configs/newton.yaml
+# =============================================================================
+
+experiment: newton
+seed: 42
+device: cuda            # falls back to cpu automatically when unavailable
+output_dir: outputs
+
+# --- Data -------------------------------------------------------------------
+data:
+  generator: newton     # pendulum | double_pendulum | newton
+  sequence_length: 500  # timesteps per trajectory
+  block_size: 100       # encoder window; with t_max=3 and dt=0.006 each block
+                        # spans 0.6 time-units. The quadratic term 0.5*a*t^2
+                        # dominates over x0 and v0*t within this window because
+                        # x0 and v0 ranges are kept small.
+  t_max: 3.0            # physical time-span -> dt=0.006, keeps position O(1-10)
+  train_samples: 50000
+  test_samples: 2000
+  # CRITICAL: x0 and v0 must be small so the parabolic curvature 0.5*(F/m)*t^2
+  # dominates over the linear/constant terms. Large v0 masks the acceleration
+  # signal and makes mass unidentifiable (verified empirically).
+  newton:
+    force_range: [0.5, 5.0]
+    mass_range: [0.5, 3.0]
+    x0_range: [-0.5, 0.5]
+    v0_range: [-0.5, 0.5]
+
+# --- Model ------------------------------------------------------------------
+model:
+  latent_dim: 4                   # >= #concepts (force, mass) + nuisances (x0, v0, a)
+  encoder_type: conv              # mlp | conv | transformer
+  conv_channels: [64, 128, 128]
+  tf_d_model: 64
+  tf_heads: 4
+  tf_layers: 2
+  encoder_hidden: [256, 128]
+  predictor_type: mlp
+  predictor_hidden: [256, 256]
+  pred_tf_heads: 2
+  pred_tf_layers: 2
+
+# --- V-JEPA training --------------------------------------------------------
+jepa:
+  rollout_steps: [1, 2, 3, 4]
+  ema_momentum: 0.996
+  ema_warmup_epochs: 10
+  pred_weight: 1.0
+  vicreg_var_weight: 25.0
+  vicreg_cov_weight: 1.0
+
+# --- Optimization -----------------------------------------------------------
+train:
+  epochs: 200
+  batch_size: 1024
+  lr: 0.001
+  weight_decay: 0.0001
+
+# --- Physics probe (SciNet concept discovery) -------------------------------
+probe:
+  hidden: [32, 16]
+  epochs: 50
+  lr: 0.001
+  out_dim: 2            # predict (force, mass)
+
+# --- Symbolic regression (AI Feynman / PySR) --------------------------------
+# CRITICAL: Newton's 2nd law is a PROPORTION (a = F/m), so PySR MUST be allowed
+# to divide -- binary "/" and unary "inv" are required (pendulum.yaml omits them).
+symbolic:
+  niterations: 40
+  binary_operators: ["+", "-", "*", "/"]
+  unary_operators: ["exp", "cos", "log", "sqrt", "inv"]
+  max_complexity: 15
+  batch_size: 100
+  parallelism: serial     # Windows下multithreading会吞掉逐轮日志且小数据更慢
+  early_stop: 0.0         # >0时,best loss低于该值即停止(如1e-3);0=关闭
+
+# --- Test-time adaptation (AdaJEPA) -----------------------------------------
+tta:
+  steps: 30
+  lr: 0.0005
+  adapt_encoder: false
+  n_samples: 64
