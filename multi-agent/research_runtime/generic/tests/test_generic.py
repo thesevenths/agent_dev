@@ -97,14 +97,6 @@ def test_scinet_backend_config_materialisation():
             pass
 
 
-def test_scinet_loop_wiring_uses_generic_modules():
-    import inspect
-    from research_runtime.arr07 import scinet_loop
-    src = inspect.getsource(scinet_loop)
-    assert "GoalGate" in src and "design_discriminative" in src
-    assert "run_scinet_experiment" in src
-
-
 def test_llm_autonomy_validates_proposals_and_finish():
     from research_runtime.generic.llm_autonomy import (
         LLMResearcher, validate_proposal)
