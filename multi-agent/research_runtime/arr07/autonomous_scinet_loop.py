@@ -49,6 +49,7 @@ class AutonomousResult:
     llm_calls: int = 0
     engine_runs: int = 0
     budget_exhausted: bool = False
+    concept_evolution: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {"task_id": self.task_id, "finished": self.finished,
@@ -56,6 +57,7 @@ class AutonomousResult:
                 "final_improvement": self.final_improvement,
                 "llm_calls": self.llm_calls, "engine_runs": self.engine_runs,
                 "budget_exhausted": self.budget_exhausted,
+                "concept_evolution": self.concept_evolution,
                 "rounds": self.rounds}
 
 
@@ -96,6 +98,22 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
     res.engine_runs += 1
     baseline = {k: float(v) for k, v in base["metrics"].items()}
     bm = baseline.get(scinet_backend.DEFAULT_METRIC, 0.0)
+
+    # ⓪b CONCEPT DISCOVERY: real analyze.py probe on the baseline run, so the
+    # LLM can reflect on whether latent space CAPTURED physical concepts.
+    concept_baseline: dict[str, Any] = {}
+    if (root / "enable_concept_discovery").exists():
+        ca = scinet_backend.run_analyze(
+            run_id=base["run_id"], experiment_id=f"auto_{core.sha256_json(task_id)[:8]}_concept0",
+            task_id=task_id, root=root, protocol_hash=protocol_hash)
+        if ca.get("ok"):
+            concept_baseline = ca.get("concepts", {})
+            res.concept_evolution.append({"stage": "baseline",
+                                          "concepts": concept_baseline,
+                                          "analyze_ok": True})
+        else:
+            res.concept_evolution.append({"stage": "baseline", "analyze_ok": False,
+                                          "error": ca.get("error", "")[:200]})
 
     # ⓪ AGENT-LED SCREENING: the LLM decides WHICH knobs/values to sweep,
     # the harness runs each single change on the real engine, and results
@@ -158,6 +176,13 @@ def run_autonomous(*, task_id: str, root: Path, seed: int = 42,
         (root / "raw_data" / "autonomy" / "agent_screening.json").write_text(
             json.dumps(prior_evidence, indent=2, ensure_ascii=False, default=str),
             encoding="utf-8")
+    if concept_baseline:
+        prior_evidence = dict(prior_evidence)
+        prior_evidence["concept_discovery_baseline"] = {
+            "note": ("Physics probe R2 from analyze.py: whether the latent "
+                     "space captured ground-truth concepts (gamma/omega). "
+                     "Negative R2 = concept NOT discovered; reflect on this."),
+            "concepts": concept_baseline}
     latest = baseline
     imp = 0.0
     history: list[dict] = []

@@ -132,4 +132,58 @@ def run_scinet_experiment(*, experiment_id: str, task_id: str, seed: int,
     return rec
 
 
-__all__ = ["ALLOWED", "DEFAULT_METRIC", "materialise_config", "run_scinet_experiment"]
+def run_analyze(*, run_id: str, experiment_id: str, task_id: str,
+                root: Path, adapter: Any = None, timeout: float = 600.0,
+                protocol_hash: str = "") -> dict[str, Any]:
+    """Run SciNet++ Stage 2 (physics probe / concept discovery) on a train run.
+
+    Produces gamma/omega probe R2, participation ratio, attribution matrix —
+    quantitative evidence of whether the latent space DISCOVERED physical
+    concepts. Honest parse from analyze.log (no fabricated metrics).
+    """
+    import re
+    root = Path(root).resolve()
+    out = root / "raw_data" / "analyze" / f"{experiment_id}.json"
+    if out.is_file():
+        return json.loads(out.read_text(encoding="utf-8"))
+    a = adapter or SciNetAdapter(strict=False)
+    rec: dict[str, Any] = {"experiment_id": experiment_id, "task_id": task_id,
+                           "engine": "scinet++", "stage": "analyze",
+                           "run_id": run_id, "protocol_hash": protocol_hash}
+    try:
+        spec = ExperimentSpec(experiment_id=experiment_id, objective_id=task_id,
+            hypothesis_id="concept_discovery", stage="analyze",
+            config_path=str(a.project_dir / DEFAULT_CONFIG), seed=42,
+            split="test", run_id=run_id)
+        jid = a.submit(spec); a.wait(jid, timeout=timeout)
+        r = a.collect_result(jid)
+        if r.status != "succeeded":
+            raise RuntimeError(f"analyze failed: {r.status} {str(r.error)[:200]}")
+        _assert_no_hidden_failure(r, "analyze")
+        log = ""
+        for f in (a.project_dir / "outputs" / "pendulum_smoke" / run_id).glob("*.log"):
+            if "analyze" in f.name:
+                log = f.read_text(encoding="utf-8", errors="replace")
+        concepts = {}
+        for m in re.finditer(r"(gamma|omega)\s*:\s*R2=([-\d.]+)\s+RMSE=([\d.]+)",
+                             log):
+            concepts[m.group(1)] = {"probe_r2": float(m.group(2)),
+                                    "rmse": float(m.group(3))}
+        names = []
+        ln = (a.project_dir / "outputs" / "pendulum_smoke" / run_id /
+              "label_names.json")
+        if ln.is_file():
+            names = json.loads(ln.read_text(encoding="utf-8"))
+        rec.update({"ok": True, "concepts": concepts, "concept_names": names,
+                    "artifacts": list(r.artifacts or []), "log_excerpt": log[-1500:],
+                    "result_hash": core.sha256_json(concepts)})
+    except Exception as exc:
+        rec.update({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(rec, indent=2, sort_keys=True, ensure_ascii=False,
+                              default=str), encoding="utf-8")
+    return rec
+
+
+__all__ = ["ALLOWED", "DEFAULT_METRIC", "materialise_config",
+           "run_scinet_experiment", "run_analyze"]
